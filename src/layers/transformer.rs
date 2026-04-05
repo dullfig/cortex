@@ -16,6 +16,20 @@ use crate::layers::ffn::FeedForward;
 use crate::layers::kv_cache::KvCache;
 use crate::layers::rmsnorm::RmsNorm;
 
+/// Hook for injecting external knowledge into the FFN output.
+///
+/// Called after the FFN forward pass, before the residual add.
+/// The NeuralKV injector (Phase 4) implements this to inject
+/// cosine-gated residuals from the knowledge store.
+pub trait FfnInjector: Send + Sync {
+    /// Optionally modify the FFN output in-place.
+    ///
+    /// `hidden_normed`: the pre-FFN-norm'd hidden state (the FFN input).
+    ///   This is the query for cosine similarity matching.
+    /// `ffn_output`: the FFN output, mutable. Injector adds its residual here.
+    fn inject(&self, hidden_normed: &[f32], ffn_output: &mut [f32]);
+}
+
 /// A single transformer decoder block.
 ///
 /// Supports optional Block Attention Residuals (MoonshotAI): learned
@@ -39,6 +53,8 @@ pub struct TransformerBlock {
     /// FFN residual scale (Block Attention Residuals).
     /// 1.0 = standard residual connection.
     ffn_residual_scale: f32,
+    /// Optional FFN output injector (NeuralKV knowledge injection).
+    ffn_injector: Option<Box<dyn FfnInjector>>,
 }
 
 impl TransformerBlock {
@@ -67,6 +83,7 @@ impl TransformerBlock {
             ffn,
             attn_residual_scale: 1.0,
             ffn_residual_scale: 1.0,
+            ffn_injector: None,
         }
     }
 
@@ -106,7 +123,16 @@ impl TransformerBlock {
             ffn,
             attn_residual_scale: 1.0,
             ffn_residual_scale: 1.0,
+            ffn_injector: None,
         }
+    }
+
+    /// Set an FFN output injector (e.g., NeuralKV knowledge injection).
+    ///
+    /// The injector is called after the FFN forward pass on each token,
+    /// before the residual add. It can modify the FFN output in-place.
+    pub fn set_ffn_injector(&mut self, injector: Box<dyn FfnInjector>) {
+        self.ffn_injector = Some(injector);
     }
 
     /// Set Block Attention Residual scales (MoonshotAI).
@@ -154,7 +180,19 @@ impl TransformerBlock {
         // 2. FFN sub-block with residual
         //    Block Attention Residuals: out = h + α_ffn * ffn(norm(h))
         let normed_for_ffn = self.norm_sequence(&self.ffn_norm, &h, seq_len);
-        let ffn_out = self.ffn.forward_sequence(&normed_for_ffn, seq_len);
+        let mut ffn_out = self.ffn.forward_sequence(&normed_for_ffn, seq_len);
+
+        // Optional FFN injection (NeuralKV knowledge residuals).
+        if let Some(ref injector) = self.ffn_injector {
+            for t in 0..seq_len {
+                let start = t * embed_dim;
+                let end = start + embed_dim;
+                injector.inject(
+                    &normed_for_ffn[start..end],
+                    &mut ffn_out[start..end],
+                );
+            }
+        }
 
         let ffn_scale = self.ffn_residual_scale;
         for (h_val, f_val) in h.iter_mut().zip(ffn_out.iter()) {
@@ -188,7 +226,19 @@ impl TransformerBlock {
 
         // 2. FFN sub-block with residual (Block Attention Residuals)
         let normed_for_ffn = self.norm_sequence(&self.ffn_norm, &h, seq_len);
-        let ffn_out = self.ffn.forward_sequence(&normed_for_ffn, seq_len);
+        let mut ffn_out = self.ffn.forward_sequence(&normed_for_ffn, seq_len);
+
+        // Optional FFN injection (NeuralKV knowledge residuals).
+        if let Some(ref injector) = self.ffn_injector {
+            for t in 0..seq_len {
+                let start = t * embed_dim;
+                let end = start + embed_dim;
+                injector.inject(
+                    &normed_for_ffn[start..end],
+                    &mut ffn_out[start..end],
+                );
+            }
+        }
 
         let ffn_scale = self.ffn_residual_scale;
         for (h_val, f_val) in h.iter_mut().zip(ffn_out.iter()) {

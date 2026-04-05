@@ -66,3 +66,7 @@ pub use gguf::{GgufFile, GgufError, GgmlType, TensorInfo, ModelConfig, MetadataV
 pub use tokenizer::Tokenizer;
 pub use loader::{load_model, LoadedModel};
 pub use layers::memory::{TransformerMemory, MemoryConfig, MemoryResult, MemoryRole, MemoryTier};
+pub use layers::ffn::FeedForward;
+pub use layers::transformer::FfnInjector;
+#[cfg(feature = "memory")]
+pub use layers::engram_memory::EngramMemory;

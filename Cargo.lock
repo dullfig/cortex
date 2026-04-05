@@ -153,6 +153,7 @@ dependencies = [
 name = "cortex"
 version = "0.1.0"
 dependencies = [
+ "engram",
  "pollster",
  "rayon",
  "tempfile",
@@ -200,6 +201,15 @@ name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
+
+[[package]]
+name = "engram"
+version = "0.1.0"
+dependencies = [
+ "ternary-rs",
+ "thiserror 2.0.18",
+ "tracing",
+]
 
 [[package]]
 name = "equivalent"
@@ -935,6 +945,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "ternary-rs"
+version = "0.1.0"
+dependencies = [
+ "pollster",
+ "rayon",
+ "thiserror 2.0.18",
+ "tracing",
+ "wgpu",
 ]
 
 [[package]]

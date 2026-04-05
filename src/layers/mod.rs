@@ -9,6 +9,8 @@
 
 pub mod attention;
 pub mod bitlinear;
+#[cfg(feature = "memory")]
+pub mod engram_memory;
 pub mod ffn;
 pub mod floatlinear;
 pub mod kv_cache;
