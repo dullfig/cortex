@@ -424,7 +424,7 @@ mod tests {
         let attn_norm = RmsNorm::new(vec![1.0; embed_dim], 1e-5);
         let ffn_norm = RmsNorm::new(vec![1.0; embed_dim], 1e-5);
 
-        TransformerBlock::new(attn_norm, attention, ffn_norm, ffn)
+        TransformerBlock::new(attn_norm, attention, ffn_norm, Box::new(ffn))
     }
 
     // Build a tiny test model: vocab=8, embed=8, 1 layer, 2 heads

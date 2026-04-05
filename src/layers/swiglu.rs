@@ -11,6 +11,7 @@
 //! - SiLU(x) = x · σ(x) = x / (1 + exp(-x))
 //! - ⊙ = element-wise multiplication
 
+use crate::layers::ffn::FeedForward;
 use crate::layers::linear::LinearLayer;
 use crate::layers::rmsnorm::RmsNorm;
 
@@ -168,6 +169,24 @@ impl SwiGLU {
             output.extend_from_slice(&self.forward(token));
         }
         output
+    }
+}
+
+impl FeedForward for SwiGLU {
+    fn forward(&self, input: &[f32]) -> Vec<f32> {
+        SwiGLU::forward(self, input)
+    }
+
+    fn forward_sequence(&self, input: &[f32], seq_len: usize) -> Vec<f32> {
+        SwiGLU::forward_sequence(self, input, seq_len)
+    }
+
+    fn in_features(&self) -> usize {
+        SwiGLU::in_features(self)
+    }
+
+    fn out_features(&self) -> usize {
+        SwiGLU::out_features(self)
     }
 }
 

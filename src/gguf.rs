@@ -285,6 +285,10 @@ pub struct ModelConfig {
     pub hidden_act: String,
     /// Model name from `general.name` metadata (e.g., "Falcon3-7B-Instruct-1.58bit").
     pub model_name: Option<String>,
+    /// Number of MoE experts per layer (None = dense model).
+    pub expert_count: Option<u32>,
+    /// Number of experts activated per token (top-k routing, default 2).
+    pub expert_used_count: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -944,6 +948,10 @@ impl GgufFile {
                 .ok_or(GgufError::MissingMetadata(format!("{arch}.vocab_size")))
         })?;
 
+        // MoE fields (optional — absent for dense models)
+        let expert_count = get_u32("expert_count").ok();
+        let expert_used_count = get_u32("expert_used_count").ok();
+
         Ok(ModelConfig {
             vocab_size,
             embedding_dim: get_u32("embedding_length")?,
@@ -957,6 +965,8 @@ impl GgufFile {
             rope_type,
             hidden_act,
             model_name,
+            expert_count,
+            expert_used_count,
         })
     }
 

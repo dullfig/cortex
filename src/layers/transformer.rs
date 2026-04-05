@@ -12,9 +12,9 @@
 //!   out = h + FFN(ffn_norm(h))
 
 use crate::layers::attention::MultiHeadAttention;
+use crate::layers::ffn::FeedForward;
 use crate::layers::kv_cache::KvCache;
 use crate::layers::rmsnorm::RmsNorm;
-use crate::layers::swiglu::SwiGLU;
 
 /// A single transformer decoder block.
 ///
@@ -31,8 +31,8 @@ pub struct TransformerBlock {
     attention: MultiHeadAttention,
     /// Pre-FFN normalization.
     ffn_norm: RmsNorm,
-    /// SwiGLU feed-forward network.
-    ffn: SwiGLU,
+    /// Feed-forward network (dense SwiGLU or MoE).
+    ffn: Box<dyn FeedForward>,
     /// Attention residual scale (Block Attention Residuals).
     /// 1.0 = standard residual connection.
     attn_residual_scale: f32,
@@ -47,7 +47,7 @@ impl TransformerBlock {
         attn_norm: RmsNorm,
         attention: MultiHeadAttention,
         ffn_norm: RmsNorm,
-        ffn: SwiGLU,
+        ffn: Box<dyn FeedForward>,
     ) -> Self {
         assert_eq!(
             attention.embed_dim(),
@@ -81,7 +81,7 @@ impl TransformerBlock {
         mut attention: MultiHeadAttention,
         attn_sub_norm: Option<RmsNorm>,
         ffn_norm: RmsNorm,
-        ffn: SwiGLU,
+        ffn: Box<dyn FeedForward>,
     ) -> Self {
         assert_eq!(
             attention.embed_dim(),
@@ -232,6 +232,7 @@ mod tests {
     use super::*;
     use crate::layers::bitlinear::BitLinear;
     use crate::layers::linear::LinearLayer;
+    use crate::layers::swiglu::SwiGLU;
     use crate::tensor::{Ternary, TernaryTensor};
 
     fn make_bitlinear(weights: &[i8], rows: usize, cols: usize, scale: f32) -> BitLinear {
@@ -292,7 +293,7 @@ mod tests {
         let attn_norm = RmsNorm::new(vec![1.0; embed_dim], 1e-5);
         let ffn_norm = RmsNorm::new(vec![1.0; embed_dim], 1e-5);
 
-        TransformerBlock::new(attn_norm, attention, ffn_norm, ffn)
+        TransformerBlock::new(attn_norm, attention, ffn_norm, Box::new(ffn))
     }
 
     #[test]

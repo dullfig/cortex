@@ -188,18 +188,41 @@ pub fn load_model(path: &str) -> Result<LoadedModel, GgufError> {
             attention.set_biases(q_bias, k_bias, v_bias);
         }
 
-        // FFN projections — auto-detect type
-        let gate_proj = load_linear_layer(&gguf, &format!("blk.{i}.ffn_gate.weight"), &backend)?;
-        let up_proj = load_linear_layer(&gguf, &format!("blk.{i}.ffn_up.weight"), &backend)?;
-        let down_proj = load_linear_layer(&gguf, &format!("blk.{i}.ffn_down.weight"), &backend)?;
+        // Build FFN: MoE or dense SwiGLU
+        let ffn: Box<dyn crate::layers::ffn::FeedForward> = if let Some(n_experts) = config.expert_count {
+            // MoE: load per-expert weights and router
+            let n_experts = n_experts as usize;
+            let top_k = config.expert_used_count.unwrap_or(2) as usize;
+            let mut experts = Vec::with_capacity(n_experts);
 
-        // Optional ffn_sub_norm [intermediate_dim]: applied between activation(gate)⊙up and down
-        let ffn = if gguf.tensor_info(&format!("blk.{i}.ffn_sub_norm.weight")).is_some() {
-            let w = gguf.load_float(&format!("blk.{i}.ffn_sub_norm.weight"))?;
-            let sub_norm = RmsNorm::new(w.data().to_vec(), config.rms_norm_eps);
-            SwiGLU::with_sub_norm_and_activation(gate_proj, up_proj, down_proj, sub_norm, activation)
+            for e in 0..n_experts {
+                let e_gate = load_linear_layer(&gguf, &format!("blk.{i}.ffn_gate.{e}.weight"), &backend)?;
+                let e_up = load_linear_layer(&gguf, &format!("blk.{i}.ffn_up.{e}.weight"), &backend)?;
+                let e_down = load_linear_layer(&gguf, &format!("blk.{i}.ffn_down.{e}.weight"), &backend)?;
+                experts.push(SwiGLU::with_activation(e_gate, e_up, e_down, activation));
+            }
+
+            let router = load_linear_layer(&gguf, &format!("blk.{i}.ffn_gate_inp.weight"), &backend)?;
+
+            if i == 0 {
+                info!(n_experts, top_k, "loading MoE experts");
+            }
+
+            Box::new(crate::layers::moe::MoELayer::new(experts, router, top_k))
         } else {
-            SwiGLU::with_activation(gate_proj, up_proj, down_proj, activation)
+            // Dense FFN projections — auto-detect type
+            let gate_proj = load_linear_layer(&gguf, &format!("blk.{i}.ffn_gate.weight"), &backend)?;
+            let up_proj = load_linear_layer(&gguf, &format!("blk.{i}.ffn_up.weight"), &backend)?;
+            let down_proj = load_linear_layer(&gguf, &format!("blk.{i}.ffn_down.weight"), &backend)?;
+
+            // Optional ffn_sub_norm [intermediate_dim]: applied between activation(gate)⊙up and down
+            if gguf.tensor_info(&format!("blk.{i}.ffn_sub_norm.weight")).is_some() {
+                let w = gguf.load_float(&format!("blk.{i}.ffn_sub_norm.weight"))?;
+                let sub_norm = RmsNorm::new(w.data().to_vec(), config.rms_norm_eps);
+                Box::new(SwiGLU::with_sub_norm_and_activation(gate_proj, up_proj, down_proj, sub_norm, activation))
+            } else {
+                Box::new(SwiGLU::with_activation(gate_proj, up_proj, down_proj, activation))
+            }
         };
 
         // Norms (float)

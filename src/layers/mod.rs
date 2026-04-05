@@ -9,11 +9,13 @@
 
 pub mod attention;
 pub mod bitlinear;
+pub mod ffn;
 pub mod floatlinear;
 pub mod kv_cache;
 pub mod linear;
 pub mod memory;
 pub mod model;
+pub mod moe;
 pub mod rmsnorm;
 pub mod rope;
 pub mod sampler;
