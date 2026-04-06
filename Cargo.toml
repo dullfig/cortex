@@ -5,3 +5,8 @@ members = [
     "cortex-cloud",
     "cortex-local",
 ]
+# pinky/ holds experimental spikes — kept out of the workspace so they can
+# have looser standards, throwaway deps, and freedom to break without
+# affecting the main crates or CI. Each pinky experiment is its own
+# standalone Cargo project that path-deps on cortex.
+exclude = ["pinky"]
