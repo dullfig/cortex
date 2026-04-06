@@ -1,0 +1,18 @@
+[package]
+name = "cortex-local"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "In-process cortex inference provider for AgentOS. Same interface as the OpenAI wire format, no HTTP hop."
+
+[features]
+default = ["gpu"]
+gpu = ["cortex/gpu"]
+
+[dependencies]
+cortex = { path = "../cortex" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+thiserror = "2"
