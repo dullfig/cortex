@@ -402,6 +402,155 @@ impl MultiHeadAttention {
 
         final_output
     }
+
+    /// Forward pass with KV cache, capturing post-softmax attention weights.
+    ///
+    /// Mirrors `forward_cached` exactly — same math, same outputs — but
+    /// additionally clones the per-head per-query attention weight vector
+    /// into a caller-provided buffer for later analysis.
+    ///
+    /// `out_scores`: caller-allocated buffer of length
+    /// `n_heads * total_seq * total_seq`, where `total_seq = cache.len() + seq_len`
+    /// (the full sequence length after this call). Layout is row-major
+    /// `[head, query_pos, key_pos]`. Entries for query positions outside this
+    /// call's `seq_len` (i.e., previously cached positions) and entries for
+    /// `key_pos > query_pos` (causal mask) are left untouched — the caller
+    /// should zero-fill the buffer before passing it in if it cares.
+    ///
+    /// `query_offset`: the absolute position of the first query token. For a
+    /// fresh prefill from `start_pos = 0` this is `0`. For a decode call this
+    /// is `cache.len()` before the call (i.e., the new tokens' positions).
+    ///
+    /// Returns the attention output, shape `[seq_len, embed_dim]` — bit-identical
+    /// to `forward_cached` on the same input.
+    pub fn forward_cached_traced(
+        &self,
+        input: &[f32],
+        seq_len: usize,
+        cache: &mut KvCache,
+        out_scores: &mut [f32],
+        total_seq: usize,
+        query_offset: usize,
+    ) -> Vec<f32> {
+        let embed_dim = self.embed_dim();
+        assert_eq!(input.len(), seq_len * embed_dim, "input shape mismatch");
+        assert_eq!(
+            out_scores.len(),
+            self.n_heads * total_seq * total_seq,
+            "out_scores buffer must be n_heads * total_seq^2",
+        );
+
+        let q_dim = self.n_heads * self.head_dim;
+        let kv_dim = self.n_kv_heads * self.head_dim;
+        let start_pos = cache.len();
+
+        // 1. Project new tokens through Q, K, V (identical to forward_cached)
+        let mut q_all = Vec::with_capacity(seq_len * q_dim);
+        let mut k_new = Vec::with_capacity(seq_len * kv_dim);
+        let mut v_new = Vec::with_capacity(seq_len * kv_dim);
+
+        for t in 0..seq_len {
+            let token = &input[t * embed_dim..(t + 1) * embed_dim];
+            let mut q = self.q_proj.forward(token);
+            let mut k = self.k_proj.forward(token);
+            let mut v = self.v_proj.forward(token);
+            if let Some(ref bias) = self.q_bias {
+                for (val, &b) in q.iter_mut().zip(bias.iter()) { *val += b; }
+            }
+            if let Some(ref bias) = self.k_bias {
+                for (val, &b) in k.iter_mut().zip(bias.iter()) { *val += b; }
+            }
+            if let Some(ref bias) = self.v_bias {
+                for (val, &b) in v.iter_mut().zip(bias.iter()) { *val += b; }
+            }
+            q_all.extend_from_slice(&q);
+            k_new.extend_from_slice(&k);
+            v_new.extend_from_slice(&v);
+        }
+
+        // 2. Apply RoPE to Q and new K (identical to forward_cached)
+        for t in 0..seq_len {
+            let pos = start_pos + t;
+            for h in 0..self.n_heads {
+                let offset = t * q_dim + h * self.head_dim;
+                let slice = q_all[offset..offset + self.head_dim].to_vec();
+                let rotated = self.rope.forward(&slice, pos);
+                q_all[offset..offset + self.head_dim].copy_from_slice(&rotated);
+            }
+            for h in 0..self.n_kv_heads {
+                let offset = t * kv_dim + h * self.head_dim;
+                let slice = k_new[offset..offset + self.head_dim].to_vec();
+                let rotated = self.rope.forward(&slice, pos);
+                k_new[offset..offset + self.head_dim].copy_from_slice(&rotated);
+            }
+        }
+
+        // 3. Append new K/V to cache
+        cache.append(&k_new, &v_new);
+
+        // 4. Compute attention with score capture
+        let total_kv = cache.len();
+        let mut output = vec![0.0f32; seq_len * q_dim];
+        let scale = 1.0 / (self.head_dim as f32).sqrt();
+        let hpg = self.heads_per_group();
+
+        for qh in 0..self.n_heads {
+            let kv_h = qh / hpg;
+
+            for t in 0..seq_len {
+                let abs_pos = start_pos + t;
+                let q_off = t * q_dim + qh * self.head_dim;
+                let q_vec = &q_all[q_off..q_off + self.head_dim];
+
+                let attend_len = (abs_pos + 1).min(total_kv);
+                let mut scores = Vec::with_capacity(attend_len);
+
+                for s in 0..attend_len {
+                    let k_vec = cache.key_at(s, kv_h);
+                    let dot: f32 = q_vec
+                        .iter()
+                        .zip(k_vec.iter())
+                        .map(|(&a, &b)| a * b)
+                        .sum();
+                    scores.push(dot * scale);
+                }
+
+                softmax_inplace(&mut scores);
+
+                // CAPTURE: write the post-softmax scores into the trace buffer.
+                // The query position in the full sequence is `query_offset + t`,
+                // and we have `attend_len` weights covering key positions
+                // 0..attend_len.
+                let q_abs = query_offset + t;
+                debug_assert!(q_abs < total_seq, "query position out of trace bounds");
+                let row_start = qh * total_seq * total_seq + q_abs * total_seq;
+                for (s, &w) in scores.iter().enumerate() {
+                    out_scores[row_start + s] = w;
+                }
+
+                let out_off = t * q_dim + qh * self.head_dim;
+                for (s, &weight) in scores.iter().enumerate() {
+                    let v_vec = cache.value_at(s, kv_h);
+                    for d in 0..self.head_dim {
+                        output[out_off + d] += weight * v_vec[d];
+                    }
+                }
+            }
+        }
+
+        // 5. Output projection (identical to forward_cached)
+        let mut final_output = Vec::with_capacity(seq_len * embed_dim);
+        for t in 0..seq_len {
+            let head_concat = &output[t * q_dim..(t + 1) * q_dim];
+            let normed = match &self.o_sub_norm {
+                Some(norm) => norm.forward(head_concat),
+                None => head_concat.to_vec(),
+            };
+            final_output.extend_from_slice(&self.o_proj.forward(&normed));
+        }
+
+        final_output
+    }
 }
 
 impl std::fmt::Debug for MultiHeadAttention {

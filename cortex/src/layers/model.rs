@@ -14,6 +14,7 @@ use crate::layers::kv_cache::ModelKvCache;
 use crate::layers::linear::LinearLayer;
 use crate::layers::rmsnorm::RmsNorm;
 use crate::layers::sampler::{Sampler, SamplerConfig};
+use crate::layers::trace::ForwardTrace;
 use crate::layers::transformer::TransformerBlock;
 use crate::tensor::FloatTensor;
 use rayon::prelude::*;
@@ -342,6 +343,99 @@ impl TransformerModel {
         }
 
         sequence
+    }
+
+    /// Forward pass with trace capture — runs prefill from position 0 over
+    /// the given tokens, allocates a fresh KV cache, and captures per-layer
+    /// hidden states and post-softmax attention scores into a `ForwardTrace`.
+    ///
+    /// Returns `(logits, trace)` where `logits` is `[seq_len, vocab_size]`
+    /// (the same shape as `forward(tokens, 0)` and bit-identical to it on
+    /// equivalent inputs) and `trace` is the captured intermediate state.
+    ///
+    /// This is opt-in and pays nothing for callers who don't use it. The
+    /// production paths (`forward`, `forward_last`, `forward_cached`,
+    /// `generate`) are unchanged.
+    pub fn forward_traced(&self, tokens: &[u32]) -> (Vec<f32>, ForwardTrace) {
+        let seq_len = tokens.len();
+        assert!(seq_len > 0, "must have at least one token");
+
+        let n_layers = self.blocks.len();
+        let n_heads = self.blocks[0].attention().n_heads();
+        let mut trace = ForwardTrace::new(n_layers, n_heads, self.embed_dim, seq_len);
+
+        // Allocate a fresh KV cache for the prefill.
+        let mut cache = self.create_kv_cache(seq_len);
+
+        // 1. Embedding lookup
+        let mut hidden = Vec::with_capacity(seq_len * self.embed_dim);
+        let embed_data = self.embedding.data();
+        for &tok in tokens {
+            assert!(
+                (tok as usize) < self.vocab_size,
+                "token ID {tok} out of range (vocab_size={})",
+                self.vocab_size
+            );
+            let start = tok as usize * self.embed_dim;
+            hidden.extend_from_slice(&embed_data[start..start + self.embed_dim]);
+        }
+
+        // Capture: post-embedding state == input to block 0
+        trace.hidden_states.push(hidden.clone());
+
+        // 2. Pass through transformer blocks with cache, capturing
+        //    attention scores and per-block input hidden states.
+        for (layer_idx, block) in self.blocks.iter().enumerate() {
+            // Allocate the per-layer score buffer: [n_heads, seq_len, seq_len]
+            // zero-initialized so causally-masked positions and any unwritten
+            // entries are 0.0.
+            let mut scores = vec![0.0f32; n_heads * seq_len * seq_len];
+
+            hidden = block.forward_cached_traced(
+                &hidden,
+                seq_len,
+                cache.layer_mut(layer_idx),
+                &mut scores,
+                seq_len,
+                0,
+            );
+
+            trace.attention_scores.push(scores);
+            // Capture: post-block state == input to next block (or to final norm)
+            trace.hidden_states.push(hidden.clone());
+        }
+
+        // 3. Final norm (per token)
+        let mut normed = Vec::with_capacity(hidden.len());
+        for t in 0..seq_len {
+            let start = t * self.embed_dim;
+            let token_hidden = &hidden[start..start + self.embed_dim];
+            normed.extend_from_slice(&self.final_norm.forward(token_hidden));
+        }
+
+        // Capture: post-final-norm state (input to output projection)
+        trace.hidden_states.push(normed.clone());
+
+        // 4. Output projection → logits (mirrors forward_cached exactly)
+        let logits = match &self.output_proj {
+            OutputProjection::Linear(proj) => {
+                let mut logits = Vec::with_capacity(seq_len * self.vocab_size);
+                for t in 0..seq_len {
+                    let start = t * self.embed_dim;
+                    let token_hidden = &normed[start..start + self.embed_dim];
+                    logits.extend_from_slice(&proj.forward(token_hidden));
+                }
+                logits
+            }
+            OutputProjection::Float(ref weight) => {
+                float_output_projection(&normed, weight.data(), seq_len, self.vocab_size, self.embed_dim)
+            }
+            OutputProjection::TiedEmbedding => {
+                float_output_projection(&normed, embed_data, seq_len, self.vocab_size, self.embed_dim)
+            }
+        };
+
+        (logits, trace)
     }
 }
 
@@ -727,6 +821,108 @@ mod tests {
         assert!(output.len() > 2);
         for &tok in &output {
             assert!((tok as usize) < model.vocab_size());
+        }
+    }
+
+    // -- Trace capture parity --
+
+    #[test]
+    fn forward_traced_logits_match_forward() {
+        // The trace path must produce bit-identical logits to the production
+        // forward path, otherwise the trace is observing a perturbed
+        // computation rather than the real one.
+        let model = make_test_model(2, false);
+        let tokens = &[0u32, 1, 2, 3, 4];
+
+        let logits_plain = model.forward(tokens, 0);
+        let (logits_traced, _trace) = model.forward_traced(tokens);
+
+        assert_eq!(
+            logits_plain.len(),
+            logits_traced.len(),
+            "logits length mismatch",
+        );
+        for (i, (a, b)) in logits_plain.iter().zip(logits_traced.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "logit {i} differs: forward={a} forward_traced={b}",
+            );
+        }
+    }
+
+    #[test]
+    fn forward_traced_shapes_correct() {
+        let model = make_test_model(2, false);
+        let tokens = &[0u32, 1, 2, 3];
+        let (_logits, trace) = model.forward_traced(tokens);
+
+        assert_eq!(trace.seq_len, 4);
+        assert_eq!(trace.n_layers, 2);
+        assert_eq!(trace.embed_dim, 8);
+
+        // n_layers attention buffers, each of size n_heads * seq_len * seq_len
+        assert_eq!(trace.attention_scores.len(), 2);
+        for layer_scores in &trace.attention_scores {
+            assert_eq!(layer_scores.len(), trace.n_heads * 4 * 4);
+        }
+
+        // n_layers + 2 hidden state snapshots:
+        // 1 post-embedding + n_layers post-block + 1 post-final-norm
+        assert_eq!(trace.hidden_states.len(), 4);
+        for h in &trace.hidden_states {
+            assert_eq!(h.len(), 4 * 8);
+        }
+    }
+
+    #[test]
+    fn forward_traced_attention_is_causal() {
+        // Each row q of the attention matrix must have weight zero for k > q
+        // (causal mask), and the row sums (over allowed positions) must be ~1.
+        let model = make_test_model(1, false);
+        let tokens = &[0u32, 1, 2, 3, 4];
+        let (_logits, trace) = model.forward_traced(tokens);
+
+        let s = trace.seq_len;
+        for h in 0..trace.n_heads {
+            for q in 0..s {
+                let row = trace.attention_row(0, h, q);
+                // Causal mask: positions k > q must be exactly zero
+                for k in (q + 1)..s {
+                    assert_eq!(
+                        row[k], 0.0,
+                        "head {h} row {q} key {k}: expected 0 (causal mask), got {}",
+                        row[k],
+                    );
+                }
+                // Row sum over allowed positions should be ~1.0 (softmax)
+                let allowed_sum: f32 = row[..=q].iter().sum();
+                assert!(
+                    (allowed_sum - 1.0).abs() < 1e-5,
+                    "head {h} row {q} sum = {} (expected ~1.0)",
+                    allowed_sum,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn forward_traced_attention_self_attends_at_position_zero() {
+        // Position 0 has only itself to attend to, so its attention weight
+        // on key 0 must be exactly 1.0 in every head/layer.
+        let model = make_test_model(2, false);
+        let tokens = &[0u32, 3, 7];
+        let (_logits, trace) = model.forward_traced(tokens);
+
+        for layer in 0..trace.n_layers {
+            for h in 0..trace.n_heads {
+                let w00 = trace.attention(layer, h, 0, 0);
+                assert!(
+                    (w00 - 1.0).abs() < 1e-5,
+                    "layer {layer} head {h} pos 0 self-attention = {} (expected ~1.0)",
+                    w00,
+                );
+            }
         }
     }
 }

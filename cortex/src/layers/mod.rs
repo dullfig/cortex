@@ -22,4 +22,5 @@ pub mod rmsnorm;
 pub mod rope;
 pub mod sampler;
 pub mod swiglu;
+pub mod trace;
 pub mod transformer;

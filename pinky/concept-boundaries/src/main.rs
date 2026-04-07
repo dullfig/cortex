@@ -161,11 +161,27 @@ struct Cli {
     #[arg(long, default_value = "fixtures/mixed-trust.txt")]
     fixture: PathBuf,
 
-    /// Optional path to a GGUF model. If provided, the binary runs a
-    /// forward pass over the encoded tokens to prove end-to-end plumbing.
-    /// If omitted, only the encoding + provenance trace is printed.
+    /// Path to a GGUF model. Required because cortex's tokenizer is loaded
+    /// from GGUF metadata and there's no standalone tokenizer constructor.
     #[arg(long)]
     model: Option<PathBuf>,
+
+    /// Future-token window for boundary scoring. For each candidate
+    /// boundary i, we look at the next `window` query positions and
+    /// measure how cleanly their attention stops at i.
+    #[arg(long, default_value = "6")]
+    window: usize,
+
+    /// Weight on the "leftward bleed" penalty in the boundary score.
+    /// Higher alpha penalizes future tokens that still attend to positions
+    /// before the candidate boundary.
+    #[arg(long, default_value = "1.0")]
+    alpha: f32,
+
+    /// Number of top-scored boundary candidates to print and evaluate
+    /// against the fixture's known trust-region edges.
+    #[arg(long, default_value = "8")]
+    top_k: usize,
 }
 
 fn main() -> Result<()> {
@@ -220,26 +236,179 @@ fn main() -> Result<()> {
     }
     println!();
 
-    // Run a forward pass over the bare token IDs (provenance is parallel
-    // metadata — the model consumes only the IDs). This is just to prove
-    // the pipeline survives end-to-end; we don't do anything with the
-    // logits yet.
+    // Run forward_traced over the bare token IDs. The provenance buffer
+    // is parallel metadata that the model never touches; we'll join it
+    // back to the boundary scores below.
     let bare_ids: Vec<u32> = tokens.iter().map(|t| t.id).collect();
-    let logits = loaded.model.forward_last(&bare_ids, 0);
-    let (top_id, top_logit) = logits
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-        .map(|(i, &v)| (i as u32, v))
-        .unwrap();
-    let top_text = loaded.tokenizer.decode(&[top_id]);
+    println!("running forward_traced over {} tokens...", bare_ids.len());
+    let t_start = std::time::Instant::now();
+    let (_logits, trace) = loaded.model.forward_traced(&bare_ids);
+    let elapsed = t_start.elapsed();
     println!(
-        "forward_last: top token = {} ({:?}, logit = {:.4})",
-        top_id, top_text, top_logit,
+        "  done in {:.2}s — captured {} layers, {} heads, seq_len={}",
+        elapsed.as_secs_f32(),
+        trace.n_layers,
+        trace.n_heads,
+        trace.seq_len,
     );
     println!();
 
-    // Provenance summary by region
+    // ----------------------------------------------------------------------
+    // Boundary scoring (DynSplit-KV-style)
+    // ----------------------------------------------------------------------
+    //
+    // For each candidate boundary position i, score how cleanly the
+    // attention pattern of future positions stops at i:
+    //
+    //   s_i = mean over q ∈ (i, i+window], heads, selected layers of:
+    //           Σ attn(q, k) for k ∈ [i, q]      <-- "rightward focus"
+    //         - α · Σ attn(q, k) for k ∈ [0, i)  <-- "leftward bleed"
+    //
+    // High s_i means future positions are mostly attending to things at
+    // or after i, ignoring everything before i. That's the operational
+    // signature of a concept boundary: the future loses interest in the
+    // past at exactly that point.
+    //
+    // Layer selection: we average over the middle third of the network.
+    // Early layers are too syntactic (token n-grams), late layers are
+    // too task-specific (next-token prediction). Middle layers carry
+    // the abstract relational structure that makes "concept" meaningful.
+
+    let n_layers = trace.n_layers;
+    let layer_lo = n_layers / 3;
+    let layer_hi = (2 * n_layers / 3).max(layer_lo + 1);
+    let selected_layers: Vec<usize> = (layer_lo..layer_hi).collect();
+
+    let window = cli.window;
+    let alpha = cli.alpha;
+    let s = trace.seq_len;
+
+    println!(
+        "scoring boundaries: layers {:?}, future window = {}, alpha = {}",
+        selected_layers, window, alpha,
+    );
+
+    let mut scores = vec![0.0f32; s];
+    for i in 0..s {
+        let q_lo = i + 1;
+        let q_hi = (i + 1 + window).min(s);
+        if q_hi <= q_lo {
+            continue;
+        }
+
+        let mut total = 0.0f32;
+        let mut count = 0usize;
+
+        for &layer in &selected_layers {
+            for h in 0..trace.n_heads {
+                for q in q_lo..q_hi {
+                    let row = trace.attention_row(layer, h, q);
+                    // Rightward focus: attention from q to keys in [i, q].
+                    // (k > q is masked to 0 by causality, so safe to slice up
+                    //  to s; but we cap at q+1 to be explicit.)
+                    let right_sum: f32 = row[i..=q].iter().sum();
+                    // Leftward bleed: attention from q to keys in [0, i).
+                    let left_sum: f32 = if i > 0 { row[..i].iter().sum() } else { 0.0 };
+                    total += right_sum - alpha * left_sum;
+                    count += 1;
+                }
+            }
+        }
+
+        scores[i] = if count > 0 { total / count as f32 } else { 0.0 };
+    }
+
+    // ----------------------------------------------------------------------
+    // Trust-region edges from the fixture (ground-truth boundaries)
+    // ----------------------------------------------------------------------
+    //
+    // A trust-region edge is any position i where tokens[i].source !=
+    // tokens[i-1].source. These are the boundaries we KNOW should exist
+    // because they were imposed by the fixture's region structure.
+    let trust_edges: Vec<usize> = (1..s)
+        .filter(|&i| tokens[i].source != tokens[i - 1].source)
+        .collect();
+
+    println!();
+    println!("trust-region edges (from fixture): {:?}", trust_edges);
+    for &edge in &trust_edges {
+        let prev_text = loaded.tokenizer.decode(&[tokens[edge - 1].id])
+            .replace('\n', "\\n");
+        let next_text = loaded.tokenizer.decode(&[tokens[edge].id])
+            .replace('\n', "\\n");
+        println!(
+            "  pos {:>3}: {:>6} → {:<6}  ({:?} → {:?})",
+            edge,
+            tokens[edge - 1].source.label(),
+            tokens[edge].source.label(),
+            prev_text,
+            next_text,
+        );
+    }
+    println!();
+
+    // ----------------------------------------------------------------------
+    // Top-K boundary candidates
+    // ----------------------------------------------------------------------
+    let mut indexed: Vec<(usize, f32)> = scores
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (i, v))
+        .collect();
+    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+    let top_k = cli.top_k.min(s);
+    println!("top-{top_k} boundary candidates by score:");
+    println!(
+        "  {:>4}  {:>9}  {:>6}  {:<8}  {:<8}  text",
+        "pos", "score", "trust?", "src_prev", "src_next"
+    );
+    println!("  {}", "-".repeat(60));
+    for &(pos, score) in indexed.iter().take(top_k) {
+        let is_trust = trust_edges.contains(&pos);
+        let prev_src = if pos > 0 {
+            tokens[pos - 1].source.label()
+        } else {
+            "-"
+        };
+        let next_src = tokens[pos].source.label();
+        let text = loaded.tokenizer.decode(&[tokens[pos].id])
+            .replace('\n', "\\n");
+        println!(
+            "  {:>4}  {:>9.4}  {:>6}  {:<8}  {:<8}  {:?}",
+            pos,
+            score,
+            if is_trust { "✓" } else { " " },
+            prev_src,
+            next_src,
+            text,
+        );
+    }
+    println!();
+
+    // ----------------------------------------------------------------------
+    // Alignment summary: how many of the top-K candidates are real edges?
+    // ----------------------------------------------------------------------
+    let top_set: std::collections::HashSet<usize> =
+        indexed.iter().take(top_k).map(|&(p, _)| p).collect();
+    let trust_set: std::collections::HashSet<usize> =
+        trust_edges.iter().copied().collect();
+    let hits = top_set.intersection(&trust_set).count();
+    let precision = if top_k > 0 { hits as f32 / top_k as f32 } else { 0.0 };
+    let recall = if !trust_set.is_empty() {
+        hits as f32 / trust_set.len() as f32
+    } else {
+        0.0
+    };
+
+    println!("alignment vs ground-truth trust edges:");
+    println!("  hits     = {hits} / {top_k} top candidates");
+    println!("  trust    = {} edges in fixture", trust_set.len());
+    println!("  precision = {:.2}  (top-K hits / top-K)", precision);
+    println!("  recall    = {:.2}  (top-K hits / trust edges)", recall);
+    println!();
+
+    // Provenance summary by region (kept from earlier)
     let mut counts = [0usize; 4];
     for t in &tokens {
         let idx = match t.source {

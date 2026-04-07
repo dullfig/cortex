@@ -248,6 +248,68 @@ impl TransformerBlock {
         h
     }
 
+    /// Forward pass with KV cache, capturing post-softmax attention scores.
+    ///
+    /// Mirrors `forward_cached` exactly — same outputs — but also writes the
+    /// attention layer's per-head per-query attention weights into the
+    /// caller-provided `out_attn_scores` buffer.
+    ///
+    /// `out_attn_scores`: caller-allocated buffer of length
+    /// `n_heads * total_seq * total_seq`, layout `[head, q, k]`.
+    /// `total_seq`: full sequence length after this call (cache.len() + seq_len).
+    /// `query_offset`: absolute position of the first query token (cache.len() before the call).
+    pub fn forward_cached_traced(
+        &self,
+        input: &[f32],
+        seq_len: usize,
+        cache: &mut KvCache,
+        out_attn_scores: &mut [f32],
+        total_seq: usize,
+        query_offset: usize,
+    ) -> Vec<f32> {
+        let embed_dim = self.embed_dim();
+        assert_eq!(input.len(), seq_len * embed_dim, "input shape mismatch");
+
+        // 1. Attention sub-block with residual (traced attention)
+        let normed_for_attn = self.norm_sequence(&self.attn_norm, input, seq_len);
+        let attn_out = self.attention.forward_cached_traced(
+            &normed_for_attn,
+            seq_len,
+            cache,
+            out_attn_scores,
+            total_seq,
+            query_offset,
+        );
+
+        let attn_scale = self.attn_residual_scale;
+        let mut h = Vec::with_capacity(input.len());
+        for (x, a) in input.iter().zip(attn_out.iter()) {
+            h.push(x + attn_scale * a);
+        }
+
+        // 2. FFN sub-block with residual (identical to forward_cached)
+        let normed_for_ffn = self.norm_sequence(&self.ffn_norm, &h, seq_len);
+        let mut ffn_out = self.ffn.forward_sequence(&normed_for_ffn, seq_len);
+
+        if let Some(ref injector) = self.ffn_injector {
+            for t in 0..seq_len {
+                let start = t * embed_dim;
+                let end = start + embed_dim;
+                injector.inject(
+                    &normed_for_ffn[start..end],
+                    &mut ffn_out[start..end],
+                );
+            }
+        }
+
+        let ffn_scale = self.ffn_residual_scale;
+        for (h_val, f_val) in h.iter_mut().zip(ffn_out.iter()) {
+            *h_val += ffn_scale * f_val;
+        }
+
+        h
+    }
+
     /// Apply RmsNorm to each token in a sequence.
     fn norm_sequence(&self, norm: &RmsNorm, input: &[f32], seq_len: usize) -> Vec<f32> {
         let embed_dim = self.embed_dim();
