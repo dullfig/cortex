@@ -1,0 +1,12 @@
+# Multi-source fixture: trust boundaries designed to coincide with concept
+# boundaries. Each region is a structurally and semantically distinct kind
+# of content, so the model's attention-based concept extractor SHOULD see
+# all three trust edges as boundaries on its own, without help from
+# the provenance bonus.
+#
+# Format: each non-comment line is "<source>: <content>".
+
+system: You are the ringhub concierge. Help users find local events.
+user: What music shows are happening this weekend in Brooklyn?
+doc: Brooklyn Steel announces three nights of Phoebe Bridgers performances Friday through Sunday with doors at 8pm and tickets starting at sixty five dollars.
+tool: search_events returned 12 results within 5 miles, sorted by distance, with the closest at Music Hall of Williamsburg at 0.4 miles away.

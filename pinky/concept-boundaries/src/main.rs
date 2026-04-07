@@ -192,6 +192,20 @@ struct Cli {
     /// to disable.
     #[arg(long, default_value = "2")]
     nms: usize,
+
+    /// Provenance bonus added to the boundary score at every position
+    /// where the source tag changes (tokens[i].source != tokens[i-1].source).
+    /// Zero (default) ignores provenance entirely and uses only the
+    /// attention-derived score, which is the right way to test what the
+    /// content alone supports. A positive value treats source changes as
+    /// evidence of a concept boundary, biasing the extractor toward the
+    /// "trust is a constituent of the concept" architecture.
+    ///
+    /// Tune by inspecting the magnitude of the raw attention scores in
+    /// the report — start at the same order of magnitude as the top-K
+    /// scores you see without the bonus.
+    #[arg(long, default_value = "0.0")]
+    provenance_bonus: f32,
 }
 
 fn main() -> Result<()> {
@@ -312,8 +326,8 @@ fn main() -> Result<()> {
     let s = trace.seq_len;
 
     println!(
-        "scoring boundaries: layers {} ({:?}), future window = {}, alpha = {}",
-        cli.layers, selected_layers, window, alpha,
+        "scoring boundaries: layers {} ({:?}), future window = {}, alpha = {}, provenance_bonus = {}",
+        cli.layers, selected_layers, window, alpha, cli.provenance_bonus,
     );
 
     // f32::NEG_INFINITY for skipped positions so they sort to the bottom
@@ -341,7 +355,21 @@ fn main() -> Result<()> {
             }
         }
 
-        scores[i] = if count > 0 { total / count as f32 } else { f32::NEG_INFINITY };
+        let attention_score = if count > 0 { total / count as f32 } else { f32::NEG_INFINITY };
+
+        // Provenance bonus: if the source tag changes at this position,
+        // add the configured bonus. Zero by default (pure attention-based
+        // boundary discovery). Positive values fold provenance into the
+        // boundary signal as a prior — see the architectural argument
+        // about why trust should be a constituent of concepts, not just
+        // a parallel label.
+        let provenance_bonus = if i > 0 && tokens[i].source != tokens[i - 1].source {
+            cli.provenance_bonus
+        } else {
+            0.0
+        };
+
+        scores[i] = attention_score + provenance_bonus;
     }
 
     // ----------------------------------------------------------------------
