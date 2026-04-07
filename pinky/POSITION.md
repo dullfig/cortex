@@ -246,34 +246,57 @@ procedural co-processor we need to build is the same: small, specialized,
 not trying to be generally intelligent, trained on narrow tasks against
 explicit error signals.
 
-### The Viola-Jones / cascade classifier framing (the next-step insight)
+### The "small classifier on top of smart features" framing
 
-This is the most recent and most important meta-architectural reframe, from
-the 2026-04-06 session. **What we're doing structurally is a Viola-Jones
-cascade classifier on top of LLM attention features.**
+This is the most important meta-architectural reframe in the project so far,
+from the 2026-04-06 session. **What we're doing structurally is what classical
+computer vision did before deep learning swallowed it: hand-engineered (or
+trained) features → small specialized classifier → composition of classifier
+outputs into structured decisions.**
 
-- **Viola-Jones (2001)**: Hand-engineered Haar features (edges, lines,
-  rectangles) → AdaBoost-trained weak classifier → cascade. The cascade is
-  what made real-time face detection possible.
-- **Cortex tonight**: Hand-engineered features (attention-to-self, leftward
-  baseline, source-change indicator, per-layer activation) → hand-tuned
-  scoring formula → NMS for deduplication. Same architecture; we're just
-  *hand-tuning* where Viola-Jones used AdaBoost.
+- **Classical CV pattern (Viola-Jones et al, 2001)**: Hand-engineered Haar
+  features → AdaBoost-trained weak classifier → cascade. Multi-stage rejection
+  cascade is what made real-time face detection possible.
+- **Modern CV pattern (Daniel's `\src\classifiers`, 2025)**: Pixel patches
+  → small per-class CNN (~115k parameters each) → ONNX export → glue code
+  composes classifier outputs into structured musical scores. Single-stage,
+  no cascade, one model per task.
+- **Cortex (tonight)**: Hand-engineered features over LLM attention scores
+  (attention-to-self, leftward baseline, source-change indicator, per-layer
+  activation) → hand-tuned scoring formula → NMS for deduplication.
 
-This means **the next pinky experiment is "make the boundary classifier
-trainable"**. The features are the LLM's attention scores. The classifier is
-a small linear or AdaBoost model with a few dozen parameters. The training
-data is hand-labeled boundary positions on the existing fixtures. The training
-algorithm is logistic regression with L2, or AdaBoost over the features as
-weak learners, or CMA-ES on the existing scoring formula's hyperparameters.
+The structural shape is identical across all three: smart feature extractor
+on the bottom, dumb specialized classifier on top, error-driven supervised
+training against an explicit target. /btw originally framed this as
+"Viola-Jones cascade" and that was *conceptually* right but *literally*
+specific — the actual engineering shape Daniel has been building (and the
+shape we should copy) is closer to "small per-task CNN trained in PyTorch and
+exported to ONNX" than to "boosted Haar-feature cascade." Both are instances
+of the same architectural family. The simpler instance is the right starting
+point for cortex too. We can always add cascading later if speed becomes
+an issue; we don't need it tonight.
 
-The really important property: **this is also the cerebellum's learning rule,
-made concrete**. Cascade classifier training is structurally identical to
-Marr-Albus cerebellar learning — error-driven, local, repetitive, supervised
-against per-example targets. Computer vision discovered the right learning
-rule for procedural co-processors in 2001 and then deep learning buried it.
-We get to dig it back up and use it because the LLM IS the smart feature
+The really important property: **this is the cerebellum's learning rule,
+made concrete**. Single-stage classifier training is structurally identical
+to Marr-Albus cerebellar learning — error-driven, local, repetitive,
+supervised against per-example targets. Computer vision discovered the right
+learning rule for procedural co-processors before deep learning buried it,
+and Daniel has been quietly using it for music notation recognition the
+whole time. We get to copy it because the LLM IS the smart feature
 extractor that classical CV never had access to.
+
+**Reference repos to study before building cortex's version:**
+
+- `C:\src\classifiers\` — collection of small per-symbol CNN classifiers,
+  one subdirectory per musical symbol class. Each subdirectory has a
+  `train.py` with the same structure (in-RAM data load → stratified split
+  → CNN train loop → ONNX export). The cleanest template is
+  `accidentals/train.py` — read it before writing cortex's classifier.
+- `C:\src\acapella\` — the OMR pipeline that consumes the classifiers via
+  ONNX. Has the `SymbolFragment` / `on_fragment` callback pattern which is
+  the bootstrap-learning approach we should copy for cortex. See
+  `src/acapella/types.py` for the dataclass and
+  `src/acapella/onnx_classifier.py` for the inference wrapper.
 
 ### Substrate preservation, attention-discovered structure, reframing — the trio
 
@@ -413,23 +436,80 @@ package moved to a subdir, but it's not blocking anything we care about).
 
 In rough order of value-per-effort, what to do next:
 
-### 1. The trainable cascade classifier (priority: high)
+### 1. The trainable boundary classifier (priority: high)
 
-This is the major next step. Build a small linear or AdaBoost classifier
-that takes per-layer attention features (about 50 features per token position)
-and is trained against hand-labeled boundary positions on the existing fixtures.
-Hold out a subset for evaluation. Report honest precision/recall on held-out
-data, which we currently do not have.
+This is the major next step. Build a small CNN/MLP classifier that takes
+per-layer attention features as input and is trained to predict whether each
+token position is a concept boundary. The shape we want is closely modeled
+on `C:\src\classifiers\accidentals\train.py` — single-stage, in-RAM, PyTorch,
+ONNX export, ~minutes per epoch on CPU. Not a Viola-Jones cascade; the
+literal prior art is simpler and the simpler shape is the right starting
+point.
 
-The expected benefit:
+**Concrete plan:**
+
+1. **Synthetic training data generation.** Build a script that produces
+   labeled token sequences by concatenating known-distinct text spans.
+   Sources: multi-turn chat logs (ShareGPT, OpenAssistant) where role
+   transitions are ground-truth boundaries; concatenated paragraphs from
+   different documents where the splice point is a known boundary;
+   structured documents (markdown headings, function definitions) where
+   structural markers are boundaries. For each synthetic fixture we know
+   the ground-truth boundary positions because *we put them there*. This
+   replaces hand-annotation with programmatic label generation, which is
+   exactly Daniel's approach in `\src\classifiers\` (extract from PrIMuS
+   and DeepScores rather than hand-label).
+
+2. **Feature extraction.** For each token position in the training set, run
+   `forward_traced` and extract ~50 features per position:
+   - 24 per-layer "attention to position i from a future window"
+   - 24 per-layer "leftward baseline"
+   - 1 source-change indicator
+   - 1 position-relative-to-sequence-length
+   Save as `(features: [N, 50], labels: [N])` tensors.
+
+3. **Train a small MLP classifier.** Adapt `accidentals/train.py`:
+   - Replace the CNN with a small MLP (50 → 32 → 16 → 1 with sigmoid)
+   - Replace the image data loader with the feature tensor loader
+   - Keep the stratified split, ReduceLROnPlateau, best-checkpoint, ONNX export
+   - Use binary cross-entropy loss
+   - Train on CPU, ~minutes per epoch
+   - WeightedRandomSampler for class imbalance (positive boundaries are rare)
+
+4. **Evaluate on held-out data.** Crucially: hold out a slice of the
+   synthetic fixtures AND the existing hand-labeled fixtures (mixed-trust,
+   multi-source, identical-content). The synthetic data is "easy"
+   boundaries (clean splices between distinct genres); the hand-labeled
+   fixtures are "hard" boundaries (in-domain shifts). The interesting
+   question is whether a classifier trained on easy synthetic data
+   generalizes to hard real data. Report precision, recall, F1, confusion
+   matrix, misclassification list. This gives us the first honest
+   evaluation number for the boundary detection problem.
+
+5. **Add Fragment collection to the pinky binary.** After the first
+   training run, integrate the trained classifier into
+   `concept-boundaries`. Add a `--save-fragments` flag that captures every
+   classified position with its features and saves them to disk. Daniel
+   labels the saved fragments later (or pipes them to a label-collection
+   tool) to grow the training set with real production data. This is the
+   bootstrap pattern from `acapella/src/acapella/types.py` (`SymbolFragment`
+   dataclass + `on_fragment` callback).
+
+**Estimated effort**: 1-2 evenings for the synthetic generator + training
+loop + first evaluation. The training loop port is mostly mechanical
+because Daniel's template is so clean. The synthetic data generator is the
+part that takes thinking — what counts as a "known-distinct text span" to
+splice, and how do we make the synthetic boundaries realistic enough to
+transfer to real data?
+
+**Expected benefit**:
 - Honest evaluation numbers (we don't have any right now; everything tonight
   was on data the formula was tuned for)
-- Discovery of which layers actually carry the boundary signal (we're guessing)
+- Discovery of which layers/features actually carry the boundary signal
+  (the trained MLP weights tell us empirically rather than us guessing)
 - A learning rule that works for the other procedures we want to build
   (refusal, reframing detection, retrieval focusing)
-
-The work is bounded: ~1-2 days for a logistic regression baseline, ~3-5 days
-for an AdaBoost cascade with a held-out evaluation pipeline.
+- A bootstrap pipeline for growing the training set with real data over time
 
 ### 2. Noise floor measurement for the reframing metric
 
@@ -648,13 +728,21 @@ internalize before touching any code are:
    we showed evidence for the first three and identified the fourth as the
    next thing to build. Do not regress to the three-property version.
 
-2. **The Viola-Jones reframe is the single biggest insight** in the project
-   so far, and it came late on 2026-04-06 from /btw via Daniel. It tells us
-   that cortex is structurally a cascade classifier on LLM features, that
-   the procedural co-processor's learning rule already exists (cascade
-   training, AdaBoost, CMA-ES), and that the next pinky experiment should
-   be making the boundary classifier trainable. Do not let this insight get
-   lost just because it was the last thing said.
+2. **The "small classifier on smart features" reframe is the single biggest
+   insight** in the project so far, and it came late on 2026-04-06 from
+   /btw via Daniel. /btw originally framed it as a Viola-Jones cascade,
+   which is conceptually correct but literally specific. After surveying
+   `C:\src\classifiers\` (Daniel's actual working music-OMR codebase), the
+   literal prior art is simpler: small per-task CNNs trained in PyTorch and
+   exported to ONNX, no cascade. **Build the simpler shape first.** Cortex
+   is structurally a small classifier on top of LLM attention features; the
+   procedural co-processor's learning rule already exists in standard
+   PyTorch supervised training; the next pinky experiment is making the
+   boundary classifier trainable using `accidentals/train.py` as the
+   template. Do not let this insight get lost just because it was the
+   last thing said. Do not also accidentally regress to "we should build a
+   Viola-Jones cascade" when the simpler single-stage version is what
+   Daniel has been successfully using all along.
 
 3. **Daniel is the one whose intuitions to follow.** He has consistently
    landed correct architectural insights ahead of me, often phrased
@@ -674,6 +762,13 @@ internalize before touching any code are:
 5. **The next thing to build is the trainable boundary classifier.** Not
    "more reframing fixtures," not "smarter scoring formulas," not "rewrite
    the engine in a fancier way." The trainable classifier. Read the
-   "open questions and next experiments" section above, then start there.
+   "open questions and next experiments" section above, then read
+   `C:\src\classifiers\accidentals\train.py` as the template to copy, then
+   start there. The synthetic-data-generation step is the part that takes
+   the most thinking; the training loop port is mechanical. Also read
+   `C:\src\acapella\src\acapella\types.py` for the `SymbolFragment` /
+   `on_fragment` callback pattern, which is the bootstrap-learning approach
+   we want to mirror so we don't have to hand-label thousands of examples
+   upfront.
 
 Welcome back. Sorry about the disk crash, if that's what brought you here.
