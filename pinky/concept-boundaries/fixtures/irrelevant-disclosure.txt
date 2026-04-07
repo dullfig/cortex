@@ -1,0 +1,12 @@
+# Control disclosure for the reframing experiment.
+#
+# This is the same shape and length as dog-disclosure.txt — a single
+# sentence about something that happened earlier — but the content is
+# completely irrelevant to the conversation about Tom. If the reframing
+# signal we measured with the dog disclosure is real, this disclosure
+# should produce a much SMALLER cos_dist on the conversation tokens, and
+# the top reframed tokens should be a different (less semantically
+# coherent) set. If it produces the same signal, the reframing measure
+# is just noise and we've measured nothing.
+
+doc: Earlier that week, the new bridge across the river had finally been completed.

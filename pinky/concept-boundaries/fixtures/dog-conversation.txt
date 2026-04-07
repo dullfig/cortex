@@ -1,0 +1,16 @@
+# Dog example — the "conversation" half.
+#
+# This is what the model reads in pass 1: a description of an evening
+# with Tom that, on the surface, reads as someone being rude or aloof.
+# The detail words (quiet, picked at his food, shrugged, tired, left
+# early, without saying goodbye) all carry potential dual meanings.
+# Without context, the most likely interpretation is "Tom was being
+# antisocial."
+#
+# The disclosure fixture (dog-disclosure.txt) introduces information
+# that should reframe every one of those details into a grief signal.
+# Pass 2 prepends the disclosure and re-runs the same conversation.
+# We measure how much the model's attention over the conversation
+# tokens reorganizes between the two passes.
+
+doc: Tom was unusually quiet during dinner. He picked at his food and barely touched his drink. When I asked about his weekend plans he just shrugged and said he was tired. He left early without saying goodbye to anyone.

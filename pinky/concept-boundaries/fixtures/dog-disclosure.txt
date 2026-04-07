@@ -1,0 +1,17 @@
+# Dog example — the "disclosure" half.
+#
+# This single sentence is prepended to the conversation in pass 2 only.
+# It changes nothing about the conversation bytes themselves; it adds
+# context that should reframe how the model attends to those bytes.
+#
+# Under this disclosure, every detail in the conversation should take
+# on a new meaning: quiet → grieving, picked at food → no appetite from
+# loss, shrugged → unable to engage, tired → emotionally exhausted,
+# left early without goodbye → couldn't bear social contact.
+#
+# A purely byte-driven concept extractor would produce identical
+# attention patterns over the conversation regardless of this prefix.
+# A reframing-capable extractor should produce meaningfully different
+# attention patterns over the same bytes.
+
+doc: Earlier that week, Tom's beloved old dog had died unexpectedly.

@@ -206,6 +206,36 @@ struct Cli {
     /// scores you see without the bonus.
     #[arg(long, default_value = "0.0")]
     provenance_bonus: f32,
+
+    /// Optional disclosure fixture for the reframing experiment.
+    ///
+    /// When provided, the binary runs forward_traced TWICE:
+    ///   pass 1: just the main fixture (the "conversation")
+    ///   pass 2: disclosure tokens + main fixture tokens
+    ///
+    /// It then measures, for each token position in the conversation,
+    /// how much the model's attention over that position reorganized
+    /// between the two passes. Tokens whose attention patterns shifted
+    /// the most are the ones whose interpretation was reframed by the
+    /// disclosure — which is the operational test of "the same bytes
+    /// produce a different concept structure under different context."
+    #[arg(long)]
+    disclosure: Option<PathBuf>,
+
+    /// Optional control disclosure for the reframing experiment.
+    ///
+    /// When provided alongside --disclosure, the binary runs THREE
+    /// forward passes: pass 1 (no disclosure), pass 2 (test disclosure),
+    /// and pass 3 (control disclosure — should be irrelevant to the
+    /// conversation). It then computes per-token DELTAS between the
+    /// test and control reorganization scores, and ranks tokens by
+    /// (test - control). This isolates the topic-specific reframing
+    /// signal from generic prefix-effect attention drift.
+    ///
+    /// Use this to confirm that an apparent reframing finding isn't
+    /// just a side effect of having any prefix at all.
+    #[arg(long)]
+    control_disclosure: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -536,6 +566,342 @@ fn main() -> Result<()> {
     ] {
         if n > 0 {
             println!("  {:<8} {} tokens", label, n);
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // Reframing experiment (only if --disclosure was provided)
+    // ----------------------------------------------------------------------
+    //
+    // Pass 2: encode the disclosure, prepend its tokens to the main
+    // fixture's tokens, run forward_traced again. The disclosure adds
+    // context that the model can attend to from the main-fixture
+    // positions. We then compare the attention patterns over the main-
+    // fixture tokens between pass 1 (no disclosure) and pass 2 (with
+    // disclosure prefix) to see how much they reorganized.
+    if let Some(ref disclosure_path) = cli.disclosure {
+        println!();
+        println!("================================================================");
+        println!("REFRAMING EXPERIMENT");
+        println!("================================================================");
+        println!();
+
+        let disclosure_regions = parse_fixture(disclosure_path)?;
+        println!(
+            "loaded disclosure: {} region(s) from {}",
+            disclosure_regions.len(),
+            disclosure_path.display(),
+        );
+        for r in &disclosure_regions {
+            println!("  [{:>6}] {}", r.source.label(), r.content);
+        }
+        println!();
+
+        let disclosure_tokens = encode_with_provenance(&loaded.tokenizer, &disclosure_regions);
+        let m = disclosure_tokens.len();
+        println!("disclosure tokens: {m}");
+
+        // Build pass-2 token sequence: disclosure followed by main fixture
+        let pass2_ids: Vec<u32> = disclosure_tokens
+            .iter()
+            .chain(tokens.iter())
+            .map(|t| t.id)
+            .collect();
+        println!(
+            "pass 2 sequence: {} tokens (disclosure {} + conversation {})",
+            pass2_ids.len(),
+            m,
+            tokens.len(),
+        );
+
+        println!("running pass 2 forward_traced...");
+        let t2_start = std::time::Instant::now();
+        let (_logits2, trace2) = loaded.model.forward_traced(&pass2_ids);
+        println!(
+            "  done in {:.2}s",
+            t2_start.elapsed().as_secs_f32(),
+        );
+        println!();
+
+        // ------------------------------------------------------------------
+        // Reframing score per conversation token
+        // ------------------------------------------------------------------
+        //
+        // For each conversation token at position q in pass 1, the
+        // corresponding position in pass 2 is q + m (because m disclosure
+        // tokens were prepended). We compare the model's attention over
+        // that position between the two passes by looking at the
+        // *within-conversation* attention rows.
+        //
+        // Specifically, for query position q in pass 1, the attention row
+        // covers keys 0..=q (causal). For query position q + m in pass 2,
+        // the row covers keys 0..=(q + m), where keys [0, m) are the
+        // disclosure tokens and keys [m, m + q] are the conversation
+        // tokens.
+        //
+        // We measure two things:
+        //   - frac_to_disclosure: how much of the attention in pass 2 is
+        //     spent on the disclosure tokens (vs the conversation). High
+        //     values mean the model is "consulting" the disclosure when
+        //     processing this conversation token.
+        //   - cosine_dist: cosine distance between pass 1's full row and
+        //     the conversation portion of pass 2's row, normalized so
+        //     they sum to 1. High values mean even after factoring out
+        //     the disclosure pull, the within-conversation attention
+        //     pattern reorganized.
+        //
+        // Both averaged over heads and selected layers.
+
+        let s1 = trace.seq_len;
+        assert_eq!(s1, tokens.len(), "pass 1 seq_len should match token count");
+
+        let mut reframe_data: Vec<(usize, f32, f32)> = Vec::with_capacity(s1);
+
+        for q in 0..s1 {
+            let q2 = q + m;
+            let mut total_frac = 0.0f32;
+            let mut total_cos_dist = 0.0f32;
+            let mut count = 0usize;
+
+            for &layer in &selected_layers {
+                for h in 0..trace.n_heads {
+                    let row1 = trace.attention_row(layer, h, q);
+                    let row2 = trace2.attention_row(layer, h, q2);
+
+                    // Pass 1 attention is over [0, q]; rest is causal-zero.
+                    // Pass 2 attention is over [0, q2] = [0, m+q]; first m
+                    // entries are over the disclosure, next q+1 entries are
+                    // over the conversation.
+                    let row1_conv = &row1[..=q]; // length q+1
+                    let row2_disc = &row2[..m];  // length m
+                    let row2_conv = &row2[m..=q2]; // length q+1
+
+                    let frac_to_disc: f32 = row2_disc.iter().sum();
+                    total_frac += frac_to_disc;
+
+                    // Renormalize the conversation portion of pass 2 to sum
+                    // to 1 (since pass 1's row also sums to 1) and compare.
+                    let conv_sum: f32 = row2_conv.iter().sum();
+                    if conv_sum > 1e-8 {
+                        let mut dot = 0.0f32;
+                        let mut n1 = 0.0f32;
+                        let mut n2 = 0.0f32;
+                        for (a, b) in row1_conv.iter().zip(row2_conv.iter()) {
+                            let b_norm = b / conv_sum;
+                            dot += a * b_norm;
+                            n1 += a * a;
+                            n2 += b_norm * b_norm;
+                        }
+                        let denom = (n1.sqrt() * n2.sqrt()).max(1e-8);
+                        let cos_sim = (dot / denom).clamp(-1.0, 1.0);
+                        total_cos_dist += 1.0 - cos_sim;
+                    }
+                    count += 1;
+                }
+            }
+
+            let avg_frac = total_frac / count as f32;
+            let avg_cos_dist = total_cos_dist / count as f32;
+            reframe_data.push((q, avg_frac, avg_cos_dist));
+        }
+
+        // Skip position 0 (no meaningful comparison) and rank by
+        // cosine distance — that's the reorganization signal independent
+        // of the absolute pull from the disclosure.
+        let mut ranked: Vec<(usize, f32, f32)> = reframe_data
+            .iter()
+            .copied()
+            .filter(|&(q, _, _)| q > 0)
+            .collect();
+        ranked.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+
+        let top_k = cli.top_k.min(ranked.len());
+        println!("top-{top_k} reframed tokens (highest within-conversation reorganization):");
+        println!(
+            "  {:>4}  {:>10}  {:>10}  text",
+            "pos", "cos_dist", "frac_disc"
+        );
+        println!("  {}", "-".repeat(60));
+        for &(q, frac, cd) in ranked.iter().take(top_k) {
+            let text = loaded.tokenizer.decode(&[tokens[q].id])
+                .replace('\n', "\\n");
+            println!(
+                "  {:>4}  {:>10.4}  {:>10.4}  {:?}",
+                q, cd, frac, text,
+            );
+        }
+        println!();
+
+        // Also report the raw per-token table so we can see the full
+        // pattern, not just the top.
+        println!("per-token reframing trace (cos_dist = within-conv reorganization, frac_disc = attention to disclosure):");
+        println!(
+            "  {:>4}  {:>10}  {:>10}  text",
+            "pos", "cos_dist", "frac_disc"
+        );
+        println!("  {}", "-".repeat(60));
+        for &(q, frac, cd) in &reframe_data {
+            let text = loaded.tokenizer.decode(&[tokens[q].id])
+                .replace('\n', "\\n");
+            println!(
+                "  {:>4}  {:>10.4}  {:>10.4}  {:?}",
+                q, cd, frac, text,
+            );
+        }
+        println!();
+
+        let mean_cos_dist: f32 = reframe_data.iter().skip(1).map(|x| x.2).sum::<f32>()
+            / (reframe_data.len() - 1) as f32;
+        let mean_frac: f32 = reframe_data.iter().skip(1).map(|x| x.1).sum::<f32>()
+            / (reframe_data.len() - 1) as f32;
+        println!("summary:");
+        println!("  mean cos_dist  = {:.4}  (avg within-conversation reorganization)", mean_cos_dist);
+        println!("  mean frac_disc = {:.4}  (avg attention pulled to disclosure)", mean_frac);
+
+        // ------------------------------------------------------------------
+        // Control disclosure comparison
+        // ------------------------------------------------------------------
+        if let Some(ref control_path) = cli.control_disclosure {
+            println!();
+            println!("----- CONTROL COMPARISON -----");
+            println!();
+
+            let control_regions = parse_fixture(control_path)?;
+            println!(
+                "loaded control disclosure: {} region(s) from {}",
+                control_regions.len(),
+                control_path.display(),
+            );
+            for r in &control_regions {
+                println!("  [{:>6}] {}", r.source.label(), r.content);
+            }
+
+            let control_tokens = encode_with_provenance(&loaded.tokenizer, &control_regions);
+            let mc = control_tokens.len();
+            println!("control disclosure tokens: {mc}");
+
+            let pass3_ids: Vec<u32> = control_tokens
+                .iter()
+                .chain(tokens.iter())
+                .map(|t| t.id)
+                .collect();
+            println!("running pass 3 (control) forward_traced...");
+            let t3_start = std::time::Instant::now();
+            let (_logits3, trace3) = loaded.model.forward_traced(&pass3_ids);
+            println!(
+                "  done in {:.2}s",
+                t3_start.elapsed().as_secs_f32(),
+            );
+            println!();
+
+            // Compute control reframe data using the same logic as the
+            // test disclosure (just with mc instead of m, and trace3
+            // instead of trace2).
+            let mut control_data: Vec<(usize, f32, f32)> = Vec::with_capacity(s1);
+            for q in 0..s1 {
+                let q3 = q + mc;
+                let mut total_frac = 0.0f32;
+                let mut total_cos_dist = 0.0f32;
+                let mut count = 0usize;
+                for &layer in &selected_layers {
+                    for h in 0..trace.n_heads {
+                        let row1 = trace.attention_row(layer, h, q);
+                        let row3 = trace3.attention_row(layer, h, q3);
+                        let row1_conv = &row1[..=q];
+                        let row3_disc = &row3[..mc];
+                        let row3_conv = &row3[mc..=q3];
+                        let frac_to_disc: f32 = row3_disc.iter().sum();
+                        total_frac += frac_to_disc;
+                        let conv_sum: f32 = row3_conv.iter().sum();
+                        if conv_sum > 1e-8 {
+                            let mut dot = 0.0f32;
+                            let mut n1 = 0.0f32;
+                            let mut n2 = 0.0f32;
+                            for (a, b) in row1_conv.iter().zip(row3_conv.iter()) {
+                                let b_norm = b / conv_sum;
+                                dot += a * b_norm;
+                                n1 += a * a;
+                                n2 += b_norm * b_norm;
+                            }
+                            let denom = (n1.sqrt() * n2.sqrt()).max(1e-8);
+                            let cos_sim = (dot / denom).clamp(-1.0, 1.0);
+                            total_cos_dist += 1.0 - cos_sim;
+                        }
+                        count += 1;
+                    }
+                }
+                let avg_frac = total_frac / count as f32;
+                let avg_cos_dist = total_cos_dist / count as f32;
+                control_data.push((q, avg_frac, avg_cos_dist));
+            }
+
+            // Compute deltas: test cos_dist minus control cos_dist.
+            // Positive delta = the test disclosure produced MORE reorganization
+            // at this position than the control did = topic-specific reframing.
+            let mut deltas: Vec<(usize, f32, f32, f32)> = Vec::with_capacity(s1);
+            for q in 1..s1 {
+                let test_cd = reframe_data[q].2;
+                let ctrl_cd = control_data[q].2;
+                let delta = test_cd - ctrl_cd;
+                deltas.push((q, test_cd, ctrl_cd, delta));
+            }
+
+            // Sort by delta descending — top positions are where the test
+            // disclosure reframed and the control did not.
+            deltas.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap());
+
+            let top_k = cli.top_k.min(deltas.len());
+            println!(
+                "top-{top_k} TOPIC-SPECIFIC reframed tokens (test cos_dist - control cos_dist):"
+            );
+            println!(
+                "  {:>4}  {:>10}  {:>10}  {:>10}  text",
+                "pos", "delta", "test_cd", "ctrl_cd"
+            );
+            println!("  {}", "-".repeat(70));
+            for &(q, test_cd, ctrl_cd, delta) in deltas.iter().take(top_k) {
+                let text = loaded.tokenizer.decode(&[tokens[q].id])
+                    .replace('\n', "\\n");
+                println!(
+                    "  {:>4}  {:>+10.4}  {:>10.4}  {:>10.4}  {:?}",
+                    q, delta, test_cd, ctrl_cd, text,
+                );
+            }
+            println!();
+
+            // Bottom-K: positions where the CONTROL reframed more than the
+            // test. These should be conversation tokens that are intrinsically
+            // related to the control topic but unrelated to the test topic.
+            // For our dog vs bridge example, these might surface words like
+            // "without" or other words that have spatial/architectural
+            // associations.
+            println!(
+                "bottom-{top_k} TOPIC-SPECIFIC tokens (control reframed MORE than test):"
+            );
+            println!(
+                "  {:>4}  {:>10}  {:>10}  {:>10}  text",
+                "pos", "delta", "test_cd", "ctrl_cd"
+            );
+            println!("  {}", "-".repeat(70));
+            for &(q, test_cd, ctrl_cd, delta) in deltas.iter().rev().take(top_k) {
+                let text = loaded.tokenizer.decode(&[tokens[q].id])
+                    .replace('\n', "\\n");
+                println!(
+                    "  {:>4}  {:>+10.4}  {:>10.4}  {:>10.4}  {:?}",
+                    q, delta, test_cd, ctrl_cd, text,
+                );
+            }
+            println!();
+
+            let mean_test: f32 = reframe_data.iter().skip(1).map(|x| x.2).sum::<f32>()
+                / (s1 - 1) as f32;
+            let mean_ctrl: f32 = control_data.iter().skip(1).map(|x| x.2).sum::<f32>()
+                / (s1 - 1) as f32;
+            let mean_delta = mean_test - mean_ctrl;
+            println!("control comparison summary:");
+            println!("  mean test cos_dist     = {:.4}", mean_test);
+            println!("  mean control cos_dist  = {:.4}", mean_ctrl);
+            println!("  mean delta             = {:+.4}  (positive = test reframed more)", mean_delta);
         }
     }
 
