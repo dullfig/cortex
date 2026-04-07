@@ -167,14 +167,13 @@ struct Cli {
     model: Option<PathBuf>,
 
     /// Future-token window for boundary scoring. For each candidate
-    /// boundary i, we look at the next `window` query positions and
-    /// measure how cleanly their attention stops at i.
-    #[arg(long, default_value = "6")]
+    /// boundary i, we look at the next `window` query positions.
+    #[arg(long, default_value = "12")]
     window: usize,
 
-    /// Weight on the "leftward bleed" penalty in the boundary score.
-    /// Higher alpha penalizes future tokens that still attend to positions
-    /// before the candidate boundary.
+    /// Weight on the "leftward baseline" penalty in the boundary score.
+    /// Higher alpha demands a stronger anchor signal at i relative to
+    /// the average leftward position.
     #[arg(long, default_value = "1.0")]
     alpha: f32,
 
@@ -182,6 +181,17 @@ struct Cli {
     /// against the fixture's known trust-region edges.
     #[arg(long, default_value = "8")]
     top_k: usize,
+
+    /// Which layers to average attention over: "middle" (middle third),
+    /// "late" (last third), "all" (every layer).
+    #[arg(long, default_value = "middle")]
+    layers: String,
+
+    /// Non-max suppression radius. Boundary candidates within ±nms of a
+    /// higher-scoring candidate are suppressed before reporting. Set to 0
+    /// to disable.
+    #[arg(long, default_value = "2")]
+    nms: usize,
 }
 
 fn main() -> Result<()> {
@@ -254,42 +264,61 @@ fn main() -> Result<()> {
     println!();
 
     // ----------------------------------------------------------------------
-    // Boundary scoring (DynSplit-KV-style)
+    // Boundary scoring (anchored, per-position normalized)
     // ----------------------------------------------------------------------
     //
-    // For each candidate boundary position i, score how cleanly the
-    // attention pattern of future positions stops at i:
+    // For each candidate boundary position i, score how strongly i acts as
+    // an anchor for the next few tokens:
     //
     //   s_i = mean over q ∈ (i, i+window], heads, selected layers of:
-    //           Σ attn(q, k) for k ∈ [i, q]      <-- "rightward focus"
-    //         - α · Σ attn(q, k) for k ∈ [0, i)  <-- "leftward bleed"
+    //           attn(q, i)                       <-- look-back attention TO i
+    //         - α · (1/i) · Σ_{k ∈ [0, i)} attn(q, k)   <-- avg per-leftward-position
     //
-    // High s_i means future positions are mostly attending to things at
-    // or after i, ignoring everything before i. That's the operational
-    // signature of a concept boundary: the future loses interest in the
-    // past at exactly that point.
+    // Both terms are "attention weight per single position" so they have
+    // the same units, and the position-in-sequence dilution cancels out.
+    // A real concept boundary is a position that future tokens look back
+    // to disproportionately, more than they look back to any typical
+    // earlier position.
     //
-    // Layer selection: we average over the middle third of the network.
-    // Early layers are too syntactic (token n-grams), late layers are
-    // too task-specific (next-token prediction). Middle layers carry
-    // the abstract relational structure that makes "concept" meaningful.
+    // Layer selection options:
+    //   "middle" — middle third of layers (relational structure)
+    //   "late"   — last third (task-conditioned, more abstract)
+    //   "all"    — every layer averaged
+    //
+    // Degenerate boundaries are skipped: i = 0 has no leftward baseline,
+    // and the last position has no future tokens to score it.
 
     let n_layers = trace.n_layers;
-    let layer_lo = n_layers / 3;
-    let layer_hi = (2 * n_layers / 3).max(layer_lo + 1);
-    let selected_layers: Vec<usize> = (layer_lo..layer_hi).collect();
+    let selected_layers: Vec<usize> = match cli.layers.as_str() {
+        "middle" => {
+            let lo = n_layers / 3;
+            let hi = (2 * n_layers / 3).max(lo + 1);
+            (lo..hi).collect()
+        }
+        "late" => {
+            let lo = 2 * n_layers / 3;
+            (lo..n_layers).collect()
+        }
+        "all" => (0..n_layers).collect(),
+        other => {
+            return Err(anyhow!(
+                "--layers must be 'middle', 'late', or 'all', got: {other}"
+            ));
+        }
+    };
 
     let window = cli.window;
     let alpha = cli.alpha;
     let s = trace.seq_len;
 
     println!(
-        "scoring boundaries: layers {:?}, future window = {}, alpha = {}",
-        selected_layers, window, alpha,
+        "scoring boundaries: layers {} ({:?}), future window = {}, alpha = {}",
+        cli.layers, selected_layers, window, alpha,
     );
 
-    let mut scores = vec![0.0f32; s];
-    for i in 0..s {
+    // f32::NEG_INFINITY for skipped positions so they sort to the bottom
+    let mut scores = vec![f32::NEG_INFINITY; s];
+    for i in 1..(s - 1) {
         let q_lo = i + 1;
         let q_hi = (i + 1 + window).min(s);
         if q_hi <= q_lo {
@@ -303,19 +332,16 @@ fn main() -> Result<()> {
             for h in 0..trace.n_heads {
                 for q in q_lo..q_hi {
                     let row = trace.attention_row(layer, h, q);
-                    // Rightward focus: attention from q to keys in [i, q].
-                    // (k > q is masked to 0 by causality, so safe to slice up
-                    //  to s; but we cap at q+1 to be explicit.)
-                    let right_sum: f32 = row[i..=q].iter().sum();
-                    // Leftward bleed: attention from q to keys in [0, i).
-                    let left_sum: f32 = if i > 0 { row[..i].iter().sum() } else { 0.0 };
-                    total += right_sum - alpha * left_sum;
+                    let attn_to_i = row[i];
+                    let left_sum: f32 = row[..i].iter().sum();
+                    let avg_left = left_sum / i as f32;
+                    total += attn_to_i - alpha * avg_left;
                     count += 1;
                 }
             }
         }
 
-        scores[i] = if count > 0 { total / count as f32 } else { 0.0 };
+        scores[i] = if count > 0 { total / count as f32 } else { f32::NEG_INFINITY };
     }
 
     // ----------------------------------------------------------------------
@@ -348,24 +374,57 @@ fn main() -> Result<()> {
     println!();
 
     // ----------------------------------------------------------------------
-    // Top-K boundary candidates
+    // Sort, then non-max suppress
     // ----------------------------------------------------------------------
+    //
+    // The model's "noticing" of a boundary tends to peak 1-2 tokens AFTER
+    // the actual boundary, so adjacent positions often score similarly.
+    // NMS collapses each cluster of nearby high-scoring positions into a
+    // single "this is one boundary" finding, by walking the score-ranked
+    // list and keeping a candidate only if no higher-scoring candidate
+    // has already been kept within ±nms positions of it.
+
     let mut indexed: Vec<(usize, f32)> = scores
         .iter()
         .enumerate()
+        .filter(|(_, &v)| v.is_finite())
         .map(|(i, &v)| (i, v))
         .collect();
     indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
-    let top_k = cli.top_k.min(s);
-    println!("top-{top_k} boundary candidates by score:");
+    let nms_radius = cli.nms;
+    let mut suppressed: Vec<(usize, f32)> = Vec::new();
+    for &(pos, score) in &indexed {
+        let collides = suppressed
+            .iter()
+            .any(|&(kept_pos, _)| pos.abs_diff(kept_pos) <= nms_radius);
+        if !collides {
+            suppressed.push((pos, score));
+        }
+    }
+
+    let top_k = cli.top_k.min(suppressed.len());
+    println!(
+        "top-{top_k} boundary candidates after NMS (radius ±{nms_radius}):"
+    );
     println!(
         "  {:>4}  {:>9}  {:>6}  {:<8}  {:<8}  text",
         "pos", "score", "trust?", "src_prev", "src_next"
     );
     println!("  {}", "-".repeat(60));
-    for &(pos, score) in indexed.iter().take(top_k) {
-        let is_trust = trust_edges.contains(&pos);
+    for &(pos, score) in suppressed.iter().take(top_k) {
+        // A candidate "hits" a trust edge if it's within ±nms_radius of one
+        let is_trust_near = trust_edges
+            .iter()
+            .any(|&e| pos.abs_diff(e) <= nms_radius);
+        let is_trust_exact = trust_edges.contains(&pos);
+        let trust_marker = if is_trust_exact {
+            "✓"
+        } else if is_trust_near {
+            "~"
+        } else {
+            " "
+        };
         let prev_src = if pos > 0 {
             tokens[pos - 1].source.label()
         } else {
@@ -376,36 +435,57 @@ fn main() -> Result<()> {
             .replace('\n', "\\n");
         println!(
             "  {:>4}  {:>9.4}  {:>6}  {:<8}  {:<8}  {:?}",
-            pos,
-            score,
-            if is_trust { "✓" } else { " " },
-            prev_src,
-            next_src,
-            text,
+            pos, score, trust_marker, prev_src, next_src, text,
         );
     }
+    println!("  (✓ = exact match, ~ = within ±{nms_radius} of a trust edge)");
     println!();
 
     // ----------------------------------------------------------------------
-    // Alignment summary: how many of the top-K candidates are real edges?
+    // Alignment summary: precision/recall against trust edges, with the
+    // "near" tolerance reflecting that boundary signal can peak 1-2 tokens
+    // off the exact edge.
     // ----------------------------------------------------------------------
-    let top_set: std::collections::HashSet<usize> =
-        indexed.iter().take(top_k).map(|&(p, _)| p).collect();
     let trust_set: std::collections::HashSet<usize> =
         trust_edges.iter().copied().collect();
-    let hits = top_set.intersection(&trust_set).count();
-    let precision = if top_k > 0 { hits as f32 / top_k as f32 } else { 0.0 };
-    let recall = if !trust_set.is_empty() {
-        hits as f32 / trust_set.len() as f32
-    } else {
-        0.0
-    };
+
+    let mut hits_exact = 0;
+    let mut hits_near = 0;
+    let mut matched_edges_exact: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
+    let mut matched_edges_near: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
+
+    for &(pos, _) in suppressed.iter().take(top_k) {
+        if trust_set.contains(&pos) {
+            hits_exact += 1;
+            matched_edges_exact.insert(pos);
+        }
+        if let Some(&edge) = trust_edges.iter().find(|&&e| pos.abs_diff(e) <= nms_radius) {
+            hits_near += 1;
+            matched_edges_near.insert(edge);
+        }
+    }
+
+    let precision_exact = if top_k > 0 { hits_exact as f32 / top_k as f32 } else { 0.0 };
+    let precision_near = if top_k > 0 { hits_near as f32 / top_k as f32 } else { 0.0 };
+    let recall_exact = if !trust_set.is_empty() {
+        matched_edges_exact.len() as f32 / trust_set.len() as f32
+    } else { 0.0 };
+    let recall_near = if !trust_set.is_empty() {
+        matched_edges_near.len() as f32 / trust_set.len() as f32
+    } else { 0.0 };
 
     println!("alignment vs ground-truth trust edges:");
-    println!("  hits     = {hits} / {top_k} top candidates");
-    println!("  trust    = {} edges in fixture", trust_set.len());
-    println!("  precision = {:.2}  (top-K hits / top-K)", precision);
-    println!("  recall    = {:.2}  (top-K hits / trust edges)", recall);
+    println!("  trust edges        = {:?}", trust_edges);
+    println!("  exact precision    = {:.2}  ({}/{} top-K candidates land on a trust edge)",
+        precision_exact, hits_exact, top_k);
+    println!("  ±{} precision      = {:.2}  ({}/{} top-K candidates within ±{} of a trust edge)",
+        nms_radius, precision_near, hits_near, top_k, nms_radius);
+    println!("  exact recall       = {:.2}  ({}/{} trust edges hit exactly)",
+        recall_exact, matched_edges_exact.len(), trust_set.len());
+    println!("  ±{} recall         = {:.2}  ({}/{} trust edges hit within ±{})",
+        nms_radius, recall_near, matched_edges_near.len(), trust_set.len(), nms_radius);
     println!();
 
     // Provenance summary by region (kept from earlier)
