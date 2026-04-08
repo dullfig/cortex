@@ -585,7 +585,200 @@ with what he literally said, I'm probably misreading the shape." Look
 for the formal version. If you can't find it, ask for a refinement
 rather than pushing back.
 
-## 11. Personal context for future Claudes
+## 11. The cross-document morsel property (why this isn't just better RAG)
+
+This is the architectural property that makes the full pipeline (POSITION.md
+"The full pipeline" section) qualitatively different from retrieval-augmented
+generation, and not just incrementally better. /btw and Daniel landed on it
+on 2026-04-07 evening and it's the cleanest single statement of what the
+architecture *enables* that no existing retrieval method can.
+
+### The claim
+
+**Sub-document-level cross-paper connections.** A scientific finding is
+sometimes hiding in a *morsel* — one sentence, one clause, one observation —
+inside a paper that is otherwise about something else. The morsel only
+becomes load-bearing when it is combined with a morsel from another paper.
+Neither paper, taken as a whole, looks like an answer to the question. The
+connection exists only when both morsels are activated together by a
+specific query.
+
+**RAG cannot find these connections, by construction.** Cortex-style
+attention-over-stored-KV retrieval can.
+
+### The drug-X / thick-blood example
+
+Paper A is about drug X. Somewhere in its discussion section, one sentence
+says: *"Drug X reduces blood viscosity in rat models."* The paper is about
+drug X's primary indication, which is something else entirely.
+
+Paper B is about stroke risk factors. Somewhere in its background section,
+one sentence says: *"Thick blood is a risk factor for ischemic stroke."*
+The paper is about stroke epidemiology, not about treatments.
+
+Neither paper says "drug X might reduce stroke risk." The connection is not
+explicit in either document. It requires the reader to *combine* the
+viscosity-reduction observation in paper A with the viscosity-as-risk-factor
+observation in paper B, and notice that they form a causal chain.
+
+A working researcher with infinite reading time and perfect recall would
+make this connection. A real researcher misses it almost certainly, because
+each individual paper is in a different subfield and the morsel that matters
+is buried in a section the reader skimmed.
+
+### Why RAG cannot find this
+
+Standard RAG works on **chunks**: the corpus is broken into chunks (often
+sentences, often paragraphs, sometimes whole documents), each chunk is
+encoded as a *single fixed embedding vector* by an embedding model, and at
+query time the query gets encoded into a vector and you find the top-K
+chunks by cosine similarity.
+
+The fatal step is the per-chunk embedding. The embedding has to summarize
+"what is this chunk about, on average," which means morsel-level information
+gets washed out by the surrounding context. Paper A's "drug X reduces blood
+viscosity" sentence, embedded in the context of a chunk about drug X's
+primary indication, produces an embedding that points at *the primary
+indication topic*, not at viscosity reduction. The viscosity morsel
+contributes a small fraction of the chunk's average meaning and disappears
+under the chunk's dominant topic.
+
+Paper B has the same problem from the other side: the "thick blood is a
+risk factor" sentence is embedded in the context of a chunk about stroke
+epidemiology. Its contribution to the chunk's embedding is dominated by
+the surrounding stroke-risk-factor content.
+
+A query like "what could reduce ischemic stroke risk" produces a query
+embedding pointing at stroke prevention. Cosine similarity finds chunks
+*about* stroke prevention. Paper A's chunk is about drug X's primary
+indication and is far from the query in embedding space. Paper B's chunk is
+about stroke epidemiology and is somewhat close. **Neither chunk's
+embedding reflects the morsel-level relevance to the query.** The
+connection is invisible to the retriever.
+
+This is not a tuning problem. It's a structural property of any retrieval
+system that commits to a per-chunk embedding at index time. You can make
+chunks smaller, you can use better embedding models, you can use hybrid
+sparse-dense retrieval, you can use re-rankers — none of these solve the
+problem because all of them still operate on chunks-as-units. The morsel
+is below the chunk level no matter how small you make the chunks (and if
+you make chunks too small, you lose the surrounding context that disambiguates
+what the morsel means, which is also bad).
+
+### Why cortex-style attention retrieval CAN find this
+
+Daniel's PubMed-into-TurboQuant-cache architecture is structurally
+different. The corpus isn't broken into chunks-with-embeddings; it's
+ingested through the LLM and the resulting **per-token K vectors** are
+stored. Every individual token in the corpus has its own K vector, produced
+by the LLM during the ingestion forward pass, and that K vector encodes the
+*contextual representation* that the token had at that moment in that
+document — not "what is this chunk about on average," but "what does the
+LLM understand this token to mean given its surrounding context."
+
+At query time, the LLM processes the query and produces Q vectors. Raw
+`Q·K^T` over the entire stored substrate (with the morning's softmax-is-
+not-mandatory insight, no probability normalization) finds the K positions
+that have the highest dot product with the query's Q. **Those positions
+are the individual tokens — the morsels — that the LLM would have attended
+to most strongly if the entire corpus had been in its context window.**
+
+For the drug-X/thick-blood example, a query about stroke prevention
+produces Q vectors that the model uses to look for content about reducing
+stroke risk. Raw `Q·K^T` over the corpus surfaces the K vectors with the
+highest dot product. *Both* paper A's "reduces blood viscosity" sentence
+*and* paper B's "thick blood is a risk factor" sentence have high dot
+products with this query, because both are part of the model's
+understanding of the causal chain "viscosity → blood flow → stroke risk."
+The K vectors carry this contextual understanding because they're produced
+by the same model that learned the relationship during pretraining.
+
+The retrieval pass returns *both* morsels independently, even though
+they're in different papers, because their Q·K^T scores are independently
+high. The synthesis pass then receives both as part of its focused context
+and can produce: *"Drug X reduces blood viscosity (paper A), and elevated
+viscosity is a risk factor for ischemic stroke (paper B); these together
+suggest drug X may have an unstudied effect on stroke risk reduction."*
+
+**The connection is made by the attention pattern, not by either paper's
+literal content.** No chunk-level retriever can produce this output
+because the morsels never get to the synthesis pass — they're filtered
+out at the retrieval stage by the chunk-level embedding bottleneck.
+
+### Why this is genuinely new and not just a variant of existing approaches
+
+The closest existing prior art is **late-interaction retrieval** like
+ColBERT (Khattab & Zaharia, 2020+). ColBERT also uses token-level vectors
+instead of chunk-level embeddings, and it computes max-sim across query
+and document tokens for retrieval. So token-granularity retrieval itself
+isn't new.
+
+What *is* new in the cortex architecture is the combination:
+
+1. **The same generative model that does synthesis also produces the K
+   vectors during ingestion.** ColBERT trains a separate retrieval encoder
+   that's optimized for retrieval, not generation. Cortex uses the same
+   LLM at every stage — ingestion, retrieval (via Q·K^T), and synthesis —
+   so the retrieval space is *literally* the LLM's own attention space.
+   Whatever the LLM learned about how concepts relate during pretraining
+   is automatically the relevance signal at retrieval time, with no
+   separately-trained encoder to drift from it.
+
+2. **The K vectors carry full LLM contextual understanding.** Every K
+   vector at position i in the corpus is the LLM's representation of what
+   token i means *given the n-1 preceding tokens of its document*, not
+   just "what the token means in isolation" or "what a sentence-encoder
+   model thinks the surrounding sentence means." The contextual richness
+   is the LLM's full pretrained understanding, not a smaller encoder's
+   summary.
+
+3. **Synthesis happens in the same model that did retrieval, with the
+   retrieved K positions naturally loadable into the inference forward
+   pass.** No format conversion, no embedding-to-text round trip, no
+   separate "now generate" pipeline. The K vectors retrieved from the
+   store are exactly the K vectors the model would have used if the
+   relevant tokens had been in its context window — so loading them into
+   the inference attention computation is mechanically clean, not a
+   conceptual hack.
+
+4. **The dilution-free retrieval pass scales to corpus sizes that
+   ColBERT-style late-interaction was never built for.** Top-K of raw
+   Q·K^T is unbounded in cache size (the morning's softmax insight),
+   which means the same architecture works at PubMed scale (~30M
+   abstracts) without the attention pattern degrading.
+
+### Why this matters for the project
+
+The defensive use case (prompt injection prevention) and the positive use
+case (cross-paper morsel discovery) are co-equal in importance. The
+defensive case is what gets cortex deployed (it solves a real, painful,
+revenue-relevant problem for SaaS deployments). The positive case is what
+makes cortex *important* — it's a tool that researchers cannot get from
+any other system, applied to a problem (scientific connection-finding)
+where the cost of missed connections is measured in delayed cures and
+lost decades.
+
+The two use cases share the same architecture and the same primitive
+(attention over preserved substrate with the right aggregation operation).
+Building one builds the other for free, modulo small differences in
+classifier output classes and policy layers.
+
+This morsel-level cross-document property is the cleanest single statement
+of why the architecture is qualitatively new, not just incrementally
+better than existing retrieval. **No existing retrieval system can find
+sentence-level connections that span multiple documents where neither
+document, considered alone, looks like an answer to the query.** Cortex
+can, structurally, because it operates on the LLM's own attention
+substrate at token granularity rather than on document-level embeddings.
+
+Add this to the explanation of the project the next time someone asks
+"how is this different from RAG." The answer is: *RAG retrieves documents.
+We retrieve morsels, in the LLM's own attention space, at token
+granularity, with no embedding bottleneck.* Documents-vs-morsels is the
+right axis, and morsels are the unit you need for cross-document
+discovery to work at all.
+
+## 12. Personal context for future Claudes
 
 Daniel is 63 (as of 2026). Longevity and aging research is a personal
 motivation alongside the technical interest. This is worth knowing
