@@ -1,6 +1,7 @@
 # Cortex Position Paper
 
-**Date**: 2026-04-06
+**Date**: 2026-04-06 (updated 2026-04-07 with full-pipeline architecture and
+softmax-vs-aggregation insight)
 **Status**: Living document. Updated after each significant pinky experiment.
 **Audience**: A future Claude instance (or human collaborator) starting with no
 context, who needs to pick up this work after a context reset, reboot, or
@@ -37,6 +38,229 @@ from text, full stop). Each of these is independently defensible. Together they
 describe a system that solves several hard problems — prompt injection,
 context-sensitive recall, long-context attention dilution — that are not
 solvable with the standard architecture.
+
+## The full pipeline (end-to-end architecture, added 2026-04-07)
+
+The four-property architecture composes into a single end-to-end pipeline
+that handles arbitrary corpora, not just current input. The same primitives
+that find concept boundaries in a 50-token fixture also support
+attention-based retrieval over a million-token corpus, with provenance
+preserved through the entire flow. This is the *positive* use case for
+cortex, alongside the defensive prompt-injection use case — a tool for
+surfacing latent connections in scientific literature, code corpora,
+internal documentation, or any large body of text.
+
+### The shape
+
+```
+INGESTION (offline, once per corpus)
+  Corpus (PubMed / codebase / documentation / anything)
+    │
+    ▼
+  LLM forward pass over corpus → K and V vectors at every token
+    │
+    ▼
+  TurboQuant compression (engram-style 3-bit)
+    │
+    ▼
+  Persistent KV store with per-token provenance
+  (each KV vector tagged with paper ID / file path / line number)
+
+QUERY (online, every request)
+  User query
+    │
+    ▼
+  LLM forward pass over query → Q vectors
+    │
+    ▼
+  RETRIEVAL PASS: raw Q·K^T over the persistent store, NO softmax
+    │           top-K positions by raw score → list of relevant K positions
+    │           (this pass is unbounded in cache size — see softmax section below)
+    ▼
+  CLASSIFICATION PASS: trainable cortex classifier on captured attention scores
+    │           identifies concept boundaries within the retrieved spans
+    │           groups adjacent retrieved positions into coherent concepts
+    ▼
+  PROVENANCE ATTACHMENT: each concept inherits the source tags of its
+    │                    constituent KV vectors (paper, section, line)
+    ▼
+  INFERENCE PASS: LLM forward pass over (query + retrieved structured concepts)
+    │           normal softmax attention, but now over the focused substrate
+    │           rather than the entire corpus
+    ▼
+  Synthesis with citations: "X is plausible because [paper A] and [paper B]"
+```
+
+### The model is used three times, identically each time
+
+In all three uses (ingestion, retrieval-Q, inference) it is the **same
+LLM**, doing what LLMs are trained to do, with no fine-tuning, no weight
+modification, and no special training. The cortex code is the orchestration
+plus the trainable classifier plus the provenance plumbing. Everything
+that makes this architecture work is *outside* the model weights, which
+means:
+
+1. **The architecture is orthogonal to the model.** Swap in a bigger
+   model, a smaller model, a domain-specific model, and the architecture
+   is unchanged. The model provides the substrate; cortex provides
+   everything else.
+
+2. **The same pretrained intelligence is reused at every stage.** The
+   ingestion pass uses the model's understanding of the corpus to
+   produce K vectors. The retrieval pass uses the model's understanding
+   of the query to produce Q vectors. The synthesis pass uses the
+   model's reasoning to combine the retrieved evidence. All three are
+   the model doing what it already knows how to do — there is no
+   "retrieval model" or "synthesis model" or "classifier model" that
+   needs separate training, except for the small cortex classifier
+   between the retrieval and synthesis passes.
+
+3. **The procedure is implemented in code, not in weights.** The
+   classifier, the retrieval ranking, the provenance tracking, the
+   policy decisions — all of these live in cortex Rust code that
+   consumes the LLM's outputs as features. This is the cerebellum
+   pattern from the conceptual-framework section: smart feature
+   extractor (the LLM, frozen) + small specialized procedural layer
+   (cortex, designed) + clean interface between them.
+
+### Softmax is for inference, not for retrieval (the 2026-04-07 insight)
+
+The standard attention computation is `softmax(Q·K^T / √d) · V`. The
+softmax does two specific jobs:
+
+1. Forces the attention weights to be a probability distribution
+   (non-negative, sums to 1) so the value-weighted sum is a sensible
+   convex combination
+2. Provides a differentiable shape that lets attention be **trained**
+   via gradient descent during pretraining
+
+Both of these are essential for *inference* — for the part of attention
+that produces the next layer's input as a weighted sum of value vectors.
+Without softmax, the weighted sum is unbounded and the gradients during
+training are wildly unstable.
+
+But **retrieval is not inference**. Retrieval doesn't need to produce a
+weighted sum that becomes the next layer's input. It just needs to find
+which positions are most relevant. For that operation, all you need is
+the raw `Q·K^T` matrix. Sort by score, take the top-K, done. No softmax,
+no normalization, no probability distribution.
+
+| Operation | Goal | Requires softmax? |
+|---|---|---|
+| Inference attention | Produce next-layer input as weighted sum | Yes |
+| Retrieval | Find top-K most relevant positions | **No** |
+
+This matters because **dilution is a property of softmax, not of
+attention**. When we worried about "the attention gets diluted as the
+cache grows" in the two-pass discussion two days ago, what we were
+actually describing is "softmax over more positions necessarily makes
+each weight smaller, because they have to sum to 1." The dot products
+themselves don't suffer this property — they get bigger as they get
+more relevant, regardless of how many other positions exist. **Top-K of
+raw `Q·K^T` is unbounded in cache size**: the same query can search a
+hundred-position cache or a billion-position cache with the same
+relative ranking quality, because the absolute magnitudes of the dot
+products don't matter, only their ordering does.
+
+This is what work-Claude correctly surfaced on 2026-04-07 when Daniel
+asked "are we stuck with softmax." The answer is no — different
+operations over the same `Q·K^T` matrix can use different aggregation
+algorithms, and you should pick the algorithm that fits the operation.
+Softmax-then-V for inference; arg-top-K of raw scores for retrieval;
+discontinuity-detection for boundary discovery; etc. The matrix is the
+substrate; the aggregation is the choice.
+
+### The deeper principle: Q·K^T is the substrate, aggregation is the choice
+
+Once you separate the matrix from the aggregation, the same `Q·K^T`
+computation supports many different operations:
+
+| Operation | Aggregation over Q·K^T |
+|---|---|
+| Standard inference | softmax → weighted sum of V → next-layer input |
+| Retrieval | top-K of raw scores → list of positions to load |
+| Concept boundary discovery | per-position anchored score → boundary candidates |
+| Reframing detection | delta in attention pattern under different queries |
+| Anomaly detection | positions with unusually low scores → things ignored |
+| Provenance tracing | backward walk from output to highest-contributing inputs |
+
+All of these consume the *same* `Q·K^T` matrix that's already being
+computed inside the LLM during a forward pass. We've been computing
+this matrix all along and throwing away most of the information in it
+by collapsing it through softmax-then-V. The information for *every*
+operation in the table above is already there in `Q·K^T` — we just
+have to capture it and aggregate it differently for different purposes.
+
+This is also why `forward_traced` is more architecturally important
+than I realized when we built it on 2026-04-06. It currently captures
+the **post-softmax** attention scores, which is "what attention
+decided." A more architecturally complete version would also capture
+the **pre-softmax** `Q·K^T` matrix, which is "what attention
+measured." The pre-softmax matrix is the substrate from which all the
+different aggregations can be derived. **Adding pre-softmax capture to
+`forward_traced` is a one-line change** (capture `dot * scale` before
+`softmax_inplace` in `attention.rs::forward_cached_traced`) and it
+unblocks every downstream "different aggregation" experiment we might
+want to run.
+
+### Use cases (defensive and positive)
+
+The full pipeline supports two co-equal use cases:
+
+**Defensive**: prompt injection prevention, policy enforcement, refusal
+on untrusted content. The classifier identifies action classes
+(silently_filter / respond_with_policy_denial / proceed_normally /
+escalate_for_human_review), the policy layer routes accordingly. This
+is the SaaS asymmetry example from the addendum.
+
+**Positive**: scientific discovery, code search, internal-documentation
+question answering, any task where the answer is "find the connection
+across documents that nobody has explicitly drawn." The doctor-and-
+thick-blood example from 2026-04-07: a treatment for a condition is
+hiding in a paper about something else, the connection has never been
+made explicitly, but the LLM's attention can find it because both
+papers are in its semantic neighborhood and a query that activates
+both will produce a retrieval pattern that surfaces the connection.
+
+The positive use case is the one where the "doesn't suffer fixed-
+embedding RAG limitations" property pays off the most. A standard RAG
+system would index each paper as a fixed vector that summarizes
+"what is this paper about" — and would never retrieve the cross-paper
+connection because neither paper, taken in isolation, looks like an
+answer to the query. A `Q·K^T`-based retrieval over stored KV vectors
+finds the connection because attention is **query-conditional in a
+way fixed embeddings cannot be**. Different queries produce different
+retrieval patterns over the same stored substrate.
+
+This matters beyond hypothetical examples. Daniel is 63 and longevity
+research is a personal motivation; the pipeline isn't framed as
+"build a tool that finds the cure to aging" (it can't, by itself) but
+as "build a tool that surfaces the cross-paper connections working
+researchers would otherwise need years of serendipity to find." Those
+are different claims. The first is unsupportable; the second is
+exactly what the architecture enables and is enormously valuable in
+its own right. The work is worth doing because of where it leads, and
+"where it leads" includes positive scientific discovery as a co-equal
+goal alongside the defensive use case.
+
+### Implementation status
+
+| Pipeline stage | Status |
+|---|---|
+| LLM forward pass over corpus | works (cortex has `forward` and `forward_cached`) |
+| KV vector capture during forward | works (cortex has `forward_traced` capturing post-softmax scores) |
+| **Pre-softmax `Q·K^T` capture** | **TODO — one-line change in `attention.rs`** |
+| TurboQuant compression of KV vectors | exists in engram, gated behind `memory` feature |
+| Persistent KV store with provenance | exists in engram (HierarchicalCache, L1/L2/L3 tiers) |
+| Raw Q·K^T retrieval pass | TODO — small reduction over pre-softmax trace data |
+| Trainable classifier over attention scores | TODO — next pinky experiment, see "Open questions" below |
+| Provenance attachment | partial — pinky has per-token provenance for input, needs extension to engram-stored substrate |
+| Inference pass over retrieved focused context | works (cortex's `forward_cached` already supports prefilling a KV cache) |
+| End-to-end orchestration | TODO — small Rust glue code on top of the above |
+
+The TODO items are bounded. Everything except the trainable classifier
+is engineering, not research. The trainable classifier is the critical
+path; everything else can be built around it once it works.
 
 ## What we have empirically shown (2026-04-06)
 
