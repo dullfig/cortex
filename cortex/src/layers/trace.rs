@@ -33,19 +33,38 @@
 /// it (useful for offline analysis, serialization, etc.).
 #[derive(Debug, Clone, Default)]
 pub struct ForwardTrace {
-    /// Per-layer post-softmax attention weights.
+    /// Per-layer post-softmax attention weights ("what attention decided").
     ///
     /// `attention_scores[layer]` has length `n_heads * seq_len * seq_len`.
     /// Entry at `[h, q, k]` (laid out as `h * seq_len * seq_len + q * seq_len + k`)
     /// is the attention weight from query position `q` to key position `k` in
     /// head `h`. The matrix is lower-triangular (causal): entries with `k > q`
-    /// are 0.0.
+    /// are 0.0. Each row over allowed keys sums to ~1.0 (softmax output).
     ///
     /// Note: in grouped-query attention (GQA) multiple query heads share a
     /// single KV head, but each query head still has its own row of softmax
     /// weights — so this captures per-query-head attention, which is the
     /// observable signal even when the underlying K/V is shared.
     pub attention_scores: Vec<Vec<f32>>,
+
+    /// Per-layer pre-softmax attention scores ("what attention measured").
+    ///
+    /// Same shape and indexing as `attention_scores`, but holds the raw
+    /// scaled `Q·K^T / sqrt(d)` values BEFORE softmax is applied. These
+    /// are unbounded (can be any real number) and do not sum to 1.0 over
+    /// the row.
+    ///
+    /// This buffer exists because **dilution is a property of softmax,
+    /// not of attention**. For retrieval-style aggregations (e.g., top-K
+    /// of raw scores over a large stored substrate), the pre-softmax
+    /// values are what you want — softmax forces weights to sum to 1
+    /// which makes per-position weights shrink as the cache grows, but
+    /// the raw dot products do not have this property and produce
+    /// dilution-free relevance signals at any cache size.
+    ///
+    /// See POSITION.md "Softmax is for inference, not for retrieval"
+    /// for the architectural argument.
+    pub pre_softmax_scores: Vec<Vec<f32>>,
 
     /// Per-layer hidden states (the residual stream).
     ///
@@ -81,6 +100,7 @@ impl ForwardTrace {
     pub fn new(n_layers: usize, n_heads: usize, embed_dim: usize, seq_len: usize) -> Self {
         Self {
             attention_scores: Vec::with_capacity(n_layers),
+            pre_softmax_scores: Vec::with_capacity(n_layers),
             hidden_states: Vec::with_capacity(n_layers + 2),
             seq_len,
             n_layers,
@@ -104,6 +124,25 @@ impl ForwardTrace {
     /// layer `layer`. Returns a slice of length `seq_len`.
     pub fn attention_row(&self, layer: usize, head: usize, q: usize) -> &[f32] {
         let scores = &self.attention_scores[layer];
+        let s = self.seq_len;
+        let start = head * s * s + q * s;
+        &scores[start..start + s]
+    }
+
+    /// Look up the pre-softmax (raw scaled Q·K^T) score from query position
+    /// `q` to key position `k` in head `h` of layer `layer`.
+    pub fn pre_score(&self, layer: usize, head: usize, q: usize, k: usize) -> f32 {
+        let scores = &self.pre_softmax_scores[layer];
+        let s = self.seq_len;
+        scores[head * s * s + q * s + k]
+    }
+
+    /// Look up the full pre-softmax score row for query position `q` in head
+    /// `h` of layer `layer`. Returns a slice of length `seq_len`.
+    /// These are the raw "what attention measured" values, useful for
+    /// retrieval-style aggregations that don't need probability normalization.
+    pub fn pre_score_row(&self, layer: usize, head: usize, q: usize) -> &[f32] {
+        let scores = &self.pre_softmax_scores[layer];
         let s = self.seq_len;
         let start = head * s * s + q * s;
         &scores[start..start + s]

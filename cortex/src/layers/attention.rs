@@ -429,6 +429,7 @@ impl MultiHeadAttention {
         seq_len: usize,
         cache: &mut KvCache,
         out_scores: &mut [f32],
+        out_pre_scores: &mut [f32],
         total_seq: usize,
         query_offset: usize,
     ) -> Vec<f32> {
@@ -438,6 +439,11 @@ impl MultiHeadAttention {
             out_scores.len(),
             self.n_heads * total_seq * total_seq,
             "out_scores buffer must be n_heads * total_seq^2",
+        );
+        assert_eq!(
+            out_pre_scores.len(),
+            self.n_heads * total_seq * total_seq,
+            "out_pre_scores buffer must be n_heads * total_seq^2",
         );
 
         let q_dim = self.n_heads * self.head_dim;
@@ -515,15 +521,26 @@ impl MultiHeadAttention {
                     scores.push(dot * scale);
                 }
 
-                softmax_inplace(&mut scores);
-
-                // CAPTURE: write the post-softmax scores into the trace buffer.
-                // The query position in the full sequence is `query_offset + t`,
-                // and we have `attend_len` weights covering key positions
-                // 0..attend_len.
+                // CAPTURE: write the pre-softmax (raw scaled Q·K^T) scores
+                // into the pre-softmax trace buffer BEFORE applying softmax.
+                // These are the "what attention measured" values, suitable
+                // for retrieval-style aggregations like top-K of raw scores.
+                // Dilution-free: the magnitudes can be any size, only their
+                // relative ordering matters for retrieval.
                 let q_abs = query_offset + t;
                 debug_assert!(q_abs < total_seq, "query position out of trace bounds");
                 let row_start = qh * total_seq * total_seq + q_abs * total_seq;
+                for (s, &raw) in scores.iter().enumerate() {
+                    out_pre_scores[row_start + s] = raw;
+                }
+
+                softmax_inplace(&mut scores);
+
+                // CAPTURE: write the post-softmax scores into the trace buffer.
+                // These are the "what attention decided" values — the
+                // probability distribution that gets multiplied by V to
+                // produce the next-layer input. Subject to softmax dilution
+                // as the cache grows.
                 for (s, &w) in scores.iter().enumerate() {
                     out_scores[row_start + s] = w;
                 }

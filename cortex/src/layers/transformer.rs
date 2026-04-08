@@ -264,6 +264,7 @@ impl TransformerBlock {
         seq_len: usize,
         cache: &mut KvCache,
         out_attn_scores: &mut [f32],
+        out_pre_attn_scores: &mut [f32],
         total_seq: usize,
         query_offset: usize,
     ) -> Vec<f32> {
@@ -277,6 +278,7 @@ impl TransformerBlock {
             seq_len,
             cache,
             out_attn_scores,
+            out_pre_attn_scores,
             total_seq,
             query_offset,
         );

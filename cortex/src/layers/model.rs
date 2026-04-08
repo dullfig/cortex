@@ -384,23 +384,32 @@ impl TransformerModel {
         trace.hidden_states.push(hidden.clone());
 
         // 2. Pass through transformer blocks with cache, capturing
-        //    attention scores and per-block input hidden states.
+        //    attention scores (both pre- and post-softmax) and per-block
+        //    input hidden states.
         for (layer_idx, block) in self.blocks.iter().enumerate() {
-            // Allocate the per-layer score buffer: [n_heads, seq_len, seq_len]
+            // Allocate the per-layer score buffers: [n_heads, seq_len, seq_len]
             // zero-initialized so causally-masked positions and any unwritten
             // entries are 0.0.
+            //
+            // Two buffers: post-softmax (for "what attention decided") and
+            // pre-softmax (for "what attention measured" — the raw scaled
+            // Q·K^T matrix, suitable for retrieval-style aggregations like
+            // top-K of raw scores).
             let mut scores = vec![0.0f32; n_heads * seq_len * seq_len];
+            let mut pre_scores = vec![0.0f32; n_heads * seq_len * seq_len];
 
             hidden = block.forward_cached_traced(
                 &hidden,
                 seq_len,
                 cache.layer_mut(layer_idx),
                 &mut scores,
+                &mut pre_scores,
                 seq_len,
                 0,
             );
 
             trace.attention_scores.push(scores);
+            trace.pre_softmax_scores.push(pre_scores);
             // Capture: post-block state == input to next block (or to final norm)
             trace.hidden_states.push(hidden.clone());
         }
@@ -867,11 +876,59 @@ mod tests {
             assert_eq!(layer_scores.len(), trace.n_heads * 4 * 4);
         }
 
+        // Pre-softmax scores have the same shape as post-softmax scores
+        assert_eq!(trace.pre_softmax_scores.len(), 2);
+        for layer_pre in &trace.pre_softmax_scores {
+            assert_eq!(layer_pre.len(), trace.n_heads * 4 * 4);
+        }
+
         // n_layers + 2 hidden state snapshots:
         // 1 post-embedding + n_layers post-block + 1 post-final-norm
         assert_eq!(trace.hidden_states.len(), 4);
         for h in &trace.hidden_states {
             assert_eq!(h.len(), 4 * 8);
+        }
+    }
+
+    #[test]
+    fn forward_traced_softmax_of_pre_matches_post() {
+        // The post-softmax scores must equal softmax of the pre-softmax
+        // scores within numerical tolerance, because the only operation
+        // between them is `softmax_inplace`. If they don't match, the
+        // pre-softmax capture is reading from the wrong buffer or the
+        // post-softmax capture is happening at the wrong point.
+        let model = make_test_model(2, false);
+        let tokens = &[0u32, 1, 2, 3, 4];
+        let (_logits, trace) = model.forward_traced(tokens);
+
+        let s = trace.seq_len;
+        for layer in 0..trace.n_layers {
+            for h in 0..trace.n_heads {
+                for q in 0..s {
+                    let pre_row = trace.pre_score_row(layer, h, q);
+                    let post_row = trace.attention_row(layer, h, q);
+
+                    // Apply softmax to the allowed (causal) portion of pre
+                    let allowed = q + 1;
+                    let pre_allowed = &pre_row[..allowed];
+                    let max_val = pre_allowed.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let exp_sum: f32 = pre_allowed.iter().map(|&x| (x - max_val).exp()).sum();
+                    let computed_post: Vec<f32> = pre_allowed
+                        .iter()
+                        .map(|&x| (x - max_val).exp() / exp_sum)
+                        .collect();
+
+                    for (i, (computed, captured)) in
+                        computed_post.iter().zip(post_row[..allowed].iter()).enumerate()
+                    {
+                        assert!(
+                            (computed - captured).abs() < 1e-5,
+                            "layer {layer} head {h} q {q} k {i}: \
+                             softmax(pre)={computed} but captured post={captured}",
+                        );
+                    }
+                }
+            }
         }
     }
 
