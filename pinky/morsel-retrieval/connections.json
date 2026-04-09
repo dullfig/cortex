@@ -1,0 +1,52 @@
+{
+  "connections": [
+    {
+      "id": "magnesium-sleep-fragmentation",
+      "description": "Dietary magnesium inadequacy is linked to nocturnal leg cramps, and leg cramps are the largest underrecognized cause of involuntary nocturnal awakenings in assisted living residents. Implied connection: a dietary magnesium intervention could reduce sleep fragmentation in elderly assisted living populations, even though neither paper is about sleep-nutrition pharmacology.",
+      "papers": [
+        {
+          "file": "paper_01.txt",
+          "morsel_text": "In an exploratory analysis of self-reported symptom questionnaires collected alongside the dietary recalls, participants in the lowest intake quartile reported nocturnal leg cramps at roughly twice the rate of those in the highest quartile, a finding that reached nominal significance and warrants targeted follow-up."
+        },
+        {
+          "file": "paper_02.txt",
+          "morsel_text": "Notably, nocturnal leg cramps accounted for 14% of attributed awakenings and were the single largest category of unexplained or involuntary wakings that did not involve a deliberate action by the resident, a figure substantially higher than nursing staff estimates collected in a parallel survey."
+        }
+      ],
+      "test_query": "What low-cost interventions could reduce sleep fragmentation in assisted living residents?",
+      "naive_query_result": "A keyword or topic retriever keyed on 'sleep fragmentation' and 'assisted living' returns paper_02 (directly on topic) and paper_07 (melatonin in shift workers, topically adjacent via 'sleep'). It does NOT return paper_01, which is classified as a nutrition survey and shares no surface vocabulary with the query."
+    },
+    {
+      "id": "av-scheduling-sidechannel",
+      "description": "Cloud cache-timing measurements show an unexplained Tuesday-morning noise spike across multiple providers, and enterprise AV products ship with default Tuesday-morning full-scan windows that produce observable memory-bus contention from unprivileged processes. Implied connection: industry-standard AV scan schedules leak a co-tenancy fingerprint usable as a side-channel primitive. Neither paper frames itself as being about side-channel fingerprinting via AV scheduling.",
+      "papers": [
+        {
+          "file": "paper_03.txt",
+          "morsel_text": "Across all three providers we observed a previously undocumented weekly periodicity: a pronounced increase in tail latency and a broadening of the noise distribution on Tuesdays between 02:00 and 05:00 local time, correlating strongly with vendor-published maintenance windows and, on the two providers where we could confirm it, with scheduled antivirus and integrity-scan sweeps running on neighboring tenants."
+        },
+        {
+          "file": "paper_04.txt",
+          "morsel_text": "We instrumented a subset of customer endpoints with lightweight performance counters during scheduled scan windows and found that full scans produce sustained, bursty contention on the memory bus that is readily observable from unprivileged user-space processes running on the same host, with scan-window memory latency increases ranging from 14% to 61% depending on storage subsystem and working set."
+        }
+      ],
+      "test_query": "Could enterprise antivirus scheduling be exploited as a side-channel signal in multi-tenant cloud environments?",
+      "naive_query_result": "A topic retriever keyed on 'side channel' and 'cloud' returns paper_03 (cache timing, the obvious hit) and possibly paper_08 (malware classification, topically adjacent via 'security'). It does NOT return paper_04, which is filed under endpoint-operations and describes itself as an AV scheduling audit with no mention of side channels or cloud tenancy."
+    },
+    {
+      "id": "road-salt-bike-fatigue",
+      "description": "Accelerated fatigue testing shows that coastal chloride exposure measurably speeds micro-crack propagation in aluminum bike frames, and winter road de-icing aerosolizes chloride at concentrations measurable up to 800 meters from treated roads, including into covered but unventilated storage. Implied connection: urban cyclists who store bikes in garages or sheds near treated roads may face coastal-like chloride exposure and accelerated frame fatigue, contradicting warranty assumptions that assume a benign inland service environment.",
+      "papers": [
+        {
+          "file": "paper_05.txt",
+          "morsel_text": "In a secondary exposure sub-study designed to probe the combined effect of environmental chloride, six frames from each group were pre-conditioned for 90 days in a coastal test rack located 40 meters from the shoreline before undergoing the same loading protocol; pre-conditioned frames, regardless of recycled content, showed micro-crack propagation rates approximately 12% faster than their dry-stored counterparts, with the effect localized to weld toes on the down tube and chainstay."
+        },
+        {
+          "file": "paper_06.txt",
+          "morsel_text": "Aerosol size distributions indicated that a substantial fraction of resuspended chloride was carried on particles in the 1 to 5 micrometer range, consistent with extended atmospheric residence times and potential for intrusion into poorly sealed building envelopes and covered but unventilated storage areas."
+        }
+      ],
+      "test_query": "What non-obvious environmental factors could shorten the service life of urban bicycle frames?",
+      "naive_query_result": "A keyword retriever on 'bicycle frame' and 'service life' returns paper_05 only. A retriever on 'urban environment' and 'aluminum' returns nothing useful. Paper_06 is classified as atmospheric science / municipal operations and shares no surface vocabulary with bicycles or fatigue."
+    }
+  ]
+}
