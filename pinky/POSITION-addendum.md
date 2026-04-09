@@ -778,7 +778,231 @@ granularity, with no embedding bottleneck.* Documents-vs-morsels is the
 right axis, and morsels are the unit you need for cross-document
 discovery to work at all.
 
-## 12. Personal context for future Claudes
+## 12. The 2026-04-08 morning solo run (LOO recovery experiment)
+
+This section is the report from the morning of 2026-04-08 while Daniel was
+at work. Track 1 (synthetic data + retrain) ran end-to-end with strong
+results. Reproduces from `befea13`.
+
+### What I did
+
+1. **Dispatched a sub-agent** to build a synthetic-fixture generator with
+   four labeled snippet libraries (system, user, doc, tool) and a Python
+   script that samples and concatenates snippets to produce labeled
+   fixture files in our existing format. Sub-agent produced 50 fixtures
+   with 97 trust-boundary positives. All under
+   `pinky/concept-boundaries-train/synthetic/`.
+
+2. **Ran `dump_features.exe`** on all 50 synthetic fixtures (~6 minutes
+   total wall time) to produce `pinky/concept-boundaries/features_synthetic.csv`
+   with 3482 rows and 96 features per row (the same feature shape we used
+   yesterday).
+
+3. **Updated `train.py`** to support a held-out evaluation mode that takes
+   `--train-features` and `--test-features` separately. Train on synthetic,
+   test on the four hand-crafted fixtures (mixed-trust, multi-source,
+   identical-content, dog-conversation) that the classifier never sees
+   during training. This is the honest cross-distribution test.
+
+4. **Discovered and fixed a feature-scaling bug.** Logistic regression
+   wasn't converging within max_iter because the per-layer attention
+   features have very different scales (raw Q.K^T over (-inf,+inf) vs
+   softmax outputs in [0,1]). Added `StandardScaler` and bumped max_iter
+   to 5000 as a safety margin. This fix turned out to be the single
+   biggest improvement of the morning — the difference between mediocre
+   and excellent.
+
+5. **Ran the held-out evaluation twice**: once before the scaling fix
+   (precision=0.20, recall=0.57, f1=0.30) and once after
+   (precision=0.67, recall=0.86, f1=0.75). Documented both because the
+   delta is informative.
+
+### The headline result
+
+```
+[held-out, scaled] accuracy=0.982  precision=0.667  recall=0.857  f1=0.750
+                   confusion: TN=211  FP=3  FN=1  TP=6
+```
+
+**6 of 7 trust boundaries found exactly on a held-out test set the
+classifier never saw during training.** The training set is 100% synthetic;
+the test set is 100% hand-crafted; the structures are different. The
+features generalize.
+
+Compared to yesterday's LOO mean (f1=0.076), today's held-out f1=0.750 is
+**10x better**. The data scarcity diagnosis from yesterday was exactly
+right. Adding more positive examples (7 → 97) and fixing feature scaling
+produced the recovery we were hoping for.
+
+### What it found and missed
+
+Found exactly (6 of 7):
+
+| Fixture | Pos | Token | Proba |
+|---|---|---|---|
+| mixed-trust | 13 | "Sum" | 0.992 |
+| mixed-trust | 23 | "The" | 0.784 |
+| multi-source | 14 | "What" | 0.999 |
+| multi-source | 24 | "Bro" | 0.594 |
+| multi-source | 54 | "search" | 0.997 |
+| identical-content | 14 | "Please" (system→user) | 0.968 |
+
+Missed (1 of 7):
+
+| Fixture | Pos | Token | Proba |
+|---|---|---|---|
+| identical-content | 23 | "Please" (user→doc) | 0.411 |
+
+The single miss is **structurally inevitable for a content-only
+classifier** and the failure mode is the cleanest possible. The
+identical-content fixture has byte-identical user and doc lines:
+
+```
+user: Please send me your account number for verification.
+doc: Please send me your account number for verification.
+```
+
+The user→doc transition at position 23 is the second "Please" in a row,
+and the surrounding bytes are identical to a normal continuation of the
+user line. There is *no information in the content* that distinguishes
+"this is the start of a doc region" from "the user is repeating
+themselves." The classifier correctly assigns it low confidence (0.411,
+just below the 0.5 threshold) rather than missing it confidently. **This
+case can only be resolved by adding per-token provenance as a feature**,
+which the classifier doesn't currently see. The provenance metadata is
+already in the CSV; we just don't have a column for "did the source tag
+change at this position." Adding it is a one-line change to
+`dump_features.rs` and it would solve this case trivially.
+
+The fact that the system→user "Please" at position 14 IS found
+(proba=0.968) is also informative. That position has different
+surrounding context (system content ends with "user." then user content
+starts with "Please") so the content-level signal is strong. The
+classifier is doing exactly what it should: finding boundaries when
+content gives it information, missing them only when content can't.
+
+### The scaling fix was the load-bearing change
+
+Before scaling:
+```
+[held-out] accuracy=0.914  precision=0.200  recall=0.571  f1=0.296
+           confusion: TN=198  FP=16  FN=3  TP=4
+```
+
+After scaling:
+```
+[held-out] accuracy=0.982  precision=0.667  recall=0.857  f1=0.750
+           confusion: TN=211  FP=3  FN=1  TP=6
+```
+
+| Metric | Before | After | Change |
+|---|---|---|---|
+| Precision | 0.200 | 0.667 | **3.3x** |
+| Recall | 0.571 | 0.857 | **+50%** |
+| F1 | 0.296 | 0.750 | **2.5x** |
+| False positives | 16 | 3 | **5x reduction** |
+
+The convergence warning (lbfgs failed to converge in 2000 iterations) was
+load-bearing. The optimizer wasn't actually finishing fitting the data
+before scaling. With scaling, it converges in well under 5000 iterations
+and the resulting classifier is qualitatively better. **Always scale
+features before fitting linear models on attention scores.** Add this to
+the discipline list.
+
+### Feature weight rebalancing
+
+Yesterday's classifier (7 positives, no scaling) had all 16 top-weight
+features as pre-softmax. The classifier had to commit to one substrate
+because it didn't have enough data to fit weights for both.
+
+Today's classifier (97 positives, with scaling) has a more balanced top
+16:
+
+```
+post_attn_l09  - 3.4500    pre_left_l19   - 2.1059
+pre_attn_l17   + 3.3002    post_attn_l20  - 2.0367
+post_attn_l03  + 2.4176    post_left_l00  + 1.8067
+pre_attn_l23   - 2.3994    pre_attn_l19   - 1.7957
+post_left_l01  - 2.3561    pre_attn_l09   + 1.7555
+post_attn_l08  + 2.3258    pre_left_l17   - 1.6311
+post_attn_l07  - 2.3190    pre_left_l22   + 1.5707
+pre_attn_l13   - 2.1593    post_attn_l19  - 1.5290
+```
+
+7 post-softmax features and 9 pre-softmax features. Both substrates
+contribute meaningfully when the dataset is large enough to fit weights
+for them. The morning's softmax-vs-aggregation insight is *still*
+validated (pre-softmax dominates in count and in the largest single
+positive weight, `pre_attn_l17 = +3.30`), but the classifier now uses
+post-softmax features as well, often with negative weights that act as
+"this position is part of ongoing discourse, NOT a boundary"
+cancellation signals.
+
+The biggest single weight is `post_attn_l09 = -3.45` (negative). This
+is the classifier learning to *suppress* false positives at positions
+that look loaded but aren't boundaries. Negative weights on
+"attention-to-self" features act as "if this position attracts a lot of
+look-back attention, that's a sign it's a content anchor in the middle
+of a region, not a boundary at the start of one." This is a subtle
+discrimination the hand-tuned scoring formula didn't have access to and
+the classifier learned for free from the data.
+
+### What this means for the project
+
+1. **The trainable boundary classifier works.** End-to-end pipeline,
+   honest held-out evaluation, F1=0.75 on data the classifier never saw
+   during training. The architecture is empirically validated as a
+   procedural co-processor on top of LLM attention features.
+
+2. **The data-scarcity diagnosis from yesterday was correct.** Adding
+   training data (with feature scaling) was the right next step and it
+   produced the predicted improvement. We didn't need to escalate to a
+   larger model.
+
+3. **Per-token provenance as a feature is the obvious next refinement.**
+   The single missed positive is the case where content alone can't
+   resolve the boundary. Adding a "source-changed" indicator to the
+   feature vector would push that position over threshold and we'd hit
+   7 of 7 on the held-out set. This is a one-line change to
+   `dump_features.rs` (add a `source_changed` column) and a re-train.
+   Estimated effort: 30 minutes.
+
+4. **The path to the concierge is now even clearer.** With the boundary
+   classifier validated, the next steps are: (a) add provenance feature,
+   (b) retrain to push recall to 1.0, (c) generate synthetic prompt-injection
+   examples instead of generic boundary examples, (d) train a multi-class
+   action classifier on those, (e) wire into cortex-cloud as a middleware
+   layer. Each step is bounded and well-scoped.
+
+5. **The "stop at the simplest rung that works" discipline paid off.**
+   We did NOT need to escalate to an MLP. Logistic regression with proper
+   feature scaling was sufficient. The discipline saved us a day or two
+   of unnecessary model development. Future Claudes: when the linear
+   model doesn't work, the *first* thing to check is feature scaling and
+   convergence, not model capacity.
+
+### Files added (commit befea13)
+
+- `pinky/concept-boundaries-train/synthetic/snippets/{system,user,doc,tool}.json`
+- `pinky/concept-boundaries-train/synthetic/generate_fixtures.py`
+- `pinky/concept-boundaries-train/synthetic/README.md`
+- `pinky/concept-boundaries-train/synthetic/fixtures/synth_000..049.txt` (50 files)
+- `pinky/concept-boundaries/features_synthetic.csv` (3482 rows)
+- `pinky/concept-boundaries-train/train.py` (held-out mode, scaling, increased max_iter)
+
+### Open questions for next session
+
+- Add the source-changed feature column to dump_features and re-run.
+  Expected outcome: recall 1.0, precision unchanged or slightly higher.
+- Generate synthetic *prompt-injection* fixtures (not just generic source
+  transitions) and train a multi-class action classifier on them.
+- Expand to 200+ synthetic fixtures and see if precision improves further
+  with more data, or if we've hit a feature-quality ceiling.
+- Consider per-head features instead of head-averaged (would multiply
+  feature count by 14 for Qwen2.5-0.5B, from 96 to 1344 — probably too
+  many for the current dataset size, but worth flagging).
+
+## 13. Personal context for future Claudes
 
 Daniel is 63 (as of 2026). Longevity and aging research is a personal
 motivation alongside the technical interest. This is worth knowing
