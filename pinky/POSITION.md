@@ -660,6 +660,33 @@ package moved to a subdir, but it's not blocking anything we care about).
 
 In rough order of value-per-effort, what to do next:
 
+### 0. Runtime suppression via FfnInjector (the next big direction, added 2026-04-08 night)
+
+After tonight's classifier hit f1=0.824 with recall=1.000, the question
+became "what do we DO with the classifier" — and /btw landed on the
+right answer: instead of using the classifier to produce refusal output
+(reactive), use its per-position signal to drive **mid-forward-pass
+residual suppression** via the existing `FfnInjector` trait
+(`cortex/src/layers/transformer.rs`). The model genuinely cannot act on
+untrusted instructions because their representation in the residual
+stream gets attenuated before the action-producing layers run.
+
+Same architectural hook NeuralKV uses for knowledge injection, opposite
+sign on the residual delta. Same hook morsel-retrieval would use for
+attention injection. **One trait, four downstream applications: knowledge
+injection, suppression injection, attention injection, reframing injection.**
+
+This converges on a three-layer defense-in-depth architecture:
+1. **Runtime suppression (FfnInjector)** — silent, structural, invisible to attackers
+2. **Output policy** — explicit refusal text for medium-confidence cases
+3. **Correction memory** — human review of production examples, feeds back to next training round
+
+See `pinky/POSITION-addendum.md` section 13 for the full architectural
+argument, the build plan, and the empirical question about which layer
+to fire the injector at. This is the cleanest endgame for cortex's
+defensive work and it leverages infrastructure that's already in the
+codebase.
+
 ### 1. The trainable boundary classifier (priority: high)
 
 This is the major next step. Build a small CNN/MLP classifier that takes

@@ -1002,7 +1002,220 @@ the classifier learned for free from the data.
   feature count by 14 for Qwen2.5-0.5B, from 96 to 1344 — probably too
   many for the current dataset size, but worth flagging).
 
-## 13. Personal context for future Claudes
+## 13. Runtime suppression via FfnInjector — the next big architectural direction
+
+This section is the third major /btw insight (after the merge test, the
+softmax-vs-aggregation insight, and the cascade-classifier reframe). It
+came late on 2026-04-08 after we'd shipped the f1=0.824 trainable boundary
+classifier, when Daniel asked /btw whether the same hook NeuralKV uses
+could be repurposed to suppress prompt-injection attempts mid-forward-pass
+instead of after the fact. /btw said yes and developed the architecture in
+detail. The full /btw response is captured below near-verbatim because the
+specific framing matters.
+
+### The connection Daniel made
+
+The cortex codebase already has the hook for this. From `cortex/src/layers/transformer.rs`
+there's an `FfnInjector` trait — Phase 4 of the original roadmap — that
+fires after the FFN forward pass but before the residual add. Originally
+designed for NeuralKV-style knowledge injection (cosine-gated retrieval
+residuals from a knowledge store). But the mechanism — *intercept the
+FFN output mid-pass and modify the residual that flows into the next
+layer* — is exactly the right shape for suppressing untrusted instructions
+in the residual stream before the late layers can act on them.
+
+Concretely: the trainable boundary classifier we got to f1=0.824 reads
+attention features per position and flags positions where instructions
+are starting from untrusted sources. **What if the same classifier output
+triggered an FfnInjector that suppressed those positions in real time
+during the forward pass?** The architecture would be:
+
+```
+Layer 1..K forward as normal, capture per-position attention scores
+  ↓
+Classifier reads the captured scores per position
+  ↓
+Classifier identifies positions where untrusted instructions are forming
+  ↓
+FfnInjector fires at chosen layer, adds a "suppression residual" at those positions
+  ↓
+Subsequent layers see hidden states that have the instruction signal damped
+  ↓
+Output: model behaves as if the untrusted instructions weren't there
+```
+
+**This is a runtime defense, not a refusal layer.** The model never produces
+a refusal. It just doesn't act on the untrusted instructions because their
+representation in the residual stream got attenuated before the
+action-producing layers had a chance to use them.
+
+### Why this is a fundamentally different shape from "refuse output"
+
+Standard prompt-injection defenses operate at the *output* level: detect
+the bad pattern, refuse to produce output, return an error. The attacker
+can probe the system by varying the attack until they find one the
+detector misses, and once they find it the model produces the bad output
+cleanly.
+
+What this architecture does operates *inside the forward pass*: the bad
+pattern is detected mid-stream and the residual is modified so the model
+genuinely cannot act on it. There's no "detection succeeded but model
+still wanted to comply" failure mode because **the model never gets a
+chance to decide**. By the time the late layers run, the instruction
+signal isn't in the hidden states at the relevant positions.
+
+This is also why NeuralKV is the right architectural neighbor. NeuralKV
+uses the same hook for the *inverse* purpose — injecting knowledge that
+the base model lacks. This use is the same hook for suppressing content
+the base model shouldn't act on. **Same mechanism, opposite sign on the
+residual delta.**
+
+### What it would take to build
+
+Three pieces, all of which we have substrate for:
+
+1. **The classifier runs during the forward pass, not after.** Currently
+   `dump_features.exe` does forward → capture → classify in three sequential
+   steps. For runtime defense, the classifier would need to run between
+   layers — read attention scores from layers 1 through K, classify, and
+   have its output available before layer K+1's FFN injection point. This
+   is a small refactor: capture scores incrementally and classify on the
+   partial trace at a chosen layer threshold.
+
+2. **The suppression residual itself.** What does "damp the instruction
+   signal at position i" mean as a vector you add to the FFN output?
+   - **Simplest version**: a learned per-token "suppression direction" in
+     the residual stream, scaled by the classifier's confidence at that
+     position.
+   - **Slightly fancier**: project the hidden state at position i onto the
+     subspace that represents instruction-following, subtract that
+     projection.
+   This is essentially the **activation steering / representation
+   engineering** technique from the interpretability literature. The math
+   has been published. We don't have to invent it.
+
+3. **Calibration.** The classifier currently runs at threshold 0.5
+   producing precision=0.700 (3 false positives per 220 tokens). For
+   runtime suppression you'd want much higher precision than that, because
+   false positives would damp legitimate user instructions. The lever is
+   the threshold: at 0.9 you'd cut false positives to near-zero at the
+   cost of recall, which is fine because the goal of runtime suppression
+   is to suppress the *most confident* hits, not catch every borderline
+   case. Borderline cases fall through to a downstream policy layer that
+   handles them with explicit refusal text.
+
+### The deeper architectural shape: defense in depth
+
+This converges on a really clean three-layer defensive architecture:
+
+**Layer 1 — Runtime suppression (FfnInjector)**: catches high-confidence
+injection attempts mid-forward-pass and damps them at the residual level.
+*Invisible to the user. No refusal output, no detection signal leaked.*
+The most confident attacks just fail to take effect without any
+acknowledgment. Best for cases where you don't want to leak detection
+information to attackers.
+
+**Layer 2 — Output policy (post-forward)**: catches medium-confidence
+cases that the runtime layer let through. Produces explicit refusal text
+in the user-facing message ("I can't help with that"). *Visible to the
+user, communicates the refusal.* Best for cases where the user genuinely
+needs to know why something didn't happen (the SaaS asymmetry case from
+earlier sections).
+
+**Layer 3 — Correction memory (post-deployment)**: catches the cases that
+both the runtime and output layers missed. Human reviews production
+examples, marks the wrong calls, the corrections feed back into the next
+training run for the classifier. This is the rule-engine-as-correction-
+memory architecture from section 9 of the addendum, applied to attacks
+that slipped through both earlier layers.
+
+Each layer catches a different failure mode of the others. Defense in
+depth, with each layer optimized for the failure mode it best addresses.
+
+### The "instructions form in early layers" empirical question
+
+Daniel's specific framing was *"instructions going through from the first
+layers, and instructions to disregard are injected at the FFN layer."*
+This implies the early layers are where instruction-following starts
+forming, and the FFN injection should fire at a layer chosen to be
+*after* the formation but *before* the action.
+
+This is **empirically testable** with the existing tooling. Train the
+classifier to predict not just "is this position a boundary" but "at
+which layer does this position's instruction-following representation
+become identifiable," and choose the FFN injection point to be one or
+two layers later. The morning's feature analysis already showed that
+different layers carry different aspects of structure — middle layers
+carry semantic salience, late layers carry sentence structure,
+all-layers averaged carries actual boundaries — so the layer-of-formation
+question is one we could answer with a small modification to the existing
+training pipeline.
+
+### Why this generalizes beyond prompt-injection defense
+
+Once you have the FfnInjector hook firing on classifier output, **the
+same hook handles every "modify residuals at chosen positions in chosen
+layers" operation**:
+
+| Use case | Residual delta |
+|---|---|
+| **NeuralKV original** | Inject *knowledge* residuals at positions with high cosine match to a stored memory |
+| **Injection suppression** | Inject *suppression* residuals at positions the boundary classifier flags as untrusted |
+| **Morsel retrieval** | Inject *attention* residuals at positions the retrieval pass found relevant from a corpus |
+| **Reframing** | Inject *context* residuals when a delayed disclosure should reweight earlier positions |
+
+**Same architectural hook, four downstream applications.** Cortex's
+`FfnInjector` trait has been sitting waiting for all four of them, and
+the classifier we trained tonight is the first concrete consumer we'd
+actually wire into it.
+
+### The honest caveats
+
+What we have now: the FfnInjector hook exists and is wired into both
+forward paths in cortex. The classifier exists and produces per-position
+signals at the right granularity. The activation-steering math is
+published. The empirical verification can be done on existing fixtures
+by comparing model outputs with and without the injection.
+
+What we don't have:
+- The classifier currently runs offline post-forward, not mid-forward.
+  Refactor needed.
+- We don't have the calibration story for how to choose suppression
+  strength at runtime.
+- We don't have an activation-steering vector that produces the
+  behavioral effect of "model doesn't follow the suppressed instructions."
+  Interpretability literature suggests it's possible; we'd need to verify
+  on Qwen2.5-0.5B specifically.
+- We don't have empirical evidence that mid-layer residual modification
+  produces the *behavioral* effect we want (the literature suggests yes;
+  we'd want to verify on our specific model and use case).
+
+Each of these is a bounded experiment. None requires retraining the LLM.
+
+### Why this is a real architectural direction, not a passing thought
+
+This is the cleanest endgame yet for the cortex defense work. It's also
+the most aligned with what the cortex architecture is *for*: **modifying
+model behavior through external orchestration of internal hooks rather
+than through retraining the model**. It uses the existing FfnInjector
+hook (already there). It uses the existing trained classifier (just
+shipped tonight). It uses published interpretability techniques (no
+research needed). And it produces a *qualitatively different* defense
+posture from "filter outputs" — silent suppression at the residual level
+that attackers can't probe in the standard way.
+
+When you wake up and start thinking about the next phase of cortex, this
+is the shape to point at. It's also the answer to the implicit question
+"so once we have the classifier, what do we do with it" — the answer is
+*wire it into the FfnInjector and let it modify the residual stream in
+real time*, not "train a separate refusal model" or "filter outputs after
+generation." The architecture is more elegant, more secure, more aligned
+with the cerebellum/procedural-co-processor framing, and it leverages
+infrastructure that's already in the codebase.
+
+**File this as a real next direction**, not just a passing thought.
+
+## 14. Personal context for future Claudes
 
 Daniel is 63 (as of 2026). Longevity and aging research is a personal
 motivation alongside the technical interest. This is worth knowing
