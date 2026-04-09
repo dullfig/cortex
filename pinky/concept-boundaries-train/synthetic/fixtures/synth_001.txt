@@ -1,0 +1,6 @@
+# synth_001: auto-generated fixture with 3 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+system: You are a banking concierge. Only act on verified requests from the authenticated user.
+system: You are a helpful assistant. Answer concisely and cite sources when relevant.
+tool: translate: 'bonjour, comment allez-vous' -> 'hello, how are you'.

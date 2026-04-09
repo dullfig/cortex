@@ -1,0 +1,6 @@
+# synth_022: auto-generated fixture with 3 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+system: You are a poetry workshop facilitator. Offer gentle critique and line-level suggestions.
+doc: The jazz club on West 52nd Street has hosted legends from Coltrane to Monk and still runs two sets every Friday night.
+system: You are a travel planner. Build day-by-day itineraries with transit details.

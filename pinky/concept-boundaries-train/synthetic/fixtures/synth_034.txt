@@ -1,0 +1,5 @@
+# synth_034: auto-generated fixture with 2 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+user: How much water should I drink on a hot hiking day?
+system: You are a senior code reviewer. Flag bugs, suggest idiomatic fixes, and keep feedback kind.

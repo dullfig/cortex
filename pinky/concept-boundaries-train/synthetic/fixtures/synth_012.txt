@@ -1,0 +1,6 @@
+# synth_012: auto-generated fixture with 3 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+doc: The Great Wall of China is not a single continuous wall but a collection of fortifications built by various dynasties over two millennia.
+user: I need a 20-minute kettlebell routine for beginners.
+user: Draft a LinkedIn post announcing that I'm starting a new role.

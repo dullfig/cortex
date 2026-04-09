@@ -1,0 +1,7 @@
+# synth_008: auto-generated fixture with 4 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+user: I'm writing a cover letter for a marketing role. Tips?
+doc: This minimalist desk lamp features a brushed aluminum arm, a dimmable LED head, and a weighted base that prevents tipping.
+doc: The museum's new exhibit traces the evolution of photography from daguerreotypes to digital sensors across two large galleries.
+user: Give me a packing list for a weekend camping trip in October.

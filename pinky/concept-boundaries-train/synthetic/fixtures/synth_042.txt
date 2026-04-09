@@ -1,0 +1,7 @@
+# synth_042: auto-generated fixture with 4 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+user: I need a 20-minute kettlebell routine for beginners.
+doc: Goldfish have a much better memory than the three-second myth suggests, and can be trained to recognize shapes and colors.
+user: Walk me through compounding interest with a five thousand dollar example.
+tool: search_web returned 8 results in 0.42 seconds, top hit: en.wikipedia.org/wiki/Photosynthesis.

@@ -1,0 +1,5 @@
+# synth_046: auto-generated fixture with 2 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+doc: Our sourdough bread is baked in stone hearth ovens using a starter that has been maintained for over twenty years.
+tool: unit_convert: 5 miles = 8.0467 kilometers.

@@ -1,0 +1,5 @@
+# synth_014: auto-generated fixture with 2 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+system: You are a frontend expert. Prefer accessible, semantic HTML and modern CSS.
+user: What's a polite way to ask a coworker to stop interrupting me in meetings?

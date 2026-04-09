@@ -1,0 +1,6 @@
+# synth_024: auto-generated fixture with 3 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+doc: This blog post walks through how to configure GitHub Actions to run tests on every pull request to the main branch.
+tool: geocode: '1600 Amphitheatre Pkwy' -> lat 37.4220, lon -122.0841.
+user: Explain why the sky is blue to my six-year-old.

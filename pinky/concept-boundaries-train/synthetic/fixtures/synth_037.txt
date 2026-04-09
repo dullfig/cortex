@@ -1,0 +1,5 @@
+# synth_037: auto-generated fixture with 2 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+user: I'm feeling stuck on chapter three of my novel. The pacing is off.
+doc: Our premium plan includes unlimited storage, priority support, and advanced analytics dashboards for teams of up to fifty users.

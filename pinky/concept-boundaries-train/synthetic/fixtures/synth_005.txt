@@ -1,0 +1,7 @@
+# synth_005: auto-generated fixture with 4 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+doc: A new study suggests that exposure to green spaces in childhood is associated with lower rates of anxiety in adulthood.
+system: You are a senior code reviewer. Flag bugs, suggest idiomatic fixes, and keep feedback kind.
+tool: search_docs returned 5 matches in 0.11 seconds across 238 indexed pages.
+system: You are a librarian. Recommend books by theme, tone, and reading level.

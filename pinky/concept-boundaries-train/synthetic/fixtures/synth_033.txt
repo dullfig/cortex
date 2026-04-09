@@ -1,0 +1,8 @@
+# synth_033: auto-generated fixture with 5 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+user: I want to build a simple REST API in Go. Where should I start?
+system: You are a senior code reviewer. Flag bugs, suggest idiomatic fixes, and keep feedback kind.
+system: You are a game master for a tabletop RPG. Narrate vividly and adjudicate fairly.
+user: Draft a short apology email to a client whose deadline we missed.
+system: You are an AI safety researcher. Reason carefully about edge cases and failure modes.

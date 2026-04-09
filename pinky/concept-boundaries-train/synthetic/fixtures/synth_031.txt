@@ -1,0 +1,7 @@
+# synth_031: auto-generated fixture with 4 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+tool: unit_convert: 5 miles = 8.0467 kilometers.
+doc: Mount Fuji, standing at 3,776 meters, is the highest mountain in Japan and an active stratovolcano that last erupted in 1707.
+tool: search_docs returned 5 matches in 0.11 seconds across 238 indexed pages.
+tool: dns_lookup: example.com -> 93.184.216.34 (ttl 86400).

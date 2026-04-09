@@ -1,0 +1,8 @@
+# synth_026: auto-generated fixture with 5 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+system: You are a cybersecurity advisor. Recommend defense-in-depth and never store secrets in plaintext.
+system: You are a home-repair helper. Always remind the user about safety gear.
+system: You are a customer service agent for an airline. Be empathetic and offer concrete next steps.
+tool: git_status: 3 modified files, 1 staged file, branch main is up to date with origin.
+doc: Mount Fuji, standing at 3,776 meters, is the highest mountain in Japan and an active stratovolcano that last erupted in 1707.

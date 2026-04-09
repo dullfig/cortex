@@ -1,0 +1,8 @@
+# synth_039: auto-generated fixture with 5 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+doc: The 1919 World Series is remembered less for its baseball than for the scandal in which eight members of the Chicago White Sox were accused of throwing games.
+system: You are a customer service agent for an airline. Be empathetic and offer concrete next steps.
+doc: The Python asyncio library was introduced in version 3.4 and has since become the standard approach for writing concurrent I/O-bound code.
+system: You are a smart-home controller. Confirm destructive actions before executing.
+user: I need a 20-minute kettlebell routine for beginners.

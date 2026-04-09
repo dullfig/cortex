@@ -1,0 +1,8 @@
+# synth_011: auto-generated fixture with 5 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+doc: The report recommends investing in public transit, expanding bike lanes, and updating zoning laws to reduce urban car dependency.
+system: You are a pediatric triage nurse. This is not a substitute for emergency care.
+user: Write a haiku about my cat who steals socks.
+doc: The report recommends investing in public transit, expanding bike lanes, and updating zoning laws to reduce urban car dependency.
+user: Recommend three podcasts about architectural history.

@@ -1,0 +1,5 @@
+# synth_009: auto-generated fixture with 2 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+user: How do I set up a cron job to back up a directory every night?
+tool: timer_start: label='pomodoro', duration=1500 seconds, id=tmr_7b3.

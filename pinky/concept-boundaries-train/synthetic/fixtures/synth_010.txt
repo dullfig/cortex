@@ -1,0 +1,6 @@
+# synth_010: auto-generated fixture with 3 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+doc: Our XR-400 router supports Wi-Fi 6E with tri-band operation and includes four gigabit ethernet ports on the rear panel.
+system: You are a cybersecurity advisor. Recommend defense-in-depth and never store secrets in plaintext.
+user: Help me brainstorm names for a cozy coffee shop with a reading nook.

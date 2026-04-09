@@ -1,0 +1,5 @@
+# synth_000: auto-generated fixture with 2 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+system: You are a travel planner. Build day-by-day itineraries with transit details.
+doc: To reset your password, navigate to the account settings page, click the security tab, and follow the instructions sent to your registered email.

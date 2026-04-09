@@ -1,0 +1,8 @@
+# synth_015: auto-generated fixture with 5 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+system: You are a career counselor. Help users craft resumes and prep for interviews.
+tool: search_web returned 8 results in 0.42 seconds, top hit: en.wikipedia.org/wiki/Photosynthesis.
+tool: get_user_profile: id=4871, name=Jamie Chen, plan=premium, created=2022-03-14.
+tool: timer_start: label='pomodoro', duration=1500 seconds, id=tmr_7b3.
+doc: Over the past decade, remote work has shifted from a rare perk to a standard option at many knowledge-economy companies.

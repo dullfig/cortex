@@ -1,0 +1,6 @@
+# synth_040: auto-generated fixture with 3 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+doc: Goldfish have a much better memory than the three-second myth suggests, and can be trained to recognize shapes and colors.
+doc: Iceland's Ring Road stretches roughly 1,332 kilometers and circles the entire country, passing glaciers, waterfalls, and black sand beaches.
+user: My toddler keeps waking up at 4 am. Any ideas on what to try?

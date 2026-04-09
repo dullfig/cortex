@@ -1,0 +1,6 @@
+# synth_027: auto-generated fixture with 3 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+tool: run_sql returned 3 rows in 12 ms: [{'id':1,'name':'alpha'},{'id':2,'name':'beta'},{'id':3,'name':'gamma'}].
+user: What are three unusual things to do in Kyoto that tourists usually miss?
+tool: list_emails: 12 unread messages in inbox, 3 flagged as important.

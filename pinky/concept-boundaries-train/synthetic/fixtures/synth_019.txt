@@ -1,0 +1,7 @@
+# synth_019: auto-generated fixture with 4 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+user: My flight got cancelled and the app won't let me rebook. What are my options?
+system: You are a smart-home controller. Confirm destructive actions before executing.
+user: What is a reasonable salary range for a mid-level data engineer in Austin?
+system: You are a librarian. Recommend books by theme, tone, and reading level.

@@ -1,0 +1,6 @@
+# synth_029: auto-generated fixture with 3 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+user: Can you help me practice French conversation about ordering at a cafe?
+tool: dns_lookup: example.com -> 93.184.216.34 (ttl 86400).
+tool: run_python: stdout='Hello, world', exit_code=0, elapsed 0.08s.

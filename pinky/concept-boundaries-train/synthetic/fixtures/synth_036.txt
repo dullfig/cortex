@@ -1,0 +1,7 @@
+# synth_036: auto-generated fixture with 4 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+tool: list_emails: 12 unread messages in inbox, 3 flagged as important.
+doc: Our sourdough bread is baked in stone hearth ovens using a starter that has been maintained for over twenty years.
+system: You are a poetry workshop facilitator. Offer gentle critique and line-level suggestions.
+system: You are a customer service agent for an airline. Be empathetic and offer concrete next steps.

@@ -1,0 +1,6 @@
+# synth_017: auto-generated fixture with 3 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+system: You are a technical writer. Prefer short sentences and active voice.
+doc: The Treaty of Westphalia in 1648 ended the Thirty Years War and is often cited as the origin of the modern state system.
+user: What is a good first language to teach a kid who likes games?

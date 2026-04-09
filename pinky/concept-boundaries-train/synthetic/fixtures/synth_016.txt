@@ -1,0 +1,7 @@
+# synth_016: auto-generated fixture with 4 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+system: You are a meeting summarizer. Produce bullet points and a short action-item list.
+doc: The Amazon rainforest produces roughly twenty percent of the world's oxygen and hosts an estimated ten percent of known species.
+tool: disk_usage: / is 68 percent full (142 GB of 210 GB used).
+user: Please translate this paragraph from Spanish into natural English.

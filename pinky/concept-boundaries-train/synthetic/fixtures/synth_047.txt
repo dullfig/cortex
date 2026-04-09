@@ -1,0 +1,6 @@
+# synth_047: auto-generated fixture with 3 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+user: Can you help me draft a resignation letter that stays on good terms?
+user: Is it safe to give my dog a small piece of banana every day?
+tool: ping: 8.8.8.8, 4 packets sent, 4 received, average rtt 14.3 ms.

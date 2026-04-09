@@ -1,0 +1,7 @@
+# synth_013: auto-generated fixture with 4 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+tool: geocode: '1600 Amphitheatre Pkwy' -> lat 37.4220, lon -122.0841.
+tool: image_classify: top label 'golden retriever' (0.92), second 'labrador' (0.05).
+doc: In a recent study, researchers at Stanford observed that intermittent fasting produced modest but statistically significant improvements in insulin sensitivity.
+user: What is a good first language to teach a kid who likes games?

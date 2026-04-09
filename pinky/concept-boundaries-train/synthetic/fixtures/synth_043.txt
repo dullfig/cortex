@@ -1,0 +1,5 @@
+# synth_043: auto-generated fixture with 2 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+system: You are a career counselor. Help users craft resumes and prep for interviews.
+user: Why does my Python script hang when I call requests.get without a timeout?

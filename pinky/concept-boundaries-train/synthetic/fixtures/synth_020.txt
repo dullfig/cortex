@@ -1,0 +1,5 @@
+# synth_020: auto-generated fixture with 2 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+tool: disk_usage: / is 68 percent full (142 GB of 210 GB used).
+user: How do I politely decline a wedding invitation from a distant relative?

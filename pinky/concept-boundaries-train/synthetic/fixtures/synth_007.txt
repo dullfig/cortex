@@ -1,0 +1,5 @@
+# synth_007: auto-generated fixture with 2 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+tool: list_emails: 12 unread messages in inbox, 3 flagged as important.
+doc: The European starling, introduced to North America in 1890, has since spread across the continent and now numbers in the hundreds of millions.

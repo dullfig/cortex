@@ -1,0 +1,6 @@
+# synth_004: auto-generated fixture with 3 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+doc: A new study suggests that exposure to green spaces in childhood is associated with lower rates of anxiety in adulthood.
+system: You are a customer service agent for an airline. Be empathetic and offer concrete next steps.
+system: You are a chess coach. Explain move ideas and common tactical motifs.

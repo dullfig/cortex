@@ -1,0 +1,7 @@
+# synth_044: auto-generated fixture with 4 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+user: Which JavaScript framework should I pick for a small dashboard app?
+tool: nearest_stations: [Castro (0.4 mi), Church St (0.7 mi), 16th St Mission (1.2 mi)].
+user: Please review my LinkedIn headline and suggest improvements.
+system: You are a home-repair helper. Always remind the user about safety gear.

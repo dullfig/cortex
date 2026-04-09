@@ -33,6 +33,7 @@ from sklearn.metrics import (
     confusion_matrix,
     precision_recall_fscore_support,
 )
+from sklearn.preprocessing import StandardScaler
 
 
 METADATA_COLS = {"fixture", "position", "token_id", "token_text", "source", "label"}
@@ -73,22 +74,32 @@ def load_features(csv_path: Path):
 
 
 def fit_and_report(X_train, y_train, X_test, y_test, label):
-    """Fit logistic regression and report key metrics."""
+    """Fit logistic regression and report key metrics.
+
+    Standardizes features (zero mean, unit variance) before fitting.
+    Per-layer attention scores have very different scales (raw Q.K^T
+    ranges over (-inf, +inf), softmax outputs in [0, 1]) so the
+    optimizer has trouble converging without scaling.
+    """
     if y_train.sum() == 0:
         print(f"  [{label}] no positive examples in training set, skipping")
         return {}
+
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
 
     model = LogisticRegression(
         penalty="l2",
         C=1.0,
         class_weight="balanced",
-        max_iter=2000,
+        max_iter=5000,
         random_state=42,
     )
-    model.fit(X_train, y_train)
+    model.fit(X_train_scaled, y_train)
 
-    y_pred = model.predict(X_test)
-    y_proba = model.predict_proba(X_test)[:, 1]
+    y_pred = model.predict(X_test_scaled)
+    y_proba = model.predict_proba(X_test_scaled)[:, 1]
 
     acc = accuracy_score(y_test, y_pred)
     p, r, f, _ = precision_recall_fscore_support(
@@ -144,7 +155,7 @@ def in_sample_run(X, y, feature_names, rows):
     for idx in pos_idx:
         row = rows[idx]
         text = str(row["token_text"])[:25]
-        pred = int(result["model"].predict(X[idx:idx + 1])[0])
+        pred = 1 if proba[idx] >= 0.5 else 0
         print(
             f"  {row['fixture']:<28} {row['position']:>4} {proba[idx]:>6.3f}  {pred:>4}  {text!r}"
         )
@@ -213,20 +224,129 @@ def leave_one_fixture_out(X, y, feature_names, rows):
     print()
 
 
+def held_out_run(X_train, y_train, rows_train, X_test, y_test, rows_test, feature_names):
+    """Train on one set of features, evaluate on a completely different set.
+
+    This is the honest evaluation: training data is the synthetic fixtures
+    (large, programmatically labeled) and test data is the hand-crafted
+    fixtures (small, hand-curated, structurally distinct from training).
+    Generalization across the train/test split is the key question.
+    """
+    print("=" * 70)
+    print("HELD-OUT EVALUATION (train on synthetic, test on hand-crafted)")
+    print("=" * 70)
+    print(f"  train: {len(y_train)} rows, {y_train.sum()} positives "
+          f"({100 * y_train.mean():.1f}%)")
+    print(f"  test:  {len(y_test)} rows, {y_test.sum()} positives "
+          f"({100 * y_test.mean():.1f}%)")
+    print()
+
+    result = fit_and_report(X_train, y_train, X_test, y_test, "held-out")
+    if not result:
+        return
+
+    print()
+    print("test-set predictions for all true positives:")
+    print(f"  {'fixture':<28} {'pos':>4} {'proba':>7}  {'pred':>4}  text")
+    print(f"  {'-' * 60}")
+    proba = result["y_proba"]
+    pos_idx = np.where(y_test == 1)[0]
+    for idx in pos_idx:
+        row = rows_test[idx]
+        text = str(row["token_text"])[:25]
+        pred = 1 if proba[idx] >= 0.5 else 0
+        marker = "*" if pred == 1 else " "
+        print(
+            f"  {row['fixture']:<28} {row['position']:>4} {proba[idx]:>6.3f}  "
+            f"{pred:>3}{marker}  {text!r}"
+        )
+    print()
+
+    # Top-K test-set predictions overall (regardless of true label)
+    print("top 12 most-confident test-set predictions:")
+    print(f"  {'fixture':<28} {'pos':>4} {'true':>5} {'proba':>7}  text")
+    print(f"  {'-' * 60}")
+    order = np.argsort(-proba)[:12]
+    for idx in order:
+        row = rows_test[idx]
+        marker = "*" if row["label"] == 1 else " "
+        text = str(row["token_text"])[:25]
+        print(
+            f"  {row['fixture']:<28} {row['position']:>4} {row['label']:>4}{marker} "
+            f"{proba[idx]:>6.3f}  {text!r}"
+        )
+    print()
+
+    # Top features by weight (interpretability)
+    coef = result["model"].coef_[0]
+    feature_importance = sorted(
+        [(name, w) for name, w in zip(feature_names, coef)],
+        key=lambda x: -abs(x[1]),
+    )
+    print("top 16 features by |weight|:")
+    print(f"  {'feature':<25} {'weight':>10}")
+    print(f"  {'-' * 40}")
+    for name, w in feature_importance[:16]:
+        sign = "+" if w >= 0 else "-"
+        print(f"  {name:<25} {sign}{abs(w):>9.4f}")
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train a classifier on attention features.")
     parser.add_argument(
         "--features",
         type=Path,
-        required=True,
-        help="Path to features CSV from dump_features binary",
+        required=False,
+        help="Path to features CSV (single-file mode: in-sample + optional LOO).",
+    )
+    parser.add_argument(
+        "--train-features",
+        type=Path,
+        required=False,
+        help="Path to training features CSV (use with --test-features).",
+    )
+    parser.add_argument(
+        "--test-features",
+        type=Path,
+        required=False,
+        help="Path to held-out test features CSV (use with --train-features).",
     )
     parser.add_argument(
         "--loo",
         action="store_true",
-        help="Run leave-one-fixture-out cross-validation in addition to in-sample",
+        help="Run leave-one-fixture-out cross-validation (single-file mode only).",
     )
     args = parser.parse_args()
+
+    if args.train_features and args.test_features:
+        # Two-file mode: train on synthetic, evaluate on held-out hand-crafted.
+        for p in (args.train_features, args.test_features):
+            if not p.exists():
+                print(f"error: file not found: {p}", file=sys.stderr)
+                sys.exit(1)
+
+        print(f"loading training features from {args.train_features}")
+        rows_train, X_train, y_train, feature_names_train = load_features(args.train_features)
+        print(f"  {len(rows_train)} rows, {X_train.shape[1]} features")
+        print()
+
+        print(f"loading test features from {args.test_features}")
+        rows_test, X_test, y_test, feature_names_test = load_features(args.test_features)
+        print(f"  {len(rows_test)} rows, {X_test.shape[1]} features")
+        print()
+
+        if feature_names_train != feature_names_test:
+            print("error: train and test feature columns don't match", file=sys.stderr)
+            sys.exit(1)
+
+        held_out_run(X_train, y_train, rows_train, X_test, y_test, rows_test, feature_names_train)
+        return
+
+    if not args.features:
+        print("error: provide either --features (single-file) or "
+              "--train-features and --test-features (held-out)", file=sys.stderr)
+        sys.exit(1)
 
     if not args.features.exists():
         print(f"error: features file not found: {args.features}", file=sys.stderr)

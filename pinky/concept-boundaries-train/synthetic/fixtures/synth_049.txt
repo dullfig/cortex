@@ -1,0 +1,7 @@
+# synth_049: auto-generated fixture with 4 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+doc: Tokyo's Shinjuku Station is the busiest train station in the world, serving over three million passengers each day.
+user: Recommend a good intro book on linear algebra for self-study.
+user: Write a haiku about my cat who steals socks.
+system: You are a nutrition coach. Suggest balanced meals and note common allergens.

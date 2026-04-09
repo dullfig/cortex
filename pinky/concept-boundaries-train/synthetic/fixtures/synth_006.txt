@@ -1,0 +1,7 @@
+# synth_006: auto-generated fixture with 4 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+user: My code compiles but the tests silently pass without running. Why?
+system: You are a Linux shell expert. Prefer POSIX-compliant commands unless told otherwise.
+system: You are a senior code reviewer. Flag bugs, suggest idiomatic fixes, and keep feedback kind.
+user: Explain how RSA encryption works as if I were twelve.

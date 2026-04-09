@@ -1,0 +1,5 @@
+# synth_030: auto-generated fixture with 2 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+user: What time does the post office on Main Street close today?
+tool: lookup_isbn: 9780143127741 -> 'Sapiens: A Brief History of Humankind' by Yuval Noah Harari.

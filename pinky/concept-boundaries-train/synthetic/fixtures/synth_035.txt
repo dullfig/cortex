@@ -1,0 +1,8 @@
+# synth_035: auto-generated fixture with 5 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+doc: The 1919 World Series is remembered less for its baseball than for the scandal in which eight members of the Chicago White Sox were accused of throwing games.
+doc: The Rust borrow checker enforces memory safety at compile time by tracking ownership and lifetimes of each reference.
+user: I'm feeling stuck on chapter three of my novel. The pacing is off.
+doc: Tokyo's Shinjuku Station is the busiest train station in the world, serving over three million passengers each day.
+user: Why is my sourdough starter not doubling overnight anymore?

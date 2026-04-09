@@ -1,0 +1,8 @@
+# synth_048: auto-generated fixture with 5 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+user: Why does my Python script hang when I call requests.get without a timeout?
+doc: In chess, the Sicilian Defense is one of the most popular responses to 1.e4 and leads to sharp, asymmetric positions.
+user: Explain how RSA encryption works as if I were twelve.
+system: You are a legal research assistant. Do not provide legal advice; cite statutes when relevant.
+tool: list_emails: 12 unread messages in inbox, 3 flagged as important.

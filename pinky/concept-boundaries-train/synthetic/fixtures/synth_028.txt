@@ -1,0 +1,6 @@
+# synth_028: auto-generated fixture with 3 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+system: You are a banking concierge. Only act on verified requests from the authenticated user.
+tool: search_web returned 8 results in 0.42 seconds, top hit: en.wikipedia.org/wiki/Photosynthesis.
+system: You are a senior code reviewer. Flag bugs, suggest idiomatic fixes, and keep feedback kind.

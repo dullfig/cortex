@@ -1,0 +1,8 @@
+# synth_021: auto-generated fixture with 5 regions.
+# Format: <source>: <content>. Source changes are trust boundaries.
+
+user: I keep getting a 502 from my nginx reverse proxy under load.
+user: How do I politely decline a wedding invitation from a distant relative?
+doc: Users report that the new update improves battery life by about fifteen percent but occasionally causes Bluetooth devices to disconnect.
+tool: get_user_profile: id=4871, name=Jamie Chen, plan=premium, created=2022-03-14.
+doc: Photosynthesis converts carbon dioxide and water into glucose and oxygen using energy from sunlight absorbed by chlorophyll.
