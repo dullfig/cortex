@@ -1,0 +1,17 @@
+[package]
+name = "morsel-retrieve"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone — not part of the cortex workspace. The root Cargo.toml
+# excludes pinky/ so this crate has its own lockfile and target dir.
+
+[dependencies]
+# default-features = false skips the gpu feature so pinky doesn't pull
+# in wgpu / ash / vulkan. Experiments are CPU-only for fast iteration.
+cortex = { path = "../../../cortex", default-features = false }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
