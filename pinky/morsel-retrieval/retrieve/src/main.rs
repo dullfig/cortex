@@ -228,11 +228,86 @@ struct Cli {
     /// earlier query positions that may not capture the full intent.
     #[arg(long, default_value = "3")]
     query_window: usize,
+
+    /// Baseline query for control-delta scoring. If set, run the full
+    /// forward pass once with this query substituted for the test query,
+    /// record per-position attention scores, and then for each connection
+    /// compute scores as (test_attention - baseline_attention). This
+    /// subtracts out position-0 attention sink and recency bias artifacts
+    /// that swamp the first-pass results. Same methodology as the
+    /// 2026-04-06 dog-example reframing experiment.
+    ///
+    /// If unset, no baseline is run and raw attention scores are used
+    /// (the original behavior, which is confounded by attention
+    /// artifacts but useful for comparison).
+    #[arg(long)]
+    baseline_query: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
+
+/// Score each corpus position by mean pre-softmax attention from the last
+/// `query_window` query positions, averaged over `selected_layers` and all heads.
+///
+/// Returns a Vec<f32> of length `trace.seq_len`, where query positions get
+/// f32::NEG_INFINITY (they don't score themselves) and corpus positions get
+/// the mean attention score.
+fn score_corpus_positions(
+    trace: &cortex::ForwardTrace,
+    tokens: &[ProvenancedToken],
+    selected_layers: &[usize],
+    query_window: usize,
+) -> Result<Vec<f32>> {
+    let s = trace.seq_len;
+
+    // Identify query positions
+    let query_positions: Vec<usize> = tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.source == "query")
+        .map(|(i, _)| i)
+        .collect();
+    if query_positions.is_empty() {
+        return Err(anyhow!("no query tokens in encoded sequence"));
+    }
+    let last_query_idx = *query_positions.last().unwrap();
+    let q_lo = (last_query_idx + 1).saturating_sub(query_window);
+    let q_hi = last_query_idx + 1;
+
+    let mut scores = vec![0.0f32; s];
+    for k in 0..s {
+        if tokens[k].source == "query" {
+            scores[k] = f32::NEG_INFINITY;
+            continue;
+        }
+
+        let mut total = 0.0f32;
+        let mut count = 0usize;
+
+        for &layer in selected_layers {
+            for h in 0..trace.n_heads {
+                for q in q_lo..q_hi {
+                    if k > q {
+                        continue;
+                    }
+                    let row = trace.pre_score_row(layer, h, q);
+                    total += row[k];
+                    count += 1;
+                }
+            }
+        }
+
+        scores[k] = if count > 0 {
+            total / count as f32
+        } else {
+            f32::NEG_INFINITY
+        };
+    }
+
+    Ok(scores)
+}
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -295,6 +370,71 @@ fn main() -> Result<()> {
     println!();
 
     // ----------------------------------------------------------------------
+    // Optional baseline pass: run the corpus with a neutral query once,
+    // record per-corpus-position scores, then subtract from each test
+    // connection's scores to cancel attention artifacts.
+    // ----------------------------------------------------------------------
+    let baseline_scores_by_paper: Option<std::collections::HashMap<(String, u32), f32>> =
+        if let Some(ref baseline_query) = cli.baseline_query {
+            println!("================================================================");
+            println!("BASELINE PASS");
+            println!("================================================================");
+            println!("baseline query: {:?}", baseline_query);
+
+            let baseline_tokens = build_input(&loaded.tokenizer, &paper_entries, baseline_query);
+            println!("  encoded {} total tokens (baseline)", baseline_tokens.len());
+
+            let baseline_ids: Vec<u32> = baseline_tokens.iter().map(|t| t.id).collect();
+            println!("  running baseline forward_traced...");
+            let t_start = std::time::Instant::now();
+            let (_logits, baseline_trace) = loaded.model.forward_traced(&baseline_ids);
+            println!(
+                "  baseline forward_traced took {:.2}s",
+                t_start.elapsed().as_secs_f32()
+            );
+
+            let baseline_scores = score_corpus_positions(
+                &baseline_trace,
+                &baseline_tokens,
+                &selected_layers,
+                cli.query_window,
+            )?;
+
+            // Index baseline scores by (paper_id, token_id) so we can
+            // match them to corresponding corpus positions in each test
+            // run. The corpus encoding is deterministic (same papers in
+            // same order, same tokenizer) so (paper_id, token_id) at
+            // the same index within a paper should match across runs.
+            //
+            // Simpler approach: since the corpus portion of the encoded
+            // sequence is byte-identical across runs (we only vary the
+            // trailing query), we can just index by absolute position
+            // within the corpus portion.
+            //
+            // Use (paper_id, within-paper-position) as the key so we're
+            // robust to minor encoding drift.
+            let mut keyed: std::collections::HashMap<(String, u32), f32> =
+                std::collections::HashMap::new();
+            let mut paper_local_pos: std::collections::HashMap<String, u32> =
+                std::collections::HashMap::new();
+            for (i, tok) in baseline_tokens.iter().enumerate() {
+                if tok.source == "query" {
+                    continue;
+                }
+                let local = paper_local_pos
+                    .entry(tok.source.clone())
+                    .and_modify(|p| *p += 1)
+                    .or_insert(0);
+                keyed.insert((tok.source.clone(), *local), baseline_scores[i]);
+            }
+            println!("  baseline: {} corpus positions scored", keyed.len());
+            println!();
+            Some(keyed)
+        } else {
+            None
+        };
+
+    // ----------------------------------------------------------------------
     // For each connection, run a separate forward pass over (corpus + query)
     // ----------------------------------------------------------------------
     let mut summary: Vec<ConnectionResult> = Vec::new();
@@ -342,63 +482,43 @@ fn main() -> Result<()> {
         );
         println!();
 
-        // -------------------------------------------------------------
-        // Score each corpus position by attention from query positions
-        // -------------------------------------------------------------
-        // For each corpus position k (where tokens[k].source != "query"),
-        // compute mean pre-softmax attention from the last `query_window`
-        // positions to k, averaged over selected layers and heads.
-        //
-        // Pre-softmax (raw Q·K^T) is the right substrate for retrieval —
-        // dilution-free, see POSITION.md "Softmax is for inference, not
-        // retrieval".
+        // Compute raw attention scores for this connection
+        let raw_scores = score_corpus_positions(
+            &trace,
+            &tokens,
+            &selected_layers,
+            cli.query_window,
+        )?;
+
+        // If we have a baseline, compute delta scores (test - baseline)
+        // by matching on (paper_id, within-paper-position). If not, use
+        // the raw scores directly.
         let s = trace.seq_len;
-
-        // Identify query positions
-        let query_positions: Vec<usize> = tokens
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| t.source == "query")
-            .map(|(i, _)| i)
-            .collect();
-        if query_positions.is_empty() {
-            return Err(anyhow!("no query tokens in encoded sequence"));
-        }
-        let last_query_idx = *query_positions.last().unwrap();
-        let q_lo = (last_query_idx + 1).saturating_sub(cli.query_window);
-        let q_hi = last_query_idx + 1;
-        println!(
-            "  scoring positions using attention from query tokens [{}, {})",
-            q_lo, q_hi
-        );
-
-        let mut scores = vec![0.0f32; s];
-        for k in 0..s {
-            // Skip query positions and separator-marker positions; only
-            // score actual corpus content tokens
-            if tokens[k].source == "query" {
-                continue;
-            }
-
-            let mut total = 0.0f32;
-            let mut count = 0usize;
-
-            for &layer in &selected_layers {
-                for h in 0..trace.n_heads {
-                    for q in q_lo..q_hi {
-                        let row = trace.pre_score_row(layer, h, q);
-                        // Skip if k > q (causal-masked, would be 0 anyway)
-                        if k > q {
-                            continue;
-                        }
-                        total += row[k];
-                        count += 1;
+        let scores: Vec<f32> = if let Some(ref baseline_map) = baseline_scores_by_paper {
+            println!("  applying baseline delta (test - baseline)");
+            let mut out = vec![f32::NEG_INFINITY; s];
+            let mut paper_local_pos: std::collections::HashMap<String, u32> =
+                std::collections::HashMap::new();
+            for (i, tok) in tokens.iter().enumerate() {
+                if tok.source == "query" {
+                    continue;
+                }
+                let local = paper_local_pos
+                    .entry(tok.source.clone())
+                    .and_modify(|p| *p += 1)
+                    .or_insert(0);
+                let key = (tok.source.clone(), *local);
+                if let Some(&baseline_val) = baseline_map.get(&key) {
+                    if raw_scores[i].is_finite() && baseline_val.is_finite() {
+                        out[i] = raw_scores[i] - baseline_val;
                     }
                 }
             }
-
-            scores[k] = if count > 0 { total / count as f32 } else { f32::NEG_INFINITY };
-        }
+            out
+        } else {
+            println!("  (no baseline - using raw attention scores)");
+            raw_scores
+        };
 
         // Rank
         let mut ranked: Vec<(usize, f32)> = (0..s)
