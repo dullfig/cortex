@@ -1927,9 +1927,74 @@ GitHub companion: the authors released a collection of research works
 on LLM reasoning failures, which is an entry point for any future
 deep-dive on a specific failure mode.
 
+### Coconut: Chain of Continuous Thought (Hao et al, December 2024)
+
+arXiv:2412.06769. Daniel found this on 2026-04-09 evening ("ah the
+joys of having your own transformer"). This is the most directly
+implementable paper we've found — it describes a technique that only
+works if you own the inference path, which we do.
+
+**What it does**: instead of forcing the LLM to reason through discrete
+tokens (chain-of-thought), feed the last hidden state back as the
+input embedding for the next position, creating a reasoning loop in
+continuous latent space. The model "thinks" for N steps without
+emitting any tokens, then produces output. Each continuous-thought
+step is a full forward pass whose input is the previous step's hidden
+state rather than a token embedding.
+
+**The killer property**: because the hidden state is a continuous
+vector (not a discrete token), it can simultaneously encode *multiple*
+candidate next thoughts. The model performs **breadth-first search**
+over reasoning paths in continuous space before committing to one.
+Token-level CoT commits to one discrete path per step; Coconut
+explores multiple branches simultaneously.
+
+**Why cortex can implement this and API-hosted models cannot**: the
+technique requires intercepting the hidden state between the final
+layer and the output projection, then feeding it back as the next
+position's embedding (bypassing the token embedding lookup). This is
+*only possible* if you own the inference path. Cortex's
+`forward_traced` already captures hidden states at every layer, and
+`forward_cached` already supports incremental KV cache appending.
+The modification needed:
+
+1. Add an optional `embeddings: &[f32]` input mode to `forward_cached`
+   that bypasses the token embedding table lookup
+2. A thin "thinking loop" wrapper (~50 lines) that feeds back hidden
+   states N times before switching to normal token generation
+
+**Connection to the rest of the cortex architecture**:
+
+- The **iteration failure mode** from the reasoning-failures paper
+  (arXiv:2602.06176, above) → Coconut is the direct solution,
+  operating in continuous space
+- The **internal voice / scratch context** discussion from the same
+  evening → Coconut is the hidden-state-level version, richer than
+  token-level scratch contexts because it can represent multiple
+  alternatives simultaneously
+- The **morsel retrieval** architecture → during continuous-thought
+  steps, the model's hidden states ARE the Q vectors for retrieval.
+  Each thought step can attend to different parts of the stored
+  substrate. The model "thinks about" the query across multiple
+  retrieval steps before committing to an answer
+- The **cerebellum** framing → the continuous-thought loop IS the
+  cerebellum's feedback loop, operating on continuous signals instead
+  of discrete symbols, exactly as biological motor control does
+- The **NeuralKV FfnInjector** → Coconut's hidden-state feedback and
+  FfnInjector's per-position residual injection are different points
+  on the same "feed internal state back into the model" continuum
+
+**Pinky experiment**: implement Coconut on Qwen2.5-0.5B via cortex.
+Maybe two evenings. The original paper used larger models; showing
+it works at small scale on a local transformer with CPU inference
+would be both a validation and a demonstration that the technique
+doesn't need massive compute. The result would also compose with the
+morsel-retrieval binary: continuous-thought steps could attend to the
+stored corpus during reasoning, not just at the initial query.
+
 ### The meta-observation
 
-All four convergences share the same core pattern:
+All five convergences share the same core pattern:
 
 **Smart feature extractor (frozen) → stored experiences in latent space
 → retrieval by similarity → action derived from retrieved cases →
