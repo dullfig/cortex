@@ -1872,9 +1872,64 @@ formalization and the real-time performance results (they run within
 physical control loop constraints, which is evidence the pattern is
 fast enough for production use).
 
+### LLM Reasoning Failures survey (Song, Han, Goodman — February 2026)
+
+arXiv:2602.06176. Daniel found this on 2026-04-09 evening and framed
+it as "an opportunity, not an indictment — you don't use a hammer to
+tighten a screw." Exactly right.
+
+This is the first comprehensive survey dedicated to cataloguing
+systematic reasoning failures in LLMs: formal logic, robustness under
+minor input variation, embodied reasoning, application-specific
+limitations. Rather than new experiments, it systematizes existing
+fragmented research into a dual-axis taxonomy (reasoning type ×
+failure type) with root-cause analysis and mitigation strategies for
+each cell.
+
+**Why this matters for cortex and AgentOS**: each failure mode in the
+taxonomy is a case where the LLM needs external procedural
+scaffolding. The paper is the *problem statement*; cortex and AgentOS
+tools are shapes of *answer*. The mapping:
+
+- **Formal reasoning failures** → don't ask the LLM to reason; use it
+  as a feature extractor, put the procedure in the classifier
+  (the cerebellum pattern)
+- **Robustness failures under variation** → per-token provenance +
+  structural defense that doesn't depend on the LLM being robust to
+  adversarial paraphrasing; attack memory catches variants via
+  attention-space similarity
+- **Iteration failures** (LLMs can't loop) → external iteration tools
+  in AgentOS (agentos already has iteration infrastructure; the paper
+  validates why it's necessary rather than just convenient)
+- **Arithmetic / formal verification / constraint satisfaction** →
+  external tool calls (calculator, SAT solver, proof checker)
+- **Multi-step planning with backtracking** → external planner that
+  uses LLM for state evaluation and candidate generation but handles
+  the search procedure externally
+
+**Daniel's key insight**: the cerebellum isn't one organ — it's a
+*family* of specialized procedural co-processors, one per failure
+mode. Cortex is the first member of the family (boundary detection,
+attack memory, morsel retrieval). AgentOS tools are the rest
+(iteration loops, calculator, code execution, search). They're all
+the same architectural pattern: LLM provides concepts, external code
+provides the procedure, clean interface between them.
+
+**Future roadmap value**: save this paper as a menu of "things the LLM
+needs external tools for." Each entry on the menu is a potential
+cortex feature or AgentOS tool. When deciding what to build next in
+either project, consult this taxonomy for the failure mode that most
+affects the current use case, and build the procedural co-processor
+that addresses it. The paper gives the diagnostic; the cerebellum
+pattern gives the treatment template.
+
+GitHub companion: the authors released a collection of research works
+on LLM reasoning failures, which is an entry point for any future
+deep-dive on a specific failure mode.
+
 ### The meta-observation
 
-All three convergences share the same core pattern:
+All four convergences share the same core pattern:
 
 **Smart feature extractor (frozen) → stored experiences in latent space
 → retrieval by similarity → action derived from retrieved cases →
