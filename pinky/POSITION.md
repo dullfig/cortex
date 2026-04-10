@@ -713,6 +713,35 @@ practical details (clustering before training, measurable improvement
 curve) worth capturing up front so they're not rediscovered the hard
 way.
 
+### 0.75. The bicameral concierge (added 2026-04-09 evening)
+
+The concierge at rest naturally decomposes into **two agents with
+separate KV caches** — a memory holder that generates user-facing
+responses, and a guardian that analyzes input for attacks. The
+guardian communicates to the memory holder only through `FfnInjector`
+suppression residuals, never through text or shared state. Daniel's
+framing: Westworld / Jaynes' bicameral mind, but deliberately
+preserving the separation as a security property rather than
+collapsing it (which in Jaynes produced consciousness; collapsing
+ours would produce insecurity).
+
+The two caches are load-bearing: attention interference, privilege
+separation, independent scaling, and different update cadences all
+argue for separation. The guardian is structurally cheap (it needs
+only enough layers for classification + retrieval, not generation)
+so the total cost is ~1.3–1.5× a single forward pass, not 2×.
+
+Maps cleanly onto the SaaS asymmetry example (section 2 of addendum):
+guardian watches `source=doc` content from retrieved ringhub events,
+fires FfnInjector suppression at attack-flagged positions, memory
+holder generates clean response, user sees clean search results with
+no refusal text leaking detection to the attacker.
+
+See `pinky/POSITION-addendum.md` section 13's "bicameral concierge"
+sub-section for the full architecture, the four reasons two caches
+are necessary, the performance analysis, and the infrastructure
+implications.
+
 ### 1. The trainable boundary classifier (priority: high)
 
 This is the major next step. Build a small CNN/MLP classifier that takes

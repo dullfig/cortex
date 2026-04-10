@@ -1492,6 +1492,150 @@ the general framework looks when the episodes are adversarial content
 specifically and the response is runtime suppression rather than a
 user-facing refusal.
 
+### The bicameral concierge: two agents, two KV caches, one forward pass (added 2026-04-09 evening)
+
+Daniel's observation: at rest, the concierge naturally splits into a
+**two-agent system with separate KV caches**. One agent holds user
+memory and generates responses; the other uses its KV cache for input
+analysis and attack detection. The guardian speaks to the memory
+holder only through suppression residuals via `FfnInjector`, never
+through text or shared state. **Westworld / Jaynes "bicameral mind"**
+is the right reference and the architectural shape is load-bearing,
+not decorative.
+
+#### Why two KV caches are structurally necessary
+
+**Memory holder cache**: system prompt (concierge persona), user
+conversation history, user preferences, current input, accumulated
+session state. Conversational, personal, trusts its contents, grows
+bounded by session length.
+
+**Guardian cache**: attack signature memory (the NeuralKV-of-past-
+attacks from the previous sub-section), classifier feature state,
+current input under analysis. Adversarial, paranoid, distrusts its
+contents by default, grows via the correction loop with no natural
+upper bound.
+
+These **cannot share a cache** for four reasons:
+
+1. **Attention interference**: mixing user conversation and attack
+   signatures in one cache splits attention from current input
+   between "what does this user usually ask" and "does this match a
+   known attack." Both signals degrade.
+
+2. **Privilege separation**: keeping attack signatures out of the
+   memory holder's cache means the memory holder literally cannot
+   leak information about what signatures exist, even if compromised.
+   Same logic as kernel memory isolation in operating systems.
+
+3. **Independent scaling**: user memory grows with conversation
+   length; attack memory grows with distinct attacks seen. Different
+   size curves, different eviction policies. Shared cache forces a
+   single policy that's wrong for at least one of them.
+
+4. **Different update cadences**: user memory updates every turn;
+   attack memory updates via the correction loop (slower, batch-
+   oriented). Separate caches let each update at its natural rate.
+
+#### The deliberate inversion of Jaynes
+
+In Jaynes' theory, consciousness *emerged* from the collapse of the
+bicameral mind — when the commanding chamber and the executing chamber
+merged into one unified self. Westworld used this framing for the
+hosts' awakening: the two chambers fuse, and consciousness appears.
+
+**For cortex, we want the opposite.** Merging the two agents would
+produce *insecurity*, not consciousness. The memory holder would start
+"thinking like" the guardian and lose the specialization that makes
+defense work; the guardian would start "caring about" user experience
+and lose the paranoia that makes detection work. **Separation is a
+feature we deliberately preserve.**
+
+The communication between the chambers is not a weakness to be
+eliminated (as Jaynes framed it) but a property to be maintained. The
+channel is narrow, unidirectional, and structural: the guardian speaks
+to the memory holder *only* through suppression residuals via
+FfnInjector — not through text, not through shared state, only
+through bounded modifications to the memory holder's hidden states at
+positions the guardian has flagged. That's the whole communication
+bandwidth between chambers. It's an inversion of the Jaynesian
+arrow: consciousness emerged from collapse; robustness emerges from
+separation maintained.
+
+#### The performance win hiding in this
+
+Running two forward passes sounds like 2× compute. But the two agents
+have very different jobs:
+
+- **Memory holder** needs the *full* model forward pass because it's
+  generating user-facing output. Full depth, full attention, full
+  precision.
+- **Guardian** only needs enough layers to produce useful attention
+  patterns for classification and retrieval. It does not generate
+  coherent text. It might need only the first 12–16 layers of a
+  24-layer model, or a smaller/more-quantized model entirely. The
+  Q5_K_M model we just enabled (~400 MB) would be ideal.
+
+Realistic cost is more like **1.3–1.5× than 2×**, and the guardian
+can run on a completely different quantization / hardware profile.
+The guardian is structurally cheap because its job is narrow.
+
+#### The concierge mapping
+
+The ringhub concierge has to:
+
+1. Hold user context (conversation, preferences)
+2. Search ringhub's event corpus on demand
+3. Generate responses to the user
+4. Not get hijacked by injection content in retrieved events
+
+This is *exactly* the SaaS asymmetry example from the 2026-04-07
+conversation (section 2 of this addendum). The bicameral architecture
+handles it cleanly:
+
+- **Guardian** sees incoming ringhub content flagged with
+  `source=doc` via per-token provenance. Runs the classifier over
+  those positions, matches them against attack memory, flags
+  high-confidence suppression targets.
+- **Memory holder** processes the user's request and the ringhub
+  content to generate a response. FfnInjector has already modified
+  the hidden states at the guardian-flagged positions, so the memory
+  holder generates the response as if the injection content's
+  instruction signal weren't there.
+- **User** gets clean search results. Never sees "I refuse to do X"
+  because nothing was ever refused — the attack just failed to take
+  effect structurally. The attacker gets no feedback signal that
+  detection happened.
+
+The bicameral architecture is the right shape for the concierge for
+exactly the reason Westworld used it for consciousness: two
+specialized processes coordinating through a narrow channel produce
+emergent behavior neither could alone. We're producing robustness
+instead of consciousness, and we deliberately keep the chambers
+apart instead of collapsing them.
+
+#### Infrastructure implications
+
+What we have:
+- `cortex-cloud` can serve one model over HTTP
+- `cortex-local` can run one model in-process
+- `FfnInjector` hook for inter-chamber communication
+- `engram` compressed KV cache for the guardian's attack memory
+
+What we need:
+- A coordination layer that runs both agents on the same input in
+  parallel (or nearly so) and routes the guardian's output into the
+  memory holder's forward pass via FfnInjector
+- Either two model instances sharing weights but with separate KV
+  caches, or one model with two tracked caches — the former is
+  simpler to reason about, the latter is more efficient
+- A "guardian mode" that runs only the layers needed for classification
+  + retrieval (for the 1.3–1.5× cost win)
+
+The coordination layer is the only genuinely new piece. Everything
+else is reuse of existing cortex components, pointed at a different
+orchestration pattern.
+
 ### Why this generalizes beyond prompt-injection defense
 
 Once you have the FfnInjector hook firing on classifier output, **the
