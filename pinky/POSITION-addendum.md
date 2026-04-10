@@ -1819,7 +1819,74 @@ to real prediction-market contracts with different-wording matches,
 the morsel claim is validated on live data — not just on a corpus we
 designed to have the property.
 
-## 15. Personal context for future Claudes
+## 15. Related work: independent convergence on the same pattern
+
+Three independent teams have converged on the same architectural
+pattern cortex uses, from different starting points and different
+domains. This is the strongest evidence that the pattern is right —
+when people who don't know about each other produce the same answer,
+the answer is usually correct.
+
+### DynSplit-KV (Ye et al, February 2026)
+
+arXiv:2602.03184. KV cache compression paper that uses attention-
+derived delimiter scoring to find semantic boundaries dynamically.
+Showed 5.5% to 55.1% accuracy degradation from rigid splitting vs
+dynamic attention-based splitting. Same "let attention find the
+boundaries" insight we use for concept extraction. They compress
+after finding boundaries; we preserve the substrate. Same primitive,
+opposite downstream choice.
+
+### Event-Centric World Modeling with Memory-Augmented Retrieval (April 2026)
+
+arXiv:2604.07392. Daniel found this paper on 2026-04-09 evening
+("chock full of technical mumbo jumbo, but somehow feels relevant").
+His gestalt was right — under the jargon, it's the same pattern:
+
+An autonomous agent (for UAV control) that:
+1. Encodes experiences as representations in a latent space
+2. Stores them in a memory bank of paired (experience, action) entries
+3. At decision time, retrieves by similarity in latent space
+4. Produces actions as weighted combinations of retrieved experiences
+5. Decisions are interpretable because they trace to specific cases
+
+The mapping to cortex:
+- Their event representations = our K vectors in attention space
+- Their knowledge bank = our attack memory / correction memory
+- Their similarity retrieval = our raw Q·K^T over stored K vectors
+- Their weighted action combination = our FfnInjector combining
+  retrieved residuals into the forward pass
+- Their interpretability via case tracing = our debuggability via
+  stored episodes (section 3)
+
+Additionally, they use a **permutation-invariant latent representation**
+— meaning the order of events doesn't matter for retrieval. This is a
+formal version of what we do informally by averaging over heads and
+layers. Their mathematical formulation might offer a cleaner way to
+express "concept representations that are order-invariant."
+
+Different domain (UAV control vs LLM security/retrieval), different
+substrate (event representations vs attention K vectors), same
+architectural pattern. Worth reading for the permutation-invariance
+formalization and the real-time performance results (they run within
+physical control loop constraints, which is evidence the pattern is
+fast enough for production use).
+
+### The meta-observation
+
+All three convergences share the same core pattern:
+
+**Smart feature extractor (frozen) → stored experiences in latent space
+→ retrieval by similarity → action derived from retrieved cases →
+interpretable because decisions trace to specific experiences**
+
+This is the cerebellum pattern from section 13, the cascade-classifier
+pattern from sections 1 and 7, and the morsel-retrieval pattern from
+section 11, all unified under one description. When a UAV control team,
+a KV cache compression team, and a prompt-injection defense project
+all independently arrive at the same shape, the shape is load-bearing.
+
+## 16. Personal context for future Claudes
 
 Daniel is 63 (as of 2026). Longevity and aging research is a personal
 motivation alongside the technical interest. This is worth knowing
