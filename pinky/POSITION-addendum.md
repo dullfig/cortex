@@ -1780,6 +1780,34 @@ output against current market prices. If any non-obvious match has a
 live spread above transaction costs, the architecture just paid for
 itself.
 
+### Design note: Grok's normalization idea as a complementary layer
+
+Grok previously suggested having the LLM fill out a structured form
+for each contract — "what is this bet about," "resolution date,"
+"resolution criteria," etc. — and then matching on the normalized
+fields. This is **concept extraction applied to a specific domain**
+and it's complementary to morsel retrieval, not competing.
+
+The synthesis: **use the normalized form as the query for morsel
+retrieval.** Instead of querying with raw contract text (which has
+the "different wording" problem), query with the standardized form
+fields (which strip surface-form differences and give the retrieval
+a cleaner signal).
+
+Pipeline:
+1. Normalize both Polymarket and Kalshi contracts via LLM → structured form
+2. Match on form fields (catches easy and medium cases)
+3. For unmatched contracts: use the normalized form as the query,
+   run morsel retrieval against the unmatched corpus from the other
+   platform (catches hard cases where the form didn't capture
+   the connection because the connection is across dimensions the
+   form designer didn't anticipate)
+
+Step 2 alone is what a traditional bot does (and what Daniel's
+existing bot does). Steps 2+3 together cover both failure modes:
+structured matching for the cases the form captures, semantic
+matching for the cases it doesn't.
+
 ### Cross-reference
 
 This is the "near-term real-world validation" counterpart to the
