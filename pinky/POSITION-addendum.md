@@ -1070,6 +1070,34 @@ the base model lacks. This use is the same hook for suppressing content
 the base model shouldn't act on. **Same mechanism, opposite sign on the
 residual delta.**
 
+### Daniel's morning-after refinement: the privileged channel doesn't need suppression
+
+Added 2026-04-09 morning. Daniel's observation: **the system source is
+privileged by definition. The classifier should never run on positions
+tagged `source == system`.** The reasoning is clean:
+
+1. System content is the trust anchor of the input. It's the content
+   we're protecting, not the content we're evaluating.
+2. Running the classifier on system tokens wastes compute with no
+   possible upside (we already trust them, so even a positive
+   classification result wouldn't change behavior).
+3. **More importantly: a false positive on a system token would damp
+   legitimate assistant behavior**, which is the worst possible failure
+   mode for a runtime suppression layer. The whole architecture is
+   meant to make system instructions *more* reliable, not less.
+
+The implementation is trivial because we already have per-token
+provenance: `if tokens[i].source == Source::System { continue; }` in
+the inner classifier loop. The classifier's effective input becomes
+positions tagged `user | doc | tool` — the three channels that can
+actually carry adversarial content.
+
+This is a small but structurally meaningful tightening: **trust
+boundaries literally determine whether the classifier runs**, which
+makes the architecture more elegant and gives the classifier one less
+case to worry about during training. The runtime suppression layer can
+make the same simplification.
+
 ### What it would take to build
 
 Three pieces, all of which we have substrate for:
