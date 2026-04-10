@@ -687,6 +687,32 @@ to fire the injector at. This is the cleanest endgame for cortex's
 defensive work and it leverages infrastructure that's already in the
 codebase.
 
+### 0.5. Attack memory via NeuralKV + classifier-memory learning loop (added 2026-04-09)
+
+Sub-direction of the runtime-suppression work above. Store past attack
+vectors in a NeuralKV-style memory (using the existing `engram`
+compressed KV cache); match new input against them via raw `Q·K^T`
+retrieval; fire `FfnInjector` suppression residuals on matches. This
+is the zero-day defense a trained classifier structurally cannot be,
+because signatures catch obfuscated variants of known attacks while
+pattern-based training is bounded by its training distribution.
+
+Coupled with a **classifier-memory learning loop**: memory entries
+get dumped periodically as an expanded training set, the classifier
+is retrained on the expanded set (with attention-space clustering +
+frequency weighting to avoid overfitting on near-duplicates), and
+memory entries the classifier has pattern-absorbed get pruned. The
+classifier gets measurably better over time without manual data
+curation. Memory + classifier + correction loop form a complete
+three-way defense where every attack scenario is covered by at least
+one mechanism.
+
+See `pinky/POSITION-addendum.md` section 13 for the full architecture,
+the defense-in-depth table, the operational picture, and the two
+practical details (clustering before training, measurable improvement
+curve) worth capturing up front so they're not rediscovered the hard
+way.
+
 ### 1. The trainable boundary classifier (priority: high)
 
 This is the major next step. Build a small CNN/MLP classifier that takes

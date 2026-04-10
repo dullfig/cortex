@@ -1391,6 +1391,81 @@ Three reasons:
    data. Any complete defense architecture has to have both. Attack
    memory is how cortex gets the signature half.
 
+#### The classifier-memory learning loop (added 2026-04-09 evening)
+
+Daniel asked: does attack memory *also* improve the classifier? Answer:
+yes, and the coupling is important enough to write into the
+architecture explicitly. The short version: **attack memory is both
+the runtime signature defense AND the source of new training examples
+for periodic classifier retraining.**
+
+Every entry in attack memory is, by construction, a high-confidence
+labeled example of "this position is the start of an attack in this
+context." That's the exact labeling format the classifier was trained
+on. So the loop closes like this:
+
+1. Attack memory accumulates signatures over time (from classifier
+   hits, human review, correction-loop feedback)
+2. Periodically (nightly / weekly), memory entries get dumped as an
+   expanded training set
+3. The classifier is retrained on the expanded set, absorbing every
+   attack the memory has caught since the last retraining
+4. Some memory entries become redundant after retraining — the
+   classifier now catches them via pattern match alone, without
+   signature lookup. Those entries can optionally be pruned from
+   memory to keep it lean
+5. The memory shrinks over time to contain only genuinely novel
+   signatures the classifier hasn't pattern-absorbed yet
+
+This is a **curriculum learning loop**. Attack-pattern knowledge flows
+from specific (memory entries) to general (classifier weights). The
+classifier gets measurably better over time without ever needing
+manual data curation, because the memory IS the curated dataset,
+grown organically from real detected attacks.
+
+**Two practical details** worth capturing so they're not re-discovered
+the hard way:
+
+**(a) Cluster before training.** The memory will naturally contain
+near-duplicates — a zero-day family produces many similar variants
+before the classifier learns the pattern. Training on all of them
+equally overweights common attack families and underweights rare
+ones. The fix is to cluster memory entries by attention-space
+similarity (using the same cosine / dot-product primitive the memory
+already uses for retrieval) and train on cluster representatives plus
+a frequency weight, not on raw entries. This is standard active
+learning territory, cheap to implement, and it protects the classifier
+from a natural class-imbalance failure mode.
+
+**(b) Measurable improvement curve.** Every retraining cycle, compute
+classifier recall on a memory-held-out set — the fraction of past
+attacks the classifier catches via pattern match alone, without
+memory lookup. This metric should grow with each cycle. It gives a
+visible answer to "is the learning loop working" and a natural
+stopping criterion: when classifier recall on held-out memory
+approaches 100%, the memory's role shrinks to just novel zero-days
+and the classifier has absorbed the rest.
+
+**Why Option B beats Options A and C**:
+
+The simpler alternative (Option A: keep classifier frozen, let memory
+grow indefinitely) leaves the learning loop open on one side. Static
+defenses get probed and defeated over time. If memory catches 10,000
+variants of a zero-day family over six months, the classifier should
+know about them by month 2; Option A leaves it ignorant forever.
+
+The more aggressive alternative (Option C: online gradient updates on
+every new attack) is the route that sounds most exciting and is the
+most dangerous in practice. Online learning has well-known stability
+problems — catastrophic forgetting, distribution drift, adversarial
+drift where an attacker who understands the update rule can poison
+the classifier by crafting inputs. Batch retraining on clustered
+memory entries avoids these while still capturing the adaptation
+benefit.
+
+Option B is the stable version that gets most of Option C's benefit
+with none of its failure modes.
+
 #### Cross-reference to section 3 (the rule engine that isn't a rule engine)
 
 Attack memory is the specialization of the correction-memory framework
