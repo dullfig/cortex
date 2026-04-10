@@ -187,6 +187,21 @@ episode, retrieved by similarity**. Not gradient-based learning, not
 rule compilation. One-shot, verbatim, retrieval-mediated. Same shape as
 how humans learn social rules from being corrected once.
 
+### Forward pointer: attack memory (added 2026-04-09)
+
+Section 13 of this addendum adds a specialization of the correction-
+memory framework for the attack domain specifically: **attack memory
+via NeuralKV**, where past attack vectors get stored in the LLM's own
+attention space and new input is matched against them via raw Q·K^T
+retrieval. At runtime, a match triggers an FfnInjector suppression
+residual that damps the attack signal before the late layers can act
+on it. This is the zero-day defense that a pure classifier cannot
+provide, because signatures catch variants of known attacks that
+pattern-based training does not generalize to. See section 13's
+"Attack memory via NeuralKV" sub-section for the full architecture
+and the defense-in-depth table showing how classifier + memory +
+correction loop cover every attack scenario.
+
 ## 4. The "BERT is wrong category" diagnostic
 
 When Daniel described the project to Gemini, Gemini suggested BERT or
@@ -1178,6 +1193,229 @@ carry semantic salience, late layers carry sentence structure,
 all-layers averaged carries actual boundaries — so the layer-of-formation
 question is one we could answer with a small modification to the existing
 training pipeline.
+
+### Attack memory via NeuralKV: the zero-day defense the classifier cannot provide
+
+Added 2026-04-09 evening. /btw's observation, delivered by Daniel: **use
+NeuralKV-style retrieval to store memories of prior attack vectors, so
+that when a new attack shows up, the system "recalls" the pattern.**
+
+This is the zero-day answer that a trained classifier structurally
+cannot be, and it's worth understanding why before going into the
+architecture.
+
+#### Why classifiers cannot catch zero-days
+
+A trained classifier catches attacks that look like its training data.
+That's the definition of a classifier — it learns a decision boundary
+over a training distribution, and it applies that boundary to new input.
+**Zero-days by definition fall outside the training distribution.**
+That's what "zero-day" means: a novel attack pattern that no defender
+has seen before. No amount of classifier training — no matter how big
+the model, no matter how careful the data curation, no matter how
+diverse the synthetic augmentation — can catch an attack whose shape
+hasn't been in the training set. The classifier's coverage is bounded
+by its training data's coverage, and the training data, by definition,
+cannot cover the future.
+
+This is the same fundamental limit that signature-based antivirus faced
+in the 1990s and that behavioral AV is still working against today. It
+is a property of supervised learning, not a weakness of any specific
+classifier we might train.
+
+#### Why attack memory catches them (after the first instance)
+
+Attack memory is **signature-based**, not pattern-based. Each detected
+attack — detected either by the classifier, by a post-hoc human review,
+or by a user reporting that something went wrong — gets stored in a
+NeuralKV-style memory as per-token K, V vectors from the LLM's own
+attention space. The stored vectors are the model's internal
+representation of what the attack *looked like* at inference time, at
+every layer and every head.
+
+At runtime, new input flows through the model. At chosen layers, the
+model's attention over the new input is matched against the stored
+attack vectors via cosine / dot-product similarity (the same primitive
+engram's bidirectional retrieval already uses, the same primitive the
+morsel-retrieve binary in `pinky/morsel-retrieval/retrieve/` uses). If
+any new position's attention fingerprint is close enough to a stored
+attack's fingerprint, the memory **fires** and the retrieval surfaces
+the matched attack as relevant context for the defense layer.
+
+The first instance of a true zero-day is missed. The *second* instance,
+and every instance after it, is caught — as long as the first instance
+was recorded in the memory. This is exactly how antivirus signature
+databases work, and it has a property byte-signature AV does not have:
+**robustness to paraphrase, translation, and obfuscation**. Because
+matching happens in the LLM's attention space rather than at the byte
+level, superficial variations of a known attack — same semantic intent,
+different wording, different language — still activate similar
+attention patterns and still retrieve the same memory entry. A
+byte-signature AV can be defeated by a single-character mutation. An
+attention-space memory cannot.
+
+#### Defense in depth: classifier + memory + correction loop
+
+Combined with the classifier from sections 1-12 and the correction loop
+from section 9, attack memory completes a three-way defense where every
+failure mode of one component is covered by at least one of the others:
+
+| Attack scenario | Classifier catches? | Memory catches? | Correction loop catches? |
+|---|---|---|---|
+| Known attack, exact replay | ✓ | ✓ | n/a |
+| Known attack, obfuscated/paraphrased | Maybe | ✓ (near-match in attention space) | n/a |
+| Novel attack matching known structural patterns | ✓ | ✗ (not in memory) | n/a |
+| True zero-day, first use | ✗ | ✗ | ✓ (human review adds to memory) |
+| True zero-day, second use onward | ✗ | ✓ (now in memory) | n/a |
+| Classifier false negative on trained pattern | ✗ | ✓ if previously reported | ✓ if not yet reported |
+
+The "true zero-day first use" row is the only cell where the runtime
+defenses both fail — and **that is exactly the cell the correction loop
+closes**. A human reviewer marks the missed attack in production, it
+gets added to the memory, and every subsequent occurrence is caught by
+near-match retrieval. The three mechanisms form a complete covering of
+the attack scenario space, where the classifier handles pattern breadth,
+the memory handles signature specificity plus obfuscation robustness,
+and the correction loop handles the first-contact problem with
+previously-unknown patterns.
+
+#### Infrastructure we already have
+
+This is not a blue-sky architecture. Every piece of it exists in the
+cortex codebase today, waiting to be connected:
+
+1. **`forward_traced` captures the attention scores** that attack
+   memory needs both for storage (ingesting an attack → recording its
+   attention fingerprint) and for retrieval (new input → computing
+   attention over stored K vectors). The pre-softmax Q·K^T capture
+   added 2026-04-08 is the right substrate per the softmax-vs-
+   aggregation insight.
+
+2. **`FfnInjector` is the hook** NeuralKV was originally designed for
+   (Phase 4 of the cortex roadmap). The same hook that section 13
+   proposes for runtime suppression is also the hook that attack
+   memory retrieval fires through: when a stored attack is matched,
+   the injector adds a suppression residual at the matched positions,
+   producing runtime defense WITHOUT a separate classifier forward
+   pass. **One hook, one mechanism, but the trigger comes from
+   retrieval similarity rather than from classifier output.**
+
+3. **`engram`** (the sibling project, feature-gated in cortex behind
+   the `memory` flag) already has compressed KV cache storage with
+   bidirectional attention retrieval. The attack memory is
+   structurally an engram cache whose entries are attack K, V vectors
+   rather than general memory vectors.
+
+4. **The morsel-retrieve binary** I built on 2026-04-09 evening
+   (`pinky/morsel-retrieval/retrieve/`) uses the exact same primitive
+   (attention-from-query over stored content) that attack memory
+   needs. The only difference between morsel retrieval and attack
+   memory is what's in the stored content (general corpus vs attack
+   corpus) and what the retrieval result triggers (synthesis input vs
+   suppression residual). Literally the same code path, different
+   substrate, different downstream action.
+
+5. **The boundary classifier** shipped 2026-04-08 (f1=0.824 on held-out)
+   is the ingestion source for the memory: every position the
+   classifier flags as an attack with high confidence gets its
+   surrounding context's K, V vectors written to the memory as a
+   signature. The classifier's role shifts from "sole line of defense"
+   to "memory ingester" — its false positives become memory entries
+   (which is fine because near-match retrieval handles slight
+   mislabels), and its true positives become the seed population of
+   known attacks that all future near-matches get caught against.
+
+6. **The correction loop** from section 9 already describes the
+   human-review → add-to-memory path for cases that slip through both
+   runtime defenses. Attack memory is just the specialization of
+   correction memory for the attack case specifically — same storage
+   mechanism, same retrieval mechanism, narrower content type.
+
+#### The operational picture
+
+In deployment, the flow looks like:
+
+```
+New input arrives at cortex-cloud
+  ↓
+forward_traced runs over the input (as today)
+  ↓  (at a chosen layer)
+Attention from current-input positions → attack memory K vectors
+via raw Q·K^T retrieval (no softmax — dilution-free)
+  ↓
+Top-K memory matches above a similarity threshold
+  ↓
+For each matched attack: FfnInjector fires a suppression residual
+at the current-input positions that matched, at a layer before the
+action-producing late layers
+  ↓
+Hidden states flow through late layers with the suppressed residuals
+  ↓
+Output is generated; because the late layers never saw coherent
+attack signal at the matched positions, the output behaves as if
+the attack weren't there
+  ↓
+(In parallel) classifier also runs as a secondary check for novel
+structural patterns that don't have signature matches yet
+  ↓
+(Post-hoc) human reviews borderline cases; confirmed attacks get
+added to the memory for next time
+```
+
+The retrieval IS the defense. There's no separate "detect and refuse"
+step at the output level (though the output-policy layer from
+section 13 can still catch anything the runtime layer lets through).
+The model never produces refusal text because the model never saw
+the attack signal as actionable — the memory retrieval pre-empted it.
+
+#### Why this is the right architectural direction, distilled
+
+Three reasons:
+
+1. **It's the answer to "what do we DO with the classifier."** Section
+   13's runtime-suppression-via-FfnInjector answered this one way
+   (classifier output → suppression residual). Attack memory answers
+   it more completely: the classifier's role becomes ingestion, not
+   decision. The classifier populates the memory; the memory drives
+   the defense.
+
+2. **It uses infrastructure we already have.** `forward_traced`,
+   `FfnInjector`, engram's compressed KV store, the morsel-retrieve
+   primitive, the boundary classifier, the correction loop — all of
+   these are shipped or partially shipped. The attack memory is a
+   new consumer of existing infrastructure, not a new architecture.
+
+3. **It provides the zero-day defense that any pure classifier
+   approach cannot.** Signature-based defense is structurally
+   necessary because pattern-based defense is bounded by training
+   data. Any complete defense architecture has to have both. Attack
+   memory is how cortex gets the signature half.
+
+#### Cross-reference to section 3 (the rule engine that isn't a rule engine)
+
+Attack memory is the specialization of the correction-memory framework
+from section 3 for the attack domain specifically. Section 3 describes
+the three-channel correction loop (episodic memory, classifier
+retraining, architectural growth) in general terms as the alternative
+to a traditional rule engine. Attack memory is a dedicated instance of
+channel 1 (episodic memory) applied to attacks, with three specific
+refinements:
+
+1. The stored episodes are attack K, V vectors (in the LLM's own
+   attention space), not hand-written rule strings or even plain-text
+   correction records
+2. Retrieval fires a suppression residual through FfnInjector during
+   the forward pass, rather than producing refusal text at the output
+3. Ingestion is automated from high-confidence classifier hits plus
+   human-reviewed production examples — the correction loop becomes
+   the feedback mechanism that grows the memory over time
+
+Section 3's general framework (retrieval as the generalization
+mechanism, episodic storage instead of compiled rules, one-shot
+learning with reversibility) all holds. This sub-section describes how
+the general framework looks when the episodes are adversarial content
+specifically and the response is runtime suppression rather than a
+user-facing refusal.
 
 ### Why this generalizes beyond prompt-injection defense
 
