@@ -81,8 +81,8 @@ impl HardwareInfo {
     /// Print the boot banner to stderr.
     pub fn print_boot_banner(&self) {
         eprintln!();
-        eprintln!("  ternary-rs inference engine");
-        eprintln!("  ───────────────────────────────");
+        eprintln!("  cortex inference engine");
+        eprintln!("  ───────────────────────────");
 
         // CPU
         if self.cpu_name.is_empty() {
