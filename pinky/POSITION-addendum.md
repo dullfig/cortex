@@ -1700,7 +1700,98 @@ infrastructure that's already in the codebase.
 
 **File this as a real next direction**, not just a passing thought.
 
-## 14. Personal context for future Claudes
+## 14. Near-term testbed: Polymarket/Kalshi arbitrage matching (added 2026-04-09 evening)
+
+Daniel previously built a prediction-market arbitrage bot that matched
+contracts between Polymarket and Kalshi. It has two failure modes that
+map *exactly* onto the morsel architecture's strengths:
+
+1. **Finds obvious matches** (high keyword/embedding overlap between
+   contract descriptions) — these are already flattened by every other
+   bot running the same keyword strategy. No alpha.
+
+2. **Misses non-obvious matches** (same underlying event, different
+   wording) — e.g., Polymarket says "Will Biden pardon Hunter before
+   January 20?" and Kalshi says "Federal clemency for Hunter Biden by
+   inauguration day." Same event; different surface form. The bot's
+   embedding-based matcher doesn't find the connection because the
+   embeddings diverge when the wording differs.
+
+**This is exactly the chunk-level embedding bottleneck from section 11,
+applied to prediction markets instead of research papers.** The value
+is in the non-obvious matches, and the non-obvious matches are
+non-obvious precisely because the wording differs between platforms
+while the underlying event is the same.
+
+### Why attention-based matching should work here
+
+The LLM *understands* that "pardon" and "federal clemency" refer to
+the same legal mechanism, and that "before January 20" and "by
+inauguration day" refer to the same deadline. The connection exists in
+the model's semantic neighborhood even when the surface forms diverge
+— exactly the property we validated on the 8-paper corpus tonight
+(3/3 planted morsel connections recovered via baseline-delta scoring).
+
+### Corpus properties that make this an easy first test
+
+- **Short contracts**: each contract is ~50-200 words (title +
+  description + resolution criteria). Much smaller than research
+  papers. The entire Polymarket + Kalshi active corpus fits in a
+  single forward pass.
+- **Symmetric matching**: compare every Polymarket contract against
+  every Kalshi contract. Each comparison is small.
+- **Ground truth available retroactively**: contracts that resolved to
+  the same outcome were matches. This gives us labeled evaluation
+  data without human annotation.
+- **Corpus refreshes regularly**: new contracts appear daily, so the
+  system can be tested on live data continuously.
+- **Immediate economic signal**: a found non-obvious match with a
+  price spread is directly monetizable. The value function is
+  unambiguous: `price_spread × contract_volume = expected_value`.
+
+### Why this is the shortest path to "does the architecture work on real data"
+
+Compared to the concierge (needs cortex-cloud integration, action-class
+taxonomy, deployment to RunPod) and the scientific-discovery pipeline
+(needs PubMed ingestion, engram integration, scale engineering), the
+arbitrage matcher:
+
+- Uses the same morsel-retrieve binary we just built tonight
+- Needs only a small data-pull script (Polymarket and Kalshi both have
+  public APIs for contract descriptions)
+- Runs on CPU in seconds (corpus is tiny compared to PubMed)
+- Produces a measurable result on day one (either it finds non-obvious
+  matches or it doesn't)
+- Has economic incentive that makes iteration self-funding if it works
+
+### What it would take
+
+1. Write a small Python script to pull active contract descriptions
+   from Polymarket API and Kalshi API, producing fixture files in our
+   existing format (one contract per "paper")
+2. Run the morsel-retrieve binary with each Polymarket contract as
+   the query and the full Kalshi corpus as the papers (and vice versa)
+3. Filter results to matches above a threshold where both contracts
+   haven't been linked by obvious keyword overlap
+4. Check price spreads on the matches that survive
+
+Steps 1-3 are maybe half an evening. Step 4 is Daniel checking the
+output against current market prices. If any non-obvious match has a
+live spread above transaction costs, the architecture just paid for
+itself.
+
+### Cross-reference
+
+This is the "near-term real-world validation" counterpart to the
+morsel-retrieval research direction (section 11) and the morsel-
+retrieve binary (commit `96670e2`). The architectural claim is the
+same; the corpus is different; the value function is economic rather
+than scientific. If the 3/3 result on planted connections transfers
+to real prediction-market contracts with different-wording matches,
+the morsel claim is validated on live data — not just on a corpus we
+designed to have the property.
+
+## 15. Personal context for future Claudes
 
 Daniel is 63 (as of 2026). Longevity and aging research is a personal
 motivation alongside the technical interest. This is worth knowing
