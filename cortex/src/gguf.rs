@@ -741,9 +741,8 @@ fn load_float_data(data: &[u8], ggml_type: GgmlType, n_elements: u64) -> Vec<f32
         GgmlType::Q2_K => crate::ops::dequant::dequant_q2_k(data, n),
         GgmlType::Q3_K => crate::ops::dequant::dequant_q3_k(data, n),
         GgmlType::Q5_0 => crate::ops::dequant::dequant_q5_0(data, n),
-        GgmlType::Q4_1 | GgmlType::Q5_1 => {
-            panic!("dequantization not yet implemented for {:?}", ggml_type)
-        }
+        GgmlType::Q4_1 => crate::ops::dequant::dequant_q4_1(data, n),
+        GgmlType::Q5_1 => crate::ops::dequant::dequant_q5_1(data, n),
         _ => panic!("load_float_data called with non-float type: {:?}", ggml_type),
     }
 }

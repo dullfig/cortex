@@ -643,6 +643,135 @@ pub fn dequant_q5_0(data: &[u8], n_elements: usize) -> Vec<f32> {
 }
 
 // ===========================================================================
+// Q4_1: 32-element blocks, 20 bytes each
+// Layout: f16 scale (2 bytes) + f16 min (2 bytes) + 16 bytes nibbles
+// Each byte holds 2 values: low nibble = first, high nibble = second
+// Values are unsigned 0..15, offset by min: val = nibble * scale + min
+// ===========================================================================
+
+/// Block size for Q4_1.
+pub const Q4_1_BLOCK_SIZE: usize = 32;
+/// Bytes per Q4_1 block: 2 (f16 scale) + 2 (f16 min) + 16 (nibble pairs) = 20.
+pub const Q4_1_BLOCK_BYTES: usize = 20;
+
+/// Dequantize Q4_1 data to f32.
+///
+/// Block layout (20 bytes per block of 32 values):
+/// - 2 bytes: f16 scale (delta, d)
+/// - 2 bytes: f16 min (m)
+/// - 16 bytes: nibble pairs (qs)
+///
+/// llama.cpp convention: first 16 values from low nibbles, next 16 from high nibbles.
+/// Unlike Q4_0 which centers at 8, Q4_1 uses unsigned nibbles with a per-block min:
+/// For j = 0..15:
+///   element[j]    = (qs[j] & 0x0F) * scale + min
+///   element[j+16] = (qs[j] >> 4)   * scale + min
+pub fn dequant_q4_1(data: &[u8], n_elements: usize) -> Vec<f32> {
+    let n_blocks = n_elements.div_ceil(Q4_1_BLOCK_SIZE);
+    assert!(
+        data.len() >= n_blocks * Q4_1_BLOCK_BYTES,
+        "Q4_1 data too short: need {} bytes for {} elements, got {}",
+        n_blocks * Q4_1_BLOCK_BYTES, n_elements, data.len()
+    );
+
+    let mut output = vec![0.0f32; n_elements];
+
+    for block_idx in 0..n_blocks {
+        let block = &data[block_idx * Q4_1_BLOCK_BYTES..];
+        let base = block_idx * Q4_1_BLOCK_SIZE;
+
+        let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let min = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+
+        // 16 bytes of nibble pairs
+        let qs = &block[4..20];
+
+        // llama.cpp layout: first 16 from low nibbles, next 16 from high nibbles
+        let remaining = n_elements - base;
+        let half = 16.min(remaining);
+        for j in 0..half {
+            let lo = (qs[j] & 0x0F) as f32;
+            output[base + j] = lo * scale + min;
+        }
+        let second_half = 16.min(remaining.saturating_sub(16));
+        for j in 0..second_half {
+            let hi = (qs[j] >> 4) as f32;
+            output[base + 16 + j] = hi * scale + min;
+        }
+    }
+
+    output
+}
+
+// ===========================================================================
+// Q5_1: 32-element blocks, 24 bytes each
+// Layout: f16 scale (2 bytes) + f16 min (2 bytes) + 4 bytes high bits + 16 bytes nibbles
+// Each value is 5 bits: 4 low bits from nibble + 1 high bit
+// Values are unsigned 0..31, offset by min: val = q * scale + min
+// ===========================================================================
+
+/// Block size for Q5_1.
+pub const Q5_1_BLOCK_SIZE: usize = 32;
+/// Bytes per Q5_1 block: 2 (f16 scale) + 2 (f16 min) + 4 (high bits) + 16 (nibbles) = 24.
+pub const Q5_1_BLOCK_BYTES: usize = 24;
+
+/// Dequantize Q5_1 data to f32.
+///
+/// Block layout (24 bytes per block of 32 values):
+/// - 2 bytes: f16 scale (delta, d)
+/// - 2 bytes: f16 min (m)
+/// - 4 bytes: high bits (qh), 1 bit per value
+/// - 16 bytes: low nibbles (qs), packed as pairs
+///
+/// Value reconstruction (llama.cpp convention, unsigned with per-block min):
+/// For j = 0..15:
+///   element[j]    = ((qs[j] & 0x0F) | ((qh >> j)      & 1) << 4) * scale + min
+///   element[j+16] = ((qs[j] >> 4)   | ((qh >> (j+16)) & 1) << 4) * scale + min
+pub fn dequant_q5_1(data: &[u8], n_elements: usize) -> Vec<f32> {
+    let n_blocks = n_elements.div_ceil(Q5_1_BLOCK_SIZE);
+    assert!(
+        data.len() >= n_blocks * Q5_1_BLOCK_BYTES,
+        "Q5_1 data too short: need {} bytes for {} elements, got {}",
+        n_blocks * Q5_1_BLOCK_BYTES, n_elements, data.len()
+    );
+
+    let mut output = vec![0.0f32; n_elements];
+
+    for block_idx in 0..n_blocks {
+        let block = &data[block_idx * Q5_1_BLOCK_BYTES..];
+        let base = block_idx * Q5_1_BLOCK_SIZE;
+
+        let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let min = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+
+        // High bits: 4 bytes = 32 bits (1 per value)
+        let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+
+        // Low 4 bits: 16 bytes (qs), packed as pairs
+        let qs = &block[8..24];
+
+        // llama.cpp layout: first 16 from low nibbles, next 16 from high nibbles
+        let remaining = n_elements - base;
+        let half = 16.min(remaining);
+        for j in 0..half {
+            let lo = qs[j] & 0x0F;
+            let hi_bit = ((qh >> j) & 1) as u8;
+            let q = (lo | (hi_bit << 4)) as f32;
+            output[base + j] = q * scale + min;
+        }
+        let second_half = 16.min(remaining.saturating_sub(16));
+        for j in 0..second_half {
+            let lo = qs[j] >> 4;
+            let hi_bit = ((qh >> (j + 16)) & 1) as u8;
+            let q = (lo | (hi_bit << 4)) as f32;
+            output[base + 16 + j] = q * scale + min;
+        }
+    }
+
+    output
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -720,6 +849,128 @@ mod tests {
         let result = dequant_q4_0(&block, 32);
         assert!((result[0] - (-8.0)).abs() < 0.01, "element 0 (low nibble 0): {}", result[0]);
         assert!((result[16] - 7.0).abs() < 0.01, "element 16 (high nibble 0xF): {}", result[16]);
+    }
+
+    #[test]
+    fn q4_1_basic_all_zero_nibbles_with_min() {
+        // One block: scale=1.0, min=5.0, all nibbles = 0
+        // Each element should equal min = 5.0
+        let mut block = vec![0u8; Q4_1_BLOCK_BYTES];
+        block[0] = 0x00;
+        block[1] = 0x3C; // f16 1.0 (scale)
+        block[2] = 0x00;
+        block[3] = 0x45; // f16 5.0 (min)
+        // All nibbles zero → all elements = 0 * 1.0 + 5.0 = 5.0
+        // (bytes 4..20 are already 0)
+        let result = dequant_q4_1(&block, 32);
+        for (i, &v) in result.iter().enumerate() {
+            assert!((v - 5.0).abs() < 0.01, "q4_1[{i}]: expected 5.0, got {v}");
+        }
+    }
+
+    #[test]
+    fn q4_1_extremes_with_min_and_scale() {
+        // One block: scale=2.0, min=-1.0
+        // Byte[4] = 0xF0: low nibble = 0 → element[0], high nibble = 0xF → element[16]
+        // element[0]  = 0 * 2.0 + (-1.0) = -1.0
+        // element[16] = 15 * 2.0 + (-1.0) = 29.0
+        let mut block = vec![0u8; Q4_1_BLOCK_BYTES];
+        block[0] = 0x00;
+        block[1] = 0x40; // f16 2.0 (scale)
+        block[2] = 0x00;
+        block[3] = 0xBC; // f16 -1.0 (min)
+        block[4] = 0xF0;
+        let result = dequant_q4_1(&block, 32);
+        assert!(
+            (result[0] - (-1.0)).abs() < 0.01,
+            "element 0 (low nibble 0): expected -1.0, got {}",
+            result[0]
+        );
+        assert!(
+            (result[16] - 29.0).abs() < 0.01,
+            "element 16 (high nibble 0xF): expected 29.0, got {}",
+            result[16]
+        );
+    }
+
+    #[test]
+    fn q4_1_uses_unsigned_nibbles_not_centered() {
+        // Verify Q4_1 does NOT center nibbles at 8 like Q4_0 does.
+        // scale=1.0, min=0.0, nibble=8 should give 8.0, not 0.0
+        let mut block = vec![0u8; Q4_1_BLOCK_BYTES];
+        block[0] = 0x00;
+        block[1] = 0x3C; // scale 1.0
+        block[2] = 0x00;
+        block[3] = 0x00; // min 0.0
+        // All nibbles = 8
+        for i in 0..16 {
+            block[4 + i] = 0x88;
+        }
+        let result = dequant_q4_1(&block, 32);
+        for (i, &v) in result.iter().enumerate() {
+            assert!(
+                (v - 8.0).abs() < 0.01,
+                "q4_1[{i}]: expected 8.0 (unsigned), got {v} (if this is 0.0, the centering is wrong)"
+            );
+        }
+    }
+
+    #[test]
+    fn q5_1_basic_all_zero_with_min() {
+        // One block: scale=1.0, min=7.0, all values 0
+        // Each element = 0 * 1.0 + 7.0 = 7.0
+        let mut block = vec![0u8; Q5_1_BLOCK_BYTES];
+        block[0] = 0x00;
+        block[1] = 0x3C; // scale 1.0
+        block[2] = 0x00;
+        block[3] = 0x47; // f16 7.0 (min)
+        // bytes 4..24 are 0 (no high bits, no nibbles)
+        let result = dequant_q5_1(&block, 32);
+        for (i, &v) in result.iter().enumerate() {
+            assert!((v - 7.0).abs() < 0.01, "q5_1[{i}]: expected 7.0, got {v}");
+        }
+    }
+
+    #[test]
+    fn q5_1_max_value() {
+        // One block: scale=1.0, min=0.0, first value = 31 (nibble 0xF + high bit 1)
+        // element[0] = 31 * 1.0 + 0.0 = 31.0
+        let mut block = vec![0u8; Q5_1_BLOCK_BYTES];
+        block[0] = 0x00;
+        block[1] = 0x3C; // scale 1.0
+        block[2] = 0x00;
+        block[3] = 0x00; // min 0.0
+        // qh byte 0, bit 0 set → high bit for value 0
+        block[4] = 0x01;
+        // qs[0] low nibble = 0xF
+        block[8] = 0x0F;
+        let result = dequant_q5_1(&block, 32);
+        assert!(
+            (result[0] - 31.0).abs() < 0.01,
+            "q5_1[0]: expected 31.0 (max unsigned), got {}",
+            result[0]
+        );
+    }
+
+    #[test]
+    fn q5_1_uses_unsigned_not_centered() {
+        // Verify Q5_1 does NOT center at 16 like Q5_0 does.
+        // scale=1.0, min=0.0, nibble=16 (high bit=1, low nibble=0) should give 16, not 0
+        let mut block = vec![0u8; Q5_1_BLOCK_BYTES];
+        block[0] = 0x00;
+        block[1] = 0x3C; // scale 1.0
+        block[2] = 0x00;
+        block[3] = 0x00; // min 0.0
+        // qh byte 0, bit 0 set → high bit for value 0 = 1
+        block[4] = 0x01;
+        // qs[0] low nibble = 0 → (0 | (1 << 4)) = 16
+        // bytes 8..24 are 0
+        let result = dequant_q5_1(&block, 32);
+        assert!(
+            (result[0] - 16.0).abs() < 0.01,
+            "q5_1[0]: expected 16.0 (unsigned), got {} (if this is 0.0, the centering is wrong)",
+            result[0]
+        );
     }
 
     #[test]
