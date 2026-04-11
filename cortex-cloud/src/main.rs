@@ -10,10 +10,11 @@
 //! GET  /health                — readiness probe
 //! ```
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -24,7 +25,7 @@ use tokio::sync::Mutex;
 use tracing::info;
 
 use cortex::layers::model::TransformerModel;
-use cortex::layers::sampler::SamplerConfig;
+use cortex::layers::sampler::{Sampler, SamplerConfig};
 use cortex::layers::kv_cache::ModelKvCache;
 use cortex::{ModelConfig, Tokenizer};
 
@@ -56,12 +57,23 @@ struct Cli {
 // Shared state
 // ---------------------------------------------------------------------------
 
+/// Per-cache metadata stored alongside the KV cache in the pool.
+struct CacheEntry {
+    cache: ModelKvCache,
+    created_at: Instant,
+    last_used: Instant,
+}
+
 struct ServerState {
     model: TransformerModel,
     tokenizer: Tokenizer,
     #[allow(dead_code)]
     config: ModelConfig,
-    cache: Mutex<ModelKvCache>,
+    /// Pool of named KV caches. Key is the opaque cache_id assigned by agentos.
+    /// Cortex never invents a cache_id — every cache in this pool got here via
+    /// an explicit POST /v1/cache/load. The invariant "cortex never invents state"
+    /// is load-bearing for the eviction-recovery lifecycle (see CACHE-LIFECYCLE.md).
+    cache_pool: Mutex<HashMap<String, CacheEntry>>,
     model_name: String,
     start_time: Instant,
     max_seq_len: usize,
@@ -82,6 +94,13 @@ struct ChatRequest {
     temperature: f32,
     #[serde(default)]
     tools: Option<Vec<Tool>>,
+    /// Opaque cache identifier assigned by the caller (agentos). If present,
+    /// cortex looks up the cache in the pool and uses it for this request.
+    /// If the cache_id is not in the pool, cortex returns 404 — it never
+    /// creates a cache implicitly. Use POST /v1/cache/load to create one.
+    /// If absent, the request runs stateless with a fresh temporary cache.
+    #[serde(default)]
+    cache_id: Option<String>,
 }
 
 fn default_max_tokens() -> u32 { 2048 }
@@ -169,8 +188,43 @@ struct HealthResponse {
 
 #[derive(Serialize)]
 struct HealthMemory {
-    kv_cache_entries: usize,
+    cache_pool_size: usize,
+    cache_pool_total_tokens: usize,
     max_seq_len: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Cache endpoint wire types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct CacheLoadRequest {
+    cache_id: String,
+    /// Token IDs to replay through the model to build the KV cache.
+    /// For a brand-new user this is empty []. For a returning user after
+    /// eviction, this is the full conversation history from sled.
+    #[serde(default)]
+    tokens: Vec<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CacheAppendRequest {
+    cache_id: String,
+    tokens: Vec<u32>,
+}
+
+#[derive(Serialize)]
+struct CacheInfoResponse {
+    cache_id: String,
+    seq_len: usize,
+    max_seq_len: usize,
+}
+
+#[derive(Serialize)]
+struct CacheLoadResponse {
+    cache_id: String,
+    seq_len: usize,
+    status: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -316,19 +370,68 @@ async fn chat_completions(
 
     let eos = state.tokenizer.eos_token_id();
     let seed = rand_seed();
-
-    // Generate — this is blocking CPU work, run on a blocking thread
-    let model = &state.model;
     let max_tokens = req.max_tokens as usize;
 
-    let output_tokens = tokio::task::block_in_place(|| {
-        model.generate(&prompt_tokens, max_tokens, sampler_config, seed, Some(eos))
-    });
+    // If cache_id is provided, use the pool cache; otherwise stateless.
+    let (generated_tokens, completion_len) = if let Some(ref cache_id) = req.cache_id {
+        let mut pool = state.cache_pool.lock().await;
+        let entry = pool.get_mut(cache_id).ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": {
+                        "type": "cache_not_found",
+                        "message": format!("cache_id '{}' not found in pool. Use POST /v1/cache/load to create it.", cache_id),
+                        "cache_id": cache_id,
+                    }
+                })),
+            )
+        })?;
 
-    // Decode only the generated part (skip prompt)
-    let generated = &output_tokens[prompt_tokens.len()..];
-    let completion_len = generated.len() as u32;
-    let text = state.tokenizer.decode(generated);
+        // Generate with the existing cache — prefill the new prompt
+        // tokens then sample autoregressively.
+        let generated = tokio::task::block_in_place(|| {
+            let model = &state.model;
+            let cache = &mut entry.cache;
+            let mut sampler = Sampler::new(sampler_config, seed);
+
+            // Prefill the prompt into the existing cache
+            let prefill_logits = model.forward_cached(&prompt_tokens, cache);
+            let last_logits_start = (prompt_tokens.len() - 1) * model.vocab_size();
+            let last_logits = &prefill_logits[last_logits_start..last_logits_start + model.vocab_size()];
+            let mut next_token = sampler.sample(last_logits);
+
+            let mut out = Vec::new();
+            if Some(next_token) == Some(eos) {
+                return out;
+            }
+            out.push(next_token);
+
+            for _ in 1..max_tokens {
+                let logits = model.forward_cached(&[next_token], cache);
+                next_token = sampler.sample(&logits);
+                if next_token == eos {
+                    break;
+                }
+                out.push(next_token);
+            }
+            out
+        });
+
+        entry.last_used = Instant::now();
+        let len = generated.len() as u32;
+        (generated, len)
+    } else {
+        // Stateless: create a temporary cache, generate, discard.
+        let output_tokens = tokio::task::block_in_place(|| {
+            state.model.generate(&prompt_tokens, max_tokens, sampler_config, seed, Some(eos))
+        });
+        let generated = output_tokens[prompt_tokens.len()..].to_vec();
+        let len = generated.len() as u32;
+        (generated, len)
+    };
+
+    let text = state.tokenizer.decode(&generated_tokens);
 
     // Determine finish reason and check for tool calls
     let finish_reason;
@@ -376,6 +479,159 @@ async fn chat_completions(
     Ok(Json(response))
 }
 
+// ---------------------------------------------------------------------------
+// Cache endpoints
+// ---------------------------------------------------------------------------
+
+/// POST /v1/cache/load — create or replace a cache by replaying tokens.
+///
+/// If tokens is empty, creates an empty cache (cold start for a new user).
+/// If tokens is non-empty, runs forward_cached to build the KV cache from
+/// the token history (reawaken after eviction).
+///
+/// "load replaces" — if the cache_id already exists, it's overwritten.
+async fn cache_load(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<CacheLoadRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let mut cache = state.model.create_kv_cache(state.max_seq_len);
+
+    if !req.tokens.is_empty() {
+        // Replay the token history to build the KV cache
+        tokio::task::block_in_place(|| {
+            let _ = state.model.forward_cached(&req.tokens, &mut cache);
+        });
+    }
+
+    let seq_len = cache.seq_len();
+    let now = Instant::now();
+
+    let mut pool = state.cache_pool.lock().await;
+    pool.insert(
+        req.cache_id.clone(),
+        CacheEntry {
+            cache,
+            created_at: now,
+            last_used: now,
+        },
+    );
+
+    info!(
+        cache_id = %req.cache_id,
+        seq_len = seq_len,
+        tokens_replayed = req.tokens.len(),
+        pool_size = pool.len(),
+        "cache loaded",
+    );
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CacheLoadResponse {
+            cache_id: req.cache_id,
+            seq_len,
+            status: "loaded".to_string(),
+        }),
+    ))
+}
+
+/// POST /v1/cache/append — extend an existing cache with new tokens.
+///
+/// Runs forward_cached on the new tokens against the existing cache.
+/// "append extends" — the cache grows by the new tokens.
+async fn cache_append(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<CacheAppendRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let mut pool = state.cache_pool.lock().await;
+    let entry = pool.get_mut(&req.cache_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "cache_not_found",
+                    "message": format!("cache_id '{}' not found", req.cache_id),
+                    "cache_id": req.cache_id,
+                }
+            })),
+        )
+    })?;
+
+    if !req.tokens.is_empty() {
+        tokio::task::block_in_place(|| {
+            let _ = state.model.forward_cached(&req.tokens, &mut entry.cache);
+        });
+    }
+
+    entry.last_used = Instant::now();
+    let seq_len = entry.cache.seq_len();
+
+    info!(
+        cache_id = %req.cache_id,
+        seq_len = seq_len,
+        tokens_appended = req.tokens.len(),
+        "cache appended",
+    );
+
+    Ok(Json(CacheInfoResponse {
+        cache_id: req.cache_id,
+        seq_len,
+        max_seq_len: state.max_seq_len,
+    }))
+}
+
+/// GET /v1/cache/{id} — get cache info.
+async fn cache_get(
+    State(state): State<Arc<ServerState>>,
+    Path(cache_id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let pool = state.cache_pool.lock().await;
+    let entry = pool.get(&cache_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "cache_not_found",
+                    "message": format!("cache_id '{}' not found", cache_id),
+                    "cache_id": cache_id,
+                }
+            })),
+        )
+    })?;
+
+    Ok(Json(CacheInfoResponse {
+        cache_id,
+        seq_len: entry.cache.seq_len(),
+        max_seq_len: state.max_seq_len,
+    }))
+}
+
+/// DELETE /v1/cache/{id} — evict a cache from the pool.
+async fn cache_delete(
+    State(state): State<Arc<ServerState>>,
+    Path(cache_id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let mut pool = state.cache_pool.lock().await;
+    if pool.remove(&cache_id).is_some() {
+        info!(cache_id = %cache_id, pool_size = pool.len(), "cache evicted");
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "cache_not_found",
+                    "message": format!("cache_id '{}' not found", cache_id),
+                    "cache_id": cache_id,
+                }
+            })),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Other handlers
+// ---------------------------------------------------------------------------
+
 async fn list_models(
     State(state): State<Arc<ServerState>>,
 ) -> Json<ModelsResponse> {
@@ -392,13 +648,15 @@ async fn list_models(
 async fn health(
     State(state): State<Arc<ServerState>>,
 ) -> Json<HealthResponse> {
-    let cache = state.cache.lock().await;
+    let pool = state.cache_pool.lock().await;
+    let total_tokens: usize = pool.values().map(|e| e.cache.seq_len()).sum();
     Json(HealthResponse {
         status: "ready".to_string(),
         model: state.model_name.clone(),
         uptime_secs: state.start_time.elapsed().as_secs(),
         memory: HealthMemory {
-            kv_cache_entries: cache.seq_len(),
+            cache_pool_size: pool.len(),
+            cache_pool_total_tokens: total_tokens,
             max_seq_len: state.max_seq_len,
         },
     })
@@ -436,13 +694,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .unwrap_or_else(|| "cortex-model".to_string());
 
-    let cache = loaded.model.create_kv_cache(cli.max_seq_len);
-
     let state = Arc::new(ServerState {
         model: loaded.model,
         tokenizer: loaded.tokenizer,
         config: loaded.config,
-        cache: Mutex::new(cache),
+        cache_pool: Mutex::new(HashMap::new()),
         model_name: model_name.clone(),
         start_time: Instant::now(),
         max_seq_len: cli.max_seq_len,
@@ -450,6 +706,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/cache/load", post(cache_load))
+        .route("/v1/cache/append", post(cache_append))
+        .route("/v1/cache/{id}", get(cache_get).delete(cache_delete))
         .route("/v1/models", get(list_models))
         .route("/health", get(health))
         .with_state(state);
