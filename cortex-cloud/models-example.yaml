@@ -1,0 +1,18 @@
+# models.yaml stanza for AgentOS → cortex integration
+# From agentos-Claude, 2026-04-10.
+#
+# Lives at ~/.agentos/models.yaml
+#
+# Provider name contains "cortex" which triggers OpenAI protocol
+# auto-detection in LlmPool::detect_protocol().
+# base_url includes /v1 suffix; OpenAiClient appends /chat/completions.
+# api_key omitted (cortex-server doesn't require one for local).
+# models maps alias → model_id sent in request body.
+# default makes this the active model on startup.
+
+providers:
+  cortex-local:
+    base_url: http://localhost:8090/v1
+    models:
+      qwen: qwen2.5-0.5b-instruct
+default: qwen
