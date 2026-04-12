@@ -38,7 +38,44 @@ Port 8081                     Port 8080
 
 ## What's left — in dependency order
 
-### Tier 0: Blocking decisions (Daniel)
+### Tier 0: The single-model experiment (could change everything)
+
+- [ ] **Field-programmable LLM test.** Take a 7B base model, build
+  three NeuralKV databases targeting different layer ranges, inject
+  them via the existing FfnInjector hook, and test whether the output
+  is a functional domain-specific instruction-following assistant
+  without any fine-tuning.
+
+  The three shims:
+  - **Early layers (0-8)**: domain facts (barbershop glossary, BHS
+    history, event data). Teaches the model *what exists*.
+  - **Middle layers (8-16)**: semantic associations (tag→afterglow→
+    convention, quartet→contest→coaching). Teaches the model *what
+    relates to what*.
+  - **Late layers (16-24)**: instruction-following behavior. Teaches
+    the model *how to behave* as a concierge.
+
+  If this works, the entire deployment topology simplifies:
+  - No separate 32B instruct model (no A100 rental)
+  - One 7B base model on one 4090 serves both librarian and thinker
+  - Different behaviors via different NeuralKV shim configurations
+  - Domain expertise added by loading databases, not retraining
+  - Reprogrammable in the field: swap shims → different specialist
+
+  This is an FPGA for LLMs: frozen weights (the fabric) +
+  loaded NeuralKV databases (the bitstream) = programmable behavior
+  on fixed hardware. Ringhub is the first configuration. The
+  platform is what scales.
+
+  **Effort**: ~1 evening for the experiment. The FfnInjector hook
+  already fires at exactly the position Gemini's analysis recommends
+  (post-FFN, pre-residual-add). The infrastructure is built.
+
+  **If it works**: collapse the two-model stack to single-model,
+  eliminate A100 rental, and the roadmap below simplifies dramatically.
+  **If it doesn't**: keep the two-model stack as planned, no work wasted.
+
+### Tier 0.5: Blocking decisions (Daniel)
 
 - [ ] **Choose the librarian model**. Softmax Qwen 1.5B (available now,
   sink padding handles the artifact) vs sigmoid-attention model (cleaner
