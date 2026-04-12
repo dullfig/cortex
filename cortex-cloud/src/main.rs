@@ -60,6 +60,10 @@ struct Cli {
 /// Per-cache metadata stored alongside the KV cache in the pool.
 struct CacheEntry {
     cache: ModelKvCache,
+    /// Token history that built this cache. Stored so shards can be composed
+    /// by replaying tokens in sequence (which gives correct RoPE positions).
+    tokens: Vec<u32>,
+    #[allow(dead_code)]
     created_at: Instant,
     last_used: Instant,
 }
@@ -94,14 +98,38 @@ struct ChatRequest {
     temperature: f32,
     #[serde(default)]
     tools: Option<Vec<Tool>>,
-    /// Opaque cache identifier assigned by the caller (agentos). If present,
-    /// cortex looks up the cache in the pool and uses it for this request.
-    /// If the cache_id is not in the pool, cortex returns 404 — it never
-    /// creates a cache implicitly. Use POST /v1/cache/load to create one.
-    /// If absent, the request runs stateless with a fresh temporary cache.
+    /// Ordered list of cache shard names to compose for this request.
+    /// Cortex looks up each shard in the pool, composes them in the given
+    /// order (with correct RoPE positions via sequential token replay),
+    /// and runs inference over the composed context.
+    ///
+    /// If any shard is not in the pool, cortex returns 404. Use
+    /// POST /v1/cache/load to create shards before referencing them.
+    /// If absent (or empty), the request runs stateless with a fresh
+    /// temporary cache.
+    #[serde(default)]
+    cache_shards: Option<Vec<String>>,
+
+    /// Backward-compatible single cache ID. If present and cache_shards
+    /// is absent, treated as a one-element shard list. Deprecated in
+    /// favor of cache_shards.
     #[serde(default)]
     cache_id: Option<String>,
+
+    /// Inference mode. "generate" (default) produces tokens. "retrieve"
+    /// computes attention from query positions over the cached corpus
+    /// and returns top-K positions with scores instead of generating.
+    #[serde(default)]
+    #[allow(dead_code)]
+    mode: Option<String>,
+
+    /// For mode: "retrieve" — number of top-scoring positions to return.
+    #[serde(default = "default_top_k")]
+    #[allow(dead_code)]
+    top_k: usize,
 }
+
+fn default_top_k() -> usize { 10 }
 
 fn default_max_tokens() -> u32 { 2048 }
 fn default_temperature() -> f32 { 0.7 }
@@ -342,6 +370,45 @@ fn extract_json_object(s: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Generate tokens with an existing KV cache. Prefills the prompt tokens
+/// into the cache, then samples autoregressively up to max_tokens.
+fn generate_with_cache(
+    model: &TransformerModel,
+    prompt_tokens: &[u32],
+    cache: &mut ModelKvCache,
+    sampler_config: SamplerConfig,
+    seed: u64,
+    eos: u32,
+    max_tokens: usize,
+) -> Vec<u32> {
+    let mut sampler = Sampler::new(sampler_config, seed);
+
+    let prefill_logits = model.forward_cached(prompt_tokens, cache);
+    let last_logits_start = (prompt_tokens.len() - 1) * model.vocab_size();
+    let last_logits = &prefill_logits[last_logits_start..last_logits_start + model.vocab_size()];
+    let mut next_token = sampler.sample(last_logits);
+
+    let mut out = Vec::new();
+    if next_token == eos {
+        return out;
+    }
+    out.push(next_token);
+
+    for _ in 1..max_tokens {
+        let logits = model.forward_cached(&[next_token], cache);
+        next_token = sampler.sample(&logits);
+        if next_token == eos {
+            break;
+        }
+        out.push(next_token);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
 
@@ -372,55 +439,98 @@ async fn chat_completions(
     let seed = rand_seed();
     let max_tokens = req.max_tokens as usize;
 
-    // If cache_id is provided, use the pool cache; otherwise stateless.
-    let (generated_tokens, completion_len) = if let Some(ref cache_id) = req.cache_id {
+    // Resolve the shard list: cache_shards takes priority, then cache_id
+    // for backward compat, then empty (stateless).
+    let shards: Vec<String> = req
+        .cache_shards
+        .or_else(|| req.cache_id.map(|id| vec![id]))
+        .unwrap_or_default();
+
+    // Generate (or retrieve) with the appropriate cache setup.
+    let (generated_tokens, completion_len) = if !shards.is_empty() {
         let mut pool = state.cache_pool.lock().await;
-        let entry = pool.get_mut(cache_id).ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": {
-                        "type": "cache_not_found",
-                        "message": format!("cache_id '{}' not found in pool. Use POST /v1/cache/load to create it.", cache_id),
-                        "cache_id": cache_id,
-                    }
-                })),
-            )
-        })?;
 
-        // Generate with the existing cache — prefill the new prompt
-        // tokens then sample autoregressively.
-        let generated = tokio::task::block_in_place(|| {
-            let model = &state.model;
-            let cache = &mut entry.cache;
-            let mut sampler = Sampler::new(sampler_config, seed);
-
-            // Prefill the prompt into the existing cache
-            let prefill_logits = model.forward_cached(&prompt_tokens, cache);
-            let last_logits_start = (prompt_tokens.len() - 1) * model.vocab_size();
-            let last_logits = &prefill_logits[last_logits_start..last_logits_start + model.vocab_size()];
-            let mut next_token = sampler.sample(last_logits);
-
-            let mut out = Vec::new();
-            if Some(next_token) == Some(eos) {
-                return out;
+        // Verify all shards exist before doing any work.
+        for shard_name in &shards {
+            if !pool.contains_key(shard_name) {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": {
+                            "type": "cache_not_found",
+                            "message": format!("shard '{}' not found in pool. Use POST /v1/cache/load to create it.", shard_name),
+                            "cache_id": shard_name,
+                        }
+                    })),
+                ));
             }
-            out.push(next_token);
+        }
 
-            for _ in 1..max_tokens {
-                let logits = model.forward_cached(&[next_token], cache);
-                next_token = sampler.sample(&logits);
-                if next_token == eos {
-                    break;
+        if shards.len() == 1 {
+            // Single shard: use the existing cache directly (fast path,
+            // no copying or replaying). This is the common case.
+            let entry = pool.get_mut(&shards[0]).unwrap();
+            let generated = tokio::task::block_in_place(|| {
+                generate_with_cache(
+                    &state.model,
+                    &prompt_tokens,
+                    &mut entry.cache,
+                    sampler_config,
+                    seed,
+                    eos,
+                    max_tokens,
+                )
+            });
+            entry.tokens.extend_from_slice(&prompt_tokens);
+            entry.tokens.extend_from_slice(&generated);
+            entry.last_used = Instant::now();
+            let len = generated.len() as u32;
+            (generated, len)
+        } else {
+            // Multi-shard: compose by replaying all shards' tokens into
+            // a fresh temporary cache in the given order. This gives
+            // correct contiguous RoPE positions across shards.
+            let mut all_tokens: Vec<u32> = Vec::new();
+            for shard_name in &shards {
+                let entry = pool.get(shard_name).unwrap();
+                all_tokens.extend_from_slice(&entry.tokens);
+            }
+
+            let mut composed_cache = state.model.create_kv_cache(state.max_seq_len);
+            tokio::task::block_in_place(|| {
+                if !all_tokens.is_empty() {
+                    let _ = state.model.forward_cached(&all_tokens, &mut composed_cache);
                 }
-                out.push(next_token);
-            }
-            out
-        });
+            });
 
-        entry.last_used = Instant::now();
-        let len = generated.len() as u32;
-        (generated, len)
+            // Now generate with the composed cache
+            let generated = tokio::task::block_in_place(|| {
+                generate_with_cache(
+                    &state.model,
+                    &prompt_tokens,
+                    &mut composed_cache,
+                    sampler_config,
+                    seed,
+                    eos,
+                    max_tokens,
+                )
+            });
+
+            // Update the LAST shard with the new tokens (the user's shard
+            // is conventionally the last in the list). The shared shards
+            // don't change.
+            if let Some(last_shard) = shards.last() {
+                if let Some(entry) = pool.get_mut(last_shard) {
+                    entry.tokens.extend_from_slice(&prompt_tokens);
+                    entry.tokens.extend_from_slice(&generated);
+                    entry.last_used = Instant::now();
+                }
+            }
+
+            // The composed cache is temporary and gets dropped.
+            let len = generated.len() as u32;
+            (generated, len)
+        }
     } else {
         // Stateless: create a temporary cache, generate, discard.
         let output_tokens = tokio::task::block_in_place(|| {
@@ -511,6 +621,7 @@ async fn cache_load(
         req.cache_id.clone(),
         CacheEntry {
             cache,
+            tokens: req.tokens.clone(),
             created_at: now,
             last_used: now,
         },
@@ -560,6 +671,7 @@ async fn cache_append(
         tokio::task::block_in_place(|| {
             let _ = state.model.forward_cached(&req.tokens, &mut entry.cache);
         });
+        entry.tokens.extend_from_slice(&req.tokens);
     }
 
     entry.last_used = Instant::now();
