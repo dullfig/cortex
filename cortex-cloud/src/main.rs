@@ -27,7 +27,7 @@ use tracing::info;
 use cortex::layers::model::TransformerModel;
 use cortex::layers::sampler::{Sampler, SamplerConfig};
 use cortex::layers::kv_cache::ModelKvCache;
-use cortex::{ModelConfig, Tokenizer};
+use cortex::{ForwardTrace, ModelConfig, Tokenizer};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -370,6 +370,57 @@ fn extract_json_object(s: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Retrieval response types
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct RetrievalResponse {
+    spans: Vec<RetrievalSpan>,
+    query_tokens: u32,
+    corpus_tokens: u32,
+    layers_used: Vec<usize>,
+}
+
+#[derive(Serialize)]
+struct RetrievalSpan {
+    shard: String,
+    offset: usize,
+    score: f32,
+    token_text: String,
+}
+
+/// Maps a position in a composed token sequence back to its shard + offset.
+struct ShardMap {
+    /// Sorted by start position: (shard_name, start, end)
+    entries: Vec<(String, usize, usize)>,
+}
+
+impl ShardMap {
+    fn new() -> Self {
+        Self { entries: Vec::new() }
+    }
+
+    fn add(&mut self, shard_name: String, start: usize, end: usize) {
+        self.entries.push((shard_name, start, end));
+    }
+
+    /// Resolve an absolute position in the composed sequence to (shard_name, offset_within_shard).
+    fn resolve(&self, pos: usize) -> Option<(&str, usize)> {
+        for (name, start, end) in &self.entries {
+            if pos >= *start && pos < *end {
+                return Some((name, pos - start));
+            }
+        }
+        None
+    }
+
+    /// Total corpus positions (sum of all shard lengths).
+    fn corpus_len(&self) -> usize {
+        self.entries.last().map(|(_, _, end)| *end).unwrap_or(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -446,7 +497,144 @@ async fn chat_completions(
         .or_else(|| req.cache_id.map(|id| vec![id]))
         .unwrap_or_default();
 
-    // Generate (or retrieve) with the appropriate cache setup.
+    // ---------------------------------------------------------------
+    // RETRIEVAL MODE: return top-K attention positions instead of
+    // generating tokens. Uses forward_traced over composed shard
+    // tokens + prompt tokens. Returns early with a RetrievalResponse.
+    // ---------------------------------------------------------------
+    let is_retrieve = req.mode.as_deref() == Some("retrieve");
+
+    if is_retrieve {
+        if shards.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "type": "invalid_request",
+                        "message": "mode 'retrieve' requires cache_shards to be set",
+                    }
+                })),
+            ));
+        }
+
+        let pool = state.cache_pool.lock().await;
+
+        // Verify all shards exist
+        for shard_name in &shards {
+            if !pool.contains_key(shard_name) {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": {
+                            "type": "cache_not_found",
+                            "message": format!("shard '{}' not found", shard_name),
+                            "cache_id": shard_name,
+                        }
+                    })),
+                ));
+            }
+        }
+
+        // Build the full token sequence and track shard boundaries
+        let mut all_tokens: Vec<u32> = Vec::new();
+        let mut shard_map = ShardMap::new();
+
+        for shard_name in &shards {
+            let entry = pool.get(shard_name).unwrap();
+            let start = all_tokens.len();
+            all_tokens.extend_from_slice(&entry.tokens);
+            let end = all_tokens.len();
+            shard_map.add(shard_name.clone(), start, end);
+        }
+
+        let corpus_len = all_tokens.len();
+
+        // Append the prompt tokens (the query)
+        all_tokens.extend_from_slice(&prompt_tokens);
+
+        info!(
+            shards = ?shards,
+            corpus_tokens = corpus_len,
+            query_tokens = prompt_tokens.len(),
+            total_tokens = all_tokens.len(),
+            "retrieval mode: running forward_traced",
+        );
+
+        // Run forward_traced over the full sequence
+        let (trace, query_start, n_layers, n_heads) = tokio::task::block_in_place(|| {
+            let (_logits, trace) = state.model.forward_traced(&all_tokens);
+            let n_layers = trace.n_layers;
+            let n_heads = trace.n_heads;
+            (trace, corpus_len, n_layers, n_heads)
+        });
+
+        // Score each corpus position by mean pre-softmax attention from
+        // the last N query positions (same scoring as morsel-retrieve).
+        let query_window = 3.min(prompt_tokens.len());
+        let q_lo = (all_tokens.len()).saturating_sub(query_window);
+        let q_hi = all_tokens.len();
+
+        // Use all layers (the morsel-retrieve experiment showed all-layers
+        // averaged gives the best signal for cross-document retrieval).
+        let selected_layers: Vec<usize> = (0..n_layers).collect();
+
+        let mut scores = vec![f32::NEG_INFINITY; corpus_len];
+        for k in 0..corpus_len {
+            let mut total = 0.0f32;
+            let mut count = 0usize;
+            for &layer in &selected_layers {
+                for h in 0..n_heads {
+                    for q in q_lo..q_hi {
+                        let row = trace.pre_score_row(layer, h, q);
+                        if k < row.len() {
+                            total += row[k];
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            if count > 0 {
+                scores[k] = total / count as f32;
+            }
+        }
+
+        // Rank and take top-K
+        let mut ranked: Vec<(usize, f32)> = scores
+            .iter()
+            .enumerate()
+            .filter(|(_, &s)| s.is_finite())
+            .map(|(i, &s)| (i, s))
+            .collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        let top_k = req.top_k.min(ranked.len());
+        let spans: Vec<RetrievalSpan> = ranked
+            .iter()
+            .take(top_k)
+            .filter_map(|&(pos, score)| {
+                let (shard_name, offset) = shard_map.resolve(pos)?;
+                let token_text = state.tokenizer.decode(&[all_tokens[pos]])
+                    .replace('\n', "\\n");
+                Some(RetrievalSpan {
+                    shard: shard_name.to_string(),
+                    offset,
+                    score,
+                    token_text,
+                })
+            })
+            .collect();
+
+        return Ok(Json(serde_json::to_value(RetrievalResponse {
+            spans,
+            query_tokens: prompt_tokens.len() as u32,
+            corpus_tokens: corpus_len as u32,
+            layers_used: selected_layers,
+        }).unwrap()));
+    }
+
+    // ---------------------------------------------------------------
+    // GENERATE MODE (default): produce tokens.
+    // ---------------------------------------------------------------
     let (generated_tokens, completion_len) = if !shards.is_empty() {
         let mut pool = state.cache_pool.lock().await;
 
@@ -586,7 +774,7 @@ async fn chat_completions(
         },
     };
 
-    Ok(Json(response))
+    Ok(Json(serde_json::to_value(response).unwrap()))
 }
 
 // ---------------------------------------------------------------------------
