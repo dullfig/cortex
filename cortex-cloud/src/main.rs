@@ -57,6 +57,13 @@ struct Cli {
 // Shared state
 // ---------------------------------------------------------------------------
 
+/// Number of dummy "sink" tokens prepended to every shard at load time.
+/// These absorb the position-0 attention sink artifact (see POSITION-
+/// addendum.md section 15 on the structural cause) so real content tokens
+/// aren't contaminated. Retrieval scoring skips the first SINK_TOKENS
+/// positions per shard.
+const SINK_TOKENS: usize = 4;
+
 /// Per-cache metadata stored alongside the KV cache in the pool.
 struct CacheEntry {
     cache: ModelKvCache,
@@ -610,18 +617,23 @@ async fn chat_completions(
         let top_k = req.top_k.min(ranked.len());
         let spans: Vec<RetrievalSpan> = ranked
             .iter()
-            .take(top_k)
             .filter_map(|&(pos, score)| {
                 let (shard_name, offset) = shard_map.resolve(pos)?;
+                // Skip sink tokens at the start of each shard
+                if offset < SINK_TOKENS {
+                    return None;
+                }
                 let token_text = state.tokenizer.decode(&[all_tokens[pos]])
                     .replace('\n', "\\n");
                 Some(RetrievalSpan {
                     shard: shard_name.to_string(),
-                    offset,
+                    // Report offset relative to real content (after sinks)
+                    offset: offset - SINK_TOKENS,
                     score,
                     token_text,
                 })
             })
+            .take(top_k)
             .collect();
 
         return Ok(Json(serde_json::to_value(RetrievalResponse {
@@ -794,10 +806,16 @@ async fn cache_load(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let mut cache = state.model.create_kv_cache(state.max_seq_len);
 
-    if !req.tokens.is_empty() {
-        // Replay the token history to build the KV cache
+    // Prepend sink tokens (BOS repeated) to absorb position-0 attention
+    // sink artifact. Real content starts at position SINK_TOKENS.
+    let bos = state.tokenizer.bos_token_id();
+    let sink_tokens: Vec<u32> = vec![bos; SINK_TOKENS];
+    let mut all_tokens = sink_tokens;
+    all_tokens.extend_from_slice(&req.tokens);
+
+    if !all_tokens.is_empty() {
         tokio::task::block_in_place(|| {
-            let _ = state.model.forward_cached(&req.tokens, &mut cache);
+            let _ = state.model.forward_cached(&all_tokens, &mut cache);
         });
     }
 
@@ -809,7 +827,7 @@ async fn cache_load(
         req.cache_id.clone(),
         CacheEntry {
             cache,
-            tokens: req.tokens.clone(),
+            tokens: all_tokens,
             created_at: now,
             last_used: now,
         },
