@@ -51,6 +51,18 @@ struct Cli {
     /// Maximum sequence length for KV cache.
     #[arg(long, default_value = "4096")]
     max_seq_len: usize,
+
+    /// Enable cache endpoints (/v1/cache/*) and cache_shards support on
+    /// /v1/chat/completions. Use this for the librarian deployment.
+    /// When disabled (default), the server is a stateless generation
+    /// endpoint only — appropriate for the 32B Bob deployment.
+    #[arg(long)]
+    enable_cache: bool,
+
+    /// Enable retrieval mode (mode: "retrieve" on /v1/chat/completions).
+    /// Implies --enable-cache since retrieval operates over cached shards.
+    #[arg(long)]
+    enable_retrieve: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -80,14 +92,17 @@ struct ServerState {
     tokenizer: Tokenizer,
     #[allow(dead_code)]
     config: ModelConfig,
-    /// Pool of named KV caches. Key is the opaque cache_id assigned by agentos.
-    /// Cortex never invents a cache_id — every cache in this pool got here via
-    /// an explicit POST /v1/cache/load. The invariant "cortex never invents state"
-    /// is load-bearing for the eviction-recovery lifecycle (see CACHE-LIFECYCLE.md).
+    /// Pool of named KV caches. Only used when cache_enabled is true
+    /// (librarian deployment). When false (32B Bob deployment), the pool
+    /// is empty and cache_shards on requests are ignored.
     cache_pool: Mutex<HashMap<String, CacheEntry>>,
     model_name: String,
     start_time: Instant,
     max_seq_len: usize,
+    /// Whether cache endpoints and cache_shards are enabled.
+    cache_enabled: bool,
+    /// Whether retrieval mode is enabled.
+    retrieve_enabled: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -504,12 +519,37 @@ async fn chat_completions(
         .or_else(|| req.cache_id.map(|id| vec![id]))
         .unwrap_or_default();
 
+    // Gate: if cache_shards provided but cache is not enabled, reject.
+    if !shards.is_empty() && !state.cache_enabled {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "feature_disabled",
+                    "message": "cache_shards requires --enable-cache. This deployment is stateless only.",
+                }
+            })),
+        ));
+    }
+
     // ---------------------------------------------------------------
     // RETRIEVAL MODE: return top-K attention positions instead of
     // generating tokens. Uses forward_traced over composed shard
     // tokens + prompt tokens. Returns early with a RetrievalResponse.
     // ---------------------------------------------------------------
     let is_retrieve = req.mode.as_deref() == Some("retrieve");
+
+    if is_retrieve && !state.retrieve_enabled {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "feature_disabled",
+                    "message": "mode 'retrieve' requires --enable-retrieve. This deployment is generation only.",
+                }
+            })),
+        ));
+    }
 
     if is_retrieve {
         if shards.is_empty() {
@@ -1012,6 +1052,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .unwrap_or_else(|| "cortex-model".to_string());
 
+    // --enable-retrieve implies --enable-cache
+    let cache_enabled = cli.enable_cache || cli.enable_retrieve;
+    let retrieve_enabled = cli.enable_retrieve;
+
     let state = Arc::new(ServerState {
         model: loaded.model,
         tokenizer: loaded.tokenizer,
@@ -1020,19 +1064,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         model_name: model_name.clone(),
         start_time: Instant::now(),
         max_seq_len: cli.max_seq_len,
+        cache_enabled,
+        retrieve_enabled,
     });
 
-    let app = Router::new()
+    // Build router: always include completions, models, health.
+    // Cache and retrieve endpoints are conditional on startup flags.
+    let mut app = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/cache/load", post(cache_load))
-        .route("/v1/cache/append", post(cache_append))
-        .route("/v1/cache/{id}", get(cache_get).delete(cache_delete))
         .route("/v1/models", get(list_models))
-        .route("/health", get(health))
-        .with_state(state);
+        .route("/health", get(health));
+
+    if cache_enabled {
+        app = app
+            .route("/v1/cache/load", post(cache_load))
+            .route("/v1/cache/append", post(cache_append))
+            .route("/v1/cache/{id}", get(cache_get).delete(cache_delete));
+    }
+
+    let app = app.with_state(state);
 
     let addr = format!("{}:{}", cli.bind, cli.port);
-    info!(addr = %addr, model = %model_name, "cortex-server ready");
+    info!(
+        addr = %addr,
+        model = %model_name,
+        cache = cache_enabled,
+        retrieve = retrieve_enabled,
+        "cortex-server ready",
+    );
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
