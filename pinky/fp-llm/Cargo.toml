@@ -1,0 +1,10 @@
+[package]
+name = "fp-llm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+cortex = { path = "../../cortex", default-features = false }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
