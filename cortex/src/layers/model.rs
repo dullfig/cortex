@@ -12,6 +12,7 @@
 
 use crate::layers::kv_cache::ModelKvCache;
 use crate::layers::linear::LinearLayer;
+use crate::layers::transformer::FfnInjector;
 use crate::layers::rmsnorm::RmsNorm;
 use crate::layers::sampler::{Sampler, SamplerConfig};
 use crate::layers::trace::ForwardTrace;
@@ -163,6 +164,18 @@ impl TransformerModel {
     /// Number of transformer blocks (layers).
     pub fn n_layers(&self) -> usize {
         self.blocks.len()
+    }
+
+    /// Attach an FfnInjector to a specific transformer block.
+    ///
+    /// The injector fires after the FFN forward pass but before the
+    /// residual add at the specified layer. This is the hook for the
+    /// field-programmable LLM architecture: different injectors at
+    /// different layers produce different model behaviors without
+    /// changing the model weights.
+    pub fn set_block_injector(&mut self, layer: usize, injector: Box<dyn FfnInjector>) {
+        assert!(layer < self.blocks.len(), "layer {layer} out of range (n_layers={})", self.blocks.len());
+        self.blocks[layer].set_ffn_injector(injector);
     }
 
     /// Access the raw embedding table data (for diagnostics).

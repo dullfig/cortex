@@ -171,7 +171,7 @@ fn main() -> Result<()> {
     // ---- Phase 2: Load base model, capture hidden states, generate baseline ----
     println!("=== Phase 2: Base model (no injection) ===");
     println!("loading: {}", cli.base_model.display());
-    let base_loaded = cortex::load_model(cli.base_model.to_str().unwrap())
+    let mut base_loaded = cortex::load_model(cli.base_model.to_str().unwrap())
         .map_err(|e| anyhow!("load base failed: {e}"))?;
 
     // Generate with base model (to see what "bad" output looks like)
@@ -220,84 +220,37 @@ fn main() -> Result<()> {
     }
     println!();
 
-    // Attach DeltaInjectors to the base model's transformer blocks
-    // at the specified layers.
-    //
-    // SAFETY NOTE: This requires mutable access to the model's blocks.
-    // In production code, the model would be behind a lock. For this
-    // experiment, we reconstruct the model with injectors attached.
-    //
-    // PROBLEM: TransformerModel doesn't expose mutable access to blocks.
-    // We need to use set_ffn_injector on each TransformerBlock, but
-    // the model owns the blocks and doesn't expose them mutably.
-    //
-    // WORKAROUND for v0: Instead of injecting via FfnInjector (which
-    // requires mutable model access we don't have), we'll use a different
-    // approach: modify the hidden states BETWEEN forward_traced calls.
-    //
-    // The approach: run forward one layer at a time... but we don't have
-    // that API either. TransformerModel::forward runs all layers.
-    //
-    // SIMPLEST WORKAROUND: Since we can't inject mid-forward-pass without
-    // mutable block access, test the hypothesis at the OUTPUT level:
-    // take the base model's final hidden state, add the delta, project
-    // to logits, sample. This tests whether the delta carries the
-    // instruction-following signal, even though the injection point is
-    // at the output rather than at the correct mid-pass position.
+    // ---- Phase 3b: Attach DeltaInjectors and generate with injection ----
+    println!("attaching DeltaInjectors at layers {}..{}", cli.inject_from_layer, n_layers);
 
-    println!("testing output-level delta injection...");
-    println!("(v0 workaround: injecting at final hidden state, not mid-pass FFN)");
-    println!("(this tests whether the delta DIRECTION carries signal,");
-    println!(" not whether mid-pass injection works — that needs mutable model access)");
-    println!();
+    // We need mutable access to the model to attach injectors.
+    // base_loaded.model is owned, so we can get &mut.
+    let model = &mut base_loaded.model;
 
-    // Take the base model's post-final-norm hidden state (last entry in hidden_states)
-    let base_final = &base_trace.hidden_states[n_layers + 1];
-    let instruct_final = &instruct_hiddens[n_layers]; // post-last-block, pre-final-norm
-    // Actually we want post-final-norm for both. instruct_hiddens has n_layers+1 entries
-    // but we only saved 0..=n_layers. Let me use the last available.
+    for layer in cli.inject_from_layer..n_layers {
+        let delta = layer_deltas[layer].clone();
+        if delta.is_empty() {
+            continue;
+        }
+        model.set_block_injector(
+            layer,
+            Box::new(DeltaInjector {
+                deltas: delta,
+                embed_dim,
+                scale: cli.scale,
+            }),
+        );
+    }
 
-    // Use the post-last-block hidden states (index n_layers) for both
-    let base_post_blocks = &base_trace.hidden_states[n_layers];
-    let instruct_post_blocks = &instruct_hiddens[n_layers];
-
-    let seq_len = base_trace.seq_len;
-    let last_pos = seq_len - 1;
-
-    // Extract the last position's hidden state from both
-    let base_last = &base_post_blocks[last_pos * embed_dim..(last_pos + 1) * embed_dim];
-    let instruct_last = &instruct_post_blocks[last_pos * embed_dim..(last_pos + 1) * embed_dim];
-
-    // Compute delta at the last position
-    let delta_last: Vec<f32> = instruct_last
-        .iter()
-        .zip(base_last.iter())
-        .map(|(a, b)| (a - b) * cli.scale)
-        .collect();
-
-    let delta_l2: f32 = delta_last.iter().map(|x| x * x).sum::<f32>().sqrt();
-    println!("last-position delta L2: {:.4}", delta_l2);
-
-    // Apply delta to base's last hidden state
-    let nudged: Vec<f32> = base_last
-        .iter()
-        .zip(delta_last.iter())
-        .map(|(b, d)| b + d)
-        .collect();
-
-    // Apply final norm to the nudged hidden state
-    // (We need the final norm, which is inside the model and not directly accessible.
-    //  As a workaround, compare the logits from the nudged state vs base state
-    //  by looking at what token each would predict.)
-
-    // For the output comparison, use forward_last on the full sequence
-    // and compare top-5 predicted next tokens between:
-    // a) base model (already have base_output)
-    // b) instruct model (already have instruct_output)
-    // c) We can't easily get nudged-model logits without the final norm...
-
-    // SIMPLEST POSSIBLE COMPARISON: just report the three outputs side by side.
-    // The qualitative comparison IS the experiment result for v0.
+    println!("generating with injection active...");
+    let injected_output = model.generate(
+        &base_tokens,
+        cli.max_tokens,
+        SamplerConfig { temperature: 0.7, top_k: 40, top_p: 0.95, ..Default::default() },
+        42,
+        Some(base_loaded.tokenizer.eos_token_id()),
+    );
+    let injected_text = base_loaded.tokenizer.decode(&injected_output[base_tokens.len()..]);
 
     println!();
     println!("================================================================");
@@ -309,6 +262,10 @@ fn main() -> Result<()> {
     println!();
     println!("BASE model output (no injection):");
     println!("  {:?}", base_text);
+    println!();
+    println!("BASE model output (WITH delta injection at layers {}-{}):",
+        cli.inject_from_layer, n_layers - 1);
+    println!("  {:?}", injected_text);
     println!();
 
     // Report delta magnitudes by layer range
