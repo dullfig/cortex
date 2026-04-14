@@ -987,6 +987,37 @@ async fn cache_delete(
 }
 
 // ---------------------------------------------------------------------------
+// Tokenize endpoint
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct TokenizeRequest {
+    text: String,
+    #[serde(default)]
+    add_bos: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct TokenizeResponse {
+    tokens: Vec<u32>,
+    count: usize,
+}
+
+/// POST /v1/tokenize — convert text to token IDs using the loaded model's tokenizer.
+///
+/// This ensures memex and cortex use the same tokenizer, so token IDs from
+/// memex's ingestion pipeline match what cortex's cache endpoints expect.
+async fn tokenize(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<TokenizeRequest>,
+) -> Json<TokenizeResponse> {
+    let add_bos = req.add_bos.unwrap_or(state.tokenizer.add_bos_default());
+    let tokens = state.tokenizer.encode(&req.text, add_bos);
+    let count = tokens.len();
+    Json(TokenizeResponse { tokens, count })
+}
+
+// ---------------------------------------------------------------------------
 // Other handlers
 // ---------------------------------------------------------------------------
 
@@ -1072,6 +1103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Cache and retrieve endpoints are conditional on startup flags.
     let mut app = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/tokenize", post(tokenize))
         .route("/v1/models", get(list_models))
         .route("/health", get(health));
 
