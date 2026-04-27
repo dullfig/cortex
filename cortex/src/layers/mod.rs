@@ -13,6 +13,10 @@ pub mod bitlinear;
 pub mod engram_memory;
 pub mod ffn;
 pub mod floatlinear;
+#[cfg(feature = "gpu")]
+pub mod gpu_bitlinear;
+#[cfg(feature = "gpu")]
+pub mod gpu_floatlinear;
 pub mod kv_cache;
 pub mod linear;
 pub mod memory;

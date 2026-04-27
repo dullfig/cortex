@@ -34,15 +34,28 @@ use crate::layers::swiglu::{GateActivation, SwiGLU};
 use crate::layers::transformer::TransformerBlock;
 use crate::tokenizer::Tokenizer;
 
+/// Bundles the compute resources passed to every layer constructor:
+/// the always-present CPU `ComputeBackend` and (with `gpu` feature) an
+/// optional shared `GpuDevice` for resident weights.
+struct LoadCtx<'a> {
+    backend: &'a Arc<dyn ComputeBackend>,
+    #[cfg(feature = "gpu")]
+    gpu: Option<&'a Arc<crate::compute::wgpu_backend::GpuDevice>>,
+}
+
 /// Load a weight tensor as a LinearLayer, auto-detecting its type.
 ///
-/// - Ternary (TQ1_0, TQ2_0, I2S) → BitLinear with compute backend
+/// - Ternary (TQ1_0, TQ2_0, I2S) → GpuBitLinear if a GpuDevice is in ctx, else BitLinear
 /// - Quantized (Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, etc.) → FloatLinear (dequantized at load time)
 /// - Float (F32, F16, BF16) → FloatLinear
+///
+/// The GPU-resident path keeps weights on the device for the model's lifetime.
+/// FloatLinear stays CPU-side for now; a `GpuFloatLinear` lands when the
+/// resident runtime is extended to f16-packed weights.
 fn load_linear_layer(
     gguf: &GgufFile,
     name: &str,
-    backend: &Arc<dyn ComputeBackend>,
+    ctx: &LoadCtx,
 ) -> Result<Box<dyn LinearLayer>, GgufError> {
     let info = gguf
         .tensor_info(name)
@@ -50,10 +63,25 @@ fn load_linear_layer(
 
     if info.ggml_type.is_ternary() {
         let (w, s) = gguf.load_ternary(name)?;
-        Ok(Box::new(BitLinear::with_backend(w, s, backend.clone())))
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = ctx.gpu {
+            return Ok(Box::new(crate::layers::gpu_bitlinear::GpuBitLinear::from_weights(
+                gpu.clone(), w, s,
+            )));
+        }
+        Ok(Box::new(BitLinear::with_backend(w, s, ctx.backend.clone())))
     } else {
         // Quantized or float → dequantize to f32
         let tensor = gguf.load_float(name)?;
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = ctx.gpu {
+            // f16 packing requires even in_features; fall back to CPU if odd.
+            if tensor.shape().len() == 2 && tensor.shape()[1] % 2 == 0 {
+                return Ok(Box::new(crate::layers::gpu_floatlinear::GpuFloatLinear::from_float_tensor(
+                    gpu.clone(), tensor,
+                )));
+            }
+        }
         Ok(Box::new(FloatLinear::from_float_tensor(tensor)))
     }
 }
@@ -158,6 +186,22 @@ pub fn load_model(path: &str) -> Result<LoadedModel, GgufError> {
     eprintln!("  [boot] Compute: {} ternary kernel", backend.name());
     info!(backend = backend.name(), "compute backend selected");
 
+    // If a discrete GPU is present, also stand up a shared GpuDevice so
+    // ternary weights can be uploaded once and stay resident.
+    #[cfg(feature = "gpu")]
+    let gpu = compute::detect_gpu_device();
+    #[cfg(feature = "gpu")]
+    if gpu.is_some() {
+        eprintln!("  [boot] Resident-weights runtime: enabled (GpuBitLinear + GpuFloatLinear)");
+        info!("GPU device available; ternary and float layers will be GPU-resident");
+    }
+
+    let ctx = LoadCtx {
+        backend: &backend,
+        #[cfg(feature = "gpu")]
+        gpu: gpu.as_ref(),
+    };
+
     // Embedding table
     let embedding = gguf.load_float("token_embd.weight")?;
     info!("loaded embedding: {:?}", embedding.shape());
@@ -167,10 +211,10 @@ pub fn load_model(path: &str) -> Result<LoadedModel, GgufError> {
 
     for i in 0..config.n_layers as usize {
         // Attention projections — auto-detect ternary vs quantized vs float
-        let q_proj = load_linear_layer(&gguf, &format!("blk.{i}.attn_q.weight"), &backend)?;
-        let k_proj = load_linear_layer(&gguf, &format!("blk.{i}.attn_k.weight"), &backend)?;
-        let v_proj = load_linear_layer(&gguf, &format!("blk.{i}.attn_v.weight"), &backend)?;
-        let o_proj = load_linear_layer(&gguf, &format!("blk.{i}.attn_output.weight"), &backend)?;
+        let q_proj = load_linear_layer(&gguf, &format!("blk.{i}.attn_q.weight"), &ctx)?;
+        let k_proj = load_linear_layer(&gguf, &format!("blk.{i}.attn_k.weight"), &ctx)?;
+        let v_proj = load_linear_layer(&gguf, &format!("blk.{i}.attn_v.weight"), &ctx)?;
+        let o_proj = load_linear_layer(&gguf, &format!("blk.{i}.attn_output.weight"), &ctx)?;
 
         let mut attention = MultiHeadAttention::with_rope_layout(
             q_proj, k_proj, v_proj, o_proj,
@@ -196,13 +240,13 @@ pub fn load_model(path: &str) -> Result<LoadedModel, GgufError> {
             let mut experts = Vec::with_capacity(n_experts);
 
             for e in 0..n_experts {
-                let e_gate = load_linear_layer(&gguf, &format!("blk.{i}.ffn_gate.{e}.weight"), &backend)?;
-                let e_up = load_linear_layer(&gguf, &format!("blk.{i}.ffn_up.{e}.weight"), &backend)?;
-                let e_down = load_linear_layer(&gguf, &format!("blk.{i}.ffn_down.{e}.weight"), &backend)?;
+                let e_gate = load_linear_layer(&gguf, &format!("blk.{i}.ffn_gate.{e}.weight"), &ctx)?;
+                let e_up = load_linear_layer(&gguf, &format!("blk.{i}.ffn_up.{e}.weight"), &ctx)?;
+                let e_down = load_linear_layer(&gguf, &format!("blk.{i}.ffn_down.{e}.weight"), &ctx)?;
                 experts.push(SwiGLU::with_activation(e_gate, e_up, e_down, activation));
             }
 
-            let router = load_linear_layer(&gguf, &format!("blk.{i}.ffn_gate_inp.weight"), &backend)?;
+            let router = load_linear_layer(&gguf, &format!("blk.{i}.ffn_gate_inp.weight"), &ctx)?;
 
             if i == 0 {
                 info!(n_experts, top_k, "loading MoE experts");
@@ -211,9 +255,9 @@ pub fn load_model(path: &str) -> Result<LoadedModel, GgufError> {
             Box::new(crate::layers::moe::MoELayer::new(experts, router, top_k))
         } else {
             // Dense FFN projections — auto-detect type
-            let gate_proj = load_linear_layer(&gguf, &format!("blk.{i}.ffn_gate.weight"), &backend)?;
-            let up_proj = load_linear_layer(&gguf, &format!("blk.{i}.ffn_up.weight"), &backend)?;
-            let down_proj = load_linear_layer(&gguf, &format!("blk.{i}.ffn_down.weight"), &backend)?;
+            let gate_proj = load_linear_layer(&gguf, &format!("blk.{i}.ffn_gate.weight"), &ctx)?;
+            let up_proj = load_linear_layer(&gguf, &format!("blk.{i}.ffn_up.weight"), &ctx)?;
+            let down_proj = load_linear_layer(&gguf, &format!("blk.{i}.ffn_down.weight"), &ctx)?;
 
             // Optional ffn_sub_norm [intermediate_dim]: applied between activation(gate)⊙up and down
             if gguf.tensor_info(&format!("blk.{i}.ffn_sub_norm.weight")).is_some() {
@@ -255,22 +299,49 @@ pub fn load_model(path: &str) -> Result<LoadedModel, GgufError> {
     // Output projection: check if "output.weight" exists and its type
     let output_proj = if let Some(out_info) = gguf.tensor_info("output.weight") {
         if out_info.ggml_type.is_ternary() {
-            // Ternary output projection → BitLinear (fast integer matmul)
+            // Ternary output projection → GpuBitLinear if available, else BitLinear
             let (out_w, out_s) = gguf.load_ternary("output.weight")?;
             info!(
                 rows = out_w.rows(),
                 cols = out_w.cols(),
                 "loaded output projection (ternary)"
             );
-            OutputProjection::Linear(Box::new(BitLinear::with_backend(out_w, out_s, backend.clone())))
+            #[cfg(feature = "gpu")]
+            let layer: Box<dyn LinearLayer> = if let Some(gpu) = ctx.gpu {
+                Box::new(crate::layers::gpu_bitlinear::GpuBitLinear::from_weights(
+                    gpu.clone(), out_w, out_s,
+                ))
+            } else {
+                Box::new(BitLinear::with_backend(out_w, out_s, backend.clone()))
+            };
+            #[cfg(not(feature = "gpu"))]
+            let layer: Box<dyn LinearLayer> =
+                Box::new(BitLinear::with_backend(out_w, out_s, backend.clone()));
+            OutputProjection::Linear(layer)
         } else {
-            // Float or quantized → dequantize to f32 tensor, use rayon-parallel projection
+            // Float or quantized → dequantize to f32 tensor
             let out_tensor = gguf.load_float("output.weight")?;
             info!(
                 shape = ?out_tensor.shape(),
                 dtype = ?out_info.ggml_type,
-                "loaded output projection (float, rayon-parallel)"
+                "loaded output projection (float)"
             );
+            // Route through GpuFloatLinear when GPU available (resident weights,
+            // GPU matvec for the vocab-sized projection — Qwen vocab=151k rows).
+            #[cfg(feature = "gpu")]
+            if let Some(gpu) = ctx.gpu {
+                if out_tensor.shape().len() == 2 && out_tensor.shape()[1] % 2 == 0 {
+                    let gpu_layer = crate::layers::gpu_floatlinear::GpuFloatLinear::from_float_tensor(
+                        gpu.clone(), out_tensor,
+                    );
+                    OutputProjection::Linear(Box::new(gpu_layer))
+                } else {
+                    OutputProjection::Float(out_tensor)
+                }
+            } else {
+                OutputProjection::Float(out_tensor)
+            }
+            #[cfg(not(feature = "gpu"))]
             OutputProjection::Float(out_tensor)
         }
     } else {

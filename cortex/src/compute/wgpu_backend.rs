@@ -212,10 +212,12 @@ pub struct Pipelines {
     pub attn_score_batch: wgpu::ComputePipeline,
     pub softmax_batch: wgpu::ComputePipeline,
     pub attn_value_batch: wgpu::ComputePipeline,
+    // Resident-weight ternary path (GpuBitLinear)
+    pub ternary_matvec: wgpu::ComputePipeline,
 }
 
 impl Pipelines {
-    /// Compile all 22 compute pipelines from embedded shader sources.
+    /// Compile all compute pipelines from embedded shader sources.
     pub fn compile(device: &wgpu::Device) -> Self {
         let make = |src: &str, label: &str| -> wgpu::ComputePipeline {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -227,6 +229,21 @@ impl Pipelines {
                 layout: None, // Auto-derive from shader
                 module: &module,
                 entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+
+        let make_with_entry = |src: &str, label: &str, entry: &str| -> wgpu::ComputePipeline {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(src.into()),
+            });
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: None,
+                module: &module,
+                entry_point: Some(entry),
                 compilation_options: Default::default(),
                 cache: None,
             })
@@ -257,6 +274,8 @@ impl Pipelines {
             attn_score_batch: make(include_str!("shaders/attn_score_batch.wgsl"), "attn_score_batch"),
             softmax_batch: make(include_str!("shaders/softmax_batch.wgsl"), "softmax_batch"),
             attn_value_batch: make(include_str!("shaders/attn_value_batch.wgsl"), "attn_value_batch"),
+            // Resident-weight ternary path — entry point differs from "main"
+            ternary_matvec: make_with_entry(TERNARY_SHADER, "ternary_matvec_resident", "ternary_matvec"),
         }
     }
 }
@@ -297,11 +316,17 @@ impl GpuDevice {
             "GPU adapter selected"
         );
 
+        // Use the adapter's actual limits instead of wgpu's conservative
+        // defaults. wgpu::Limits::default() caps max_buffer_size at 256 MB,
+        // which is smaller than a 7B model's vocab projection (~600 MB f16).
+        // The 4080 reports 4 GB+; requesting adapter limits keeps resident
+        // weights practical for vocab-sized tensors.
+        let adapter_limits = adapter.limits();
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("cortex"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits: adapter_limits,
                 memory_hints: wgpu::MemoryHints::Performance,
             },
             None,
@@ -309,7 +334,7 @@ impl GpuDevice {
         .ok()?;
 
         let pipelines = Pipelines::compile(&device);
-        tracing::info!("compiled 22 GPU compute pipelines");
+        tracing::info!("compiled 23 GPU compute pipelines");
 
         Some(Self { device, queue, pipelines })
     }
@@ -812,9 +837,9 @@ mod tests {
 
     #[test]
     fn gpu_device_creation() {
-        // Test that GpuDevice compiles all 22 pipelines
+        // Test that GpuDevice compiles all 23 pipelines
         let Some(_gpu) = GpuDevice::try_new() else { return };
-        // If we got here, all 22 shaders compiled successfully
+        // If we got here, all 23 shaders compiled successfully
     }
 
     #[test]

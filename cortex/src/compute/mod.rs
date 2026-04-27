@@ -153,6 +153,31 @@ pub fn detect() -> std::sync::Arc<dyn ComputeBackend> {
     std::sync::Arc::new(scalar::ScalarBackend)
 }
 
+/// Try to build a shared `GpuDevice` (resident-weights runtime).
+///
+/// Returns `Some(Arc<GpuDevice>)` only if a discrete GPU adapter is available
+/// — integrated GPUs lose to AVX2 for our workload, so we don't pay the cost
+/// of standing up a resident runtime there.
+///
+/// One `Arc<GpuDevice>` is shared across all GPU-resident layers in a model.
+#[cfg(feature = "gpu")]
+pub fn detect_gpu_device() -> Option<std::sync::Arc<wgpu_backend::GpuDevice>> {
+    let has_discrete = device::HardwareInfo::detect()
+        .gpus
+        .iter()
+        .any(|g| g.device_type == device::GpuDeviceType::Discrete);
+    if !has_discrete {
+        tracing::info!("no discrete GPU; skipping resident-weights runtime");
+        return None;
+    }
+    wgpu_backend::GpuDevice::try_new().map(std::sync::Arc::new)
+}
+
+#[cfg(not(feature = "gpu"))]
+pub fn detect_gpu_device() -> Option<std::sync::Arc<()>> {
+    None
+}
+
 /// Auto-detect the fastest CPU-only backend (skip GPU).
 ///
 /// Useful when you want deterministic CPU results or when the GPU
