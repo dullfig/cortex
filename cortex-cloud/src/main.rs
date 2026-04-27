@@ -397,18 +397,24 @@ fn extract_json_object(s: &str) -> Option<String> {
 
 #[derive(Serialize)]
 struct RetrievalResponse {
-    spans: Vec<RetrievalSpan>,
-    query_tokens: u32,
-    corpus_tokens: u32,
-    layers_used: Vec<usize>,
+    hits: Vec<RetrievalHit>,
+    metadata: RetrievalMetadata,
 }
 
 #[derive(Serialize)]
-struct RetrievalSpan {
-    shard: String,
+struct RetrievalHit {
+    shard_id: String,
     offset: usize,
+    length: u32,
     score: f32,
-    token_text: String,
+}
+
+#[derive(Serialize)]
+struct RetrievalMetadata {
+    retrieval_ms: u64,
+    query_tokens: u32,
+    corpus_tokens: u32,
+    layers_used: Vec<usize>,
 }
 
 /// Maps a position in a composed token sequence back to its shard + offset.
@@ -607,6 +613,8 @@ async fn chat_completions(
             "retrieval mode: running forward_traced",
         );
 
+        let retrieve_start = Instant::now();
+
         // Run forward_traced over the full sequence
         let (trace, query_start, n_layers, n_heads) = tokio::task::block_in_place(|| {
             let (_logits, trace) = state.model.forward_traced(&all_tokens);
@@ -655,7 +663,7 @@ async fn chat_completions(
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
         let top_k = req.top_k.min(ranked.len());
-        let spans: Vec<RetrievalSpan> = ranked
+        let hits: Vec<RetrievalHit> = ranked
             .iter()
             .filter_map(|&(pos, score)| {
                 let (shard_name, offset) = shard_map.resolve(pos)?;
@@ -663,24 +671,27 @@ async fn chat_completions(
                 if offset < SINK_TOKENS {
                     return None;
                 }
-                let token_text = state.tokenizer.decode(&[all_tokens[pos]])
-                    .replace('\n', "\\n");
-                Some(RetrievalSpan {
-                    shard: shard_name.to_string(),
+                Some(RetrievalHit {
+                    shard_id: shard_name.to_string(),
                     // Report offset relative to real content (after sinks)
                     offset: offset - SINK_TOKENS,
+                    length: 1,
                     score,
-                    token_text,
                 })
             })
             .take(top_k)
             .collect();
 
+        let retrieval_ms = retrieve_start.elapsed().as_millis() as u64;
+
         return Ok(Json(serde_json::to_value(RetrievalResponse {
-            spans,
-            query_tokens: prompt_tokens.len() as u32,
-            corpus_tokens: corpus_len as u32,
-            layers_used: selected_layers,
+            hits,
+            metadata: RetrievalMetadata {
+                retrieval_ms,
+                query_tokens: prompt_tokens.len() as u32,
+                corpus_tokens: corpus_len as u32,
+                layers_used: selected_layers,
+            },
         }).unwrap()));
     }
 
@@ -1017,6 +1028,29 @@ async fn tokenize(
     Json(TokenizeResponse { tokens, count })
 }
 
+#[derive(Deserialize)]
+struct DetokenizeRequest {
+    tokens: Vec<u32>,
+}
+
+#[derive(Serialize)]
+struct DetokenizeResponse {
+    text: String,
+}
+
+/// POST /v1/detokenize — convert token IDs back to text.
+///
+/// Useful for resolving retrieval hits — given a hit at (offset, length),
+/// the caller can pull tokens[offset-k .. offset+length+k] from the original
+/// shard token list and POST them here to get a human-readable context window.
+async fn detokenize(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<DetokenizeRequest>,
+) -> Json<DetokenizeResponse> {
+    let text = state.tokenizer.decode(&req.tokens);
+    Json(DetokenizeResponse { text })
+}
+
 // ---------------------------------------------------------------------------
 // Other handlers
 // ---------------------------------------------------------------------------
@@ -1104,6 +1138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/tokenize", post(tokenize))
+        .route("/v1/detokenize", post(detokenize))
         .route("/v1/models", get(list_models))
         .route("/health", get(health));
 
