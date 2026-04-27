@@ -1,3 +1,7 @@
+> **Cross-session coordination:** Before making any design/scope decision, read `C:\Users\danu\.claude\projects\C--src-ringhub-integration\memory\MEMORY.md` first — that folder is the shared brain across all Claude sessions on this project. Decisions pinned there supersede anything in this repo's older docs.
+>
+> **If something has happened to Daniel:** read `C:\src\CARETAKER.md` — the project's caretaker-handoff document.
+
 # cortex
 
 Universal local transformer engine with persistent memory. Runs any GGUF model — ternary, quantized, or float.
@@ -93,8 +97,9 @@ let response = provider.complete(&request)?;
 
 ## Testing
 
-282 tests covering: ternary packing, matmul kernels, quantization, GGUF parsing,
-layer forward passes, attention, RoPE, SwiGLU, full model forward, sampler.
+310 tests covering: ternary packing, matmul kernels, quantization, GGUF parsing,
+layer forward passes, attention, RoPE, SwiGLU, full model forward, sampler,
+retrieval (forward_traced + attention-score ranking).
 
 Run all: `cargo test --workspace`
 

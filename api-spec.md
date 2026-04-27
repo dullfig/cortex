@@ -115,7 +115,7 @@ If `cache_id` is provided but not resident, cortex returns 404 with:
 ```json
 {"error": "cache_not_found", "cache_id": "user-alice"}
 ```
-The caller (Donna) should then `POST /v1/cache/load` to restore from its sled
+The caller (AgentOS) should then `POST /v1/cache/load` to restore from its sled
 backup, then retry the completion.
 
 The response includes new KV entries generated during this turn:
@@ -132,7 +132,7 @@ The response includes new KV entries generated during this turn:
 }
 ```
 
-Donna appends these to both cortex (via `/v1/cache/append`) and its local sled
+AgentOS appends these to both cortex (via `/v1/cache/append`) and its local sled
 store (for durability). If `new_cache_entries` is absent or empty, no new entries
 were generated (e.g., very short response).
 
@@ -164,7 +164,7 @@ Optional but nice — lets the pipeline discover what's loaded.
 ### `POST /v1/cache/load`
 
 Full cache restore — called on cold start when a user's cache is not resident.
-Donna sends the compressed KV entries from its sled store; cortex loads them
+AgentOS sends the compressed KV entries from its sled store; cortex loads them
 into GPU memory so subsequent requests can use `cache_id`.
 
 **Request:**
@@ -228,11 +228,11 @@ Called after each inference turn to keep the cache current.
 **Notes:**
 - Tiny payload — only the new entries from the latest turn (~0.5-2MB).
 - Returns 404 if `cache_id` not resident (caller needs to do a full load first).
-- Donna also writes these same entries to its local sled store for durability.
+- AgentOS also writes these same entries to its local sled store for durability.
 
 ### `GET /v1/cache/{cache_id}`
 
-Check if a user's cache is resident and get stats. Used by Donna to decide
+Check if a user's cache is resident and get stats. Used by AgentOS to decide
 whether to do a full load or go straight to inference.
 
 **Response (resident):**
@@ -269,9 +269,9 @@ cortex needs to free memory for other users.
 ```
 
 **Notes:**
-- Donna should call this proactively when a user goes idle (e.g., 5 min timeout).
+- AgentOS should call this proactively when a user goes idle (e.g., 5 min timeout).
 - Cortex may also auto-evict LRU caches when GPU memory pressure is high.
-  In that case, subsequent requests with that `cache_id` get 404 and Donna
+  In that case, subsequent requests with that `cache_id` get 404 and AgentOS
   does a full load — graceful degradation.
 
 ### `GET /health`
@@ -351,30 +351,30 @@ The model doesn't need to "know" the tool call format — the grammar forces it.
 
 Cortex manages a **cache pool** — a collection of per-user KV caches resident
 in GPU memory. The protocol is designed so the A100 is semi-stateful (caches
-live on GPU for performance) but the source of truth is Donna's sled store.
+live on GPU for performance) but the source of truth is AgentOS's sled store.
 
 **Request flow (warm user — cache resident):**
 ```
-Donna: GET  /v1/cache/alice            → 200, resident
-Donna: POST /v1/chat/completions       → {cache_id: "alice", messages: [...]}
+AgentOS: GET  /v1/cache/alice            → 200, resident
+AgentOS: POST /v1/chat/completions       → {cache_id: "alice", messages: [...]}
 Cortex: runs inference with resident cache, returns response + new_cache_entries
-Donna: POST /v1/cache/append           → appends new entries to cortex
-Donna: kv_store.append("alice", ...)   → appends to local sled (durability)
+AgentOS: POST /v1/cache/append           → appends new entries to cortex
+AgentOS: kv_store.append("alice", ...)   → appends to local sled (durability)
 ```
 
 **Request flow (cold user — cache not resident):**
 ```
-Donna: GET  /v1/cache/alice            → 404
-Donna: loads entries from sled
-Donna: POST /v1/cache/load             → full restore (~42MB one-time)
-Donna: POST /v1/chat/completions       → {cache_id: "alice", messages: [...]}
+AgentOS: GET  /v1/cache/alice            → 404
+AgentOS: loads entries from sled
+AgentOS: POST /v1/cache/load             → full restore (~42MB one-time)
+AgentOS: POST /v1/chat/completions       → {cache_id: "alice", messages: [...]}
 ... (same as warm from here)
 ```
 
 **Idle eviction:**
 ```
-Donna: user idle 5 min
-Donna: DELETE /v1/cache/alice           → frees GPU memory
+AgentOS: user idle 5 min
+AgentOS: DELETE /v1/cache/alice           → frees GPU memory
 (sled still has everything — next message triggers cold load)
 ```
 
@@ -388,8 +388,8 @@ First message from each user → full load from sled → back to warm
 Key points:
 - Bulk transfer (full load) happens once per session, not per message
 - Per-turn transfer (append) is tiny: ~0.5-2MB of new entries
-- Cortex may auto-evict LRU caches under memory pressure — Donna handles 404 gracefully
-- Donna's sled store is the source of truth, cortex's GPU memory is a hot cache
+- Cortex may auto-evict LRU caches under memory pressure — AgentOS handles 404 gracefully
+- AgentOS's sled store is the source of truth, cortex's GPU memory is a hot cache
 - The `/health` endpoint reports cache pool stats for monitoring
 
 ### Docker image
