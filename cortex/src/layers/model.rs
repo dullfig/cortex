@@ -183,6 +183,80 @@ impl TransformerModel {
         self.embedding.data()
     }
 
+    /// Access the final RMSNorm (for GpuEngine to upload its weights).
+    pub fn final_norm(&self) -> &RmsNorm {
+        &self.final_norm
+    }
+
+    /// Access the transformer blocks (for GpuEngine to drive forward orchestration).
+    pub fn blocks(&self) -> &[TransformerBlock] {
+        &self.blocks
+    }
+
+    /// Access the output projection variant.
+    pub fn output_proj(&self) -> &OutputProjection {
+        &self.output_proj
+    }
+
+    /// Embedding lookup + all transformer blocks. Returns the per-token hidden
+    /// state immediately before the final RMSNorm. Used by `GpuEngine` to
+    /// hand off pre-norm activations into a GPU rmsnorm dispatch.
+    pub fn forward_pre_norm(&self, tokens: &[u32], start_pos: usize) -> Vec<f32> {
+        let seq_len = tokens.len();
+        assert!(seq_len > 0, "must have at least one token");
+
+        let mut hidden = Vec::with_capacity(seq_len * self.embed_dim);
+        let embed_data = self.embedding.data();
+        for &tok in tokens {
+            assert!(
+                (tok as usize) < self.vocab_size,
+                "token ID {tok} out of range (vocab_size={})",
+                self.vocab_size
+            );
+            let start = tok as usize * self.embed_dim;
+            hidden.extend_from_slice(&embed_data[start..start + self.embed_dim]);
+        }
+        for block in &self.blocks {
+            hidden = block.forward(&hidden, seq_len, start_pos);
+        }
+        hidden
+    }
+
+    /// Per-token final RMSNorm. Counterpart to `forward_pre_norm`'s output;
+    /// `pre_norm` is `[seq_len, embed_dim]`, result is the same shape.
+    pub fn apply_final_norm(&self, pre_norm: &[f32], seq_len: usize) -> Vec<f32> {
+        assert_eq!(pre_norm.len(), seq_len * self.embed_dim, "shape mismatch");
+        let mut normed = Vec::with_capacity(pre_norm.len());
+        for t in 0..seq_len {
+            let start = t * self.embed_dim;
+            normed.extend_from_slice(&self.final_norm.forward(&pre_norm[start..start + self.embed_dim]));
+        }
+        normed
+    }
+
+    /// Apply the output projection to already-normed hidden state, producing
+    /// `[seq_len, vocab_size]` logits.
+    pub fn finalize_logits(&self, normed: &[f32], seq_len: usize) -> Vec<f32> {
+        assert_eq!(normed.len(), seq_len * self.embed_dim, "shape mismatch");
+        let embed_data = self.embedding.data();
+        match &self.output_proj {
+            OutputProjection::Linear(proj) => {
+                let mut logits = Vec::with_capacity(seq_len * self.vocab_size);
+                for t in 0..seq_len {
+                    let start = t * self.embed_dim;
+                    logits.extend_from_slice(&proj.forward(&normed[start..start + self.embed_dim]));
+                }
+                logits
+            }
+            OutputProjection::Float(ref weight) => {
+                float_output_projection(normed, weight.data(), seq_len, self.vocab_size, self.embed_dim)
+            }
+            OutputProjection::TiedEmbedding => {
+                float_output_projection(normed, embed_data, seq_len, self.vocab_size, self.embed_dim)
+            }
+        }
+    }
+
     /// Forward pass: token IDs → logits.
     ///
     /// `tokens`: slice of token IDs (each < vocab_size).

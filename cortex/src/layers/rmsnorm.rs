@@ -61,6 +61,9 @@ impl RmsNorm {
 
     /// Access the weight vector.
     pub fn weight(&self) -> &[f32] { &self.weight }
+
+    /// Numerical-stability epsilon.
+    pub fn eps(&self) -> f32 { self.eps }
 }
 
 impl std::fmt::Debug for RmsNorm {
