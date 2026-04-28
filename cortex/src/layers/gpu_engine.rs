@@ -61,6 +61,21 @@ struct MatvecParams {
     cols: u32,
 }
 
+/// Params struct for the rope_batch shader. Layout must match
+/// `compute/shaders/rope_batch.wgsl` exactly — eight u32s.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct RopeBatchParams {
+    n_heads: u32,
+    head_dim: u32,
+    start_pos: u32,
+    half_dim: u32,
+    n_tokens: u32,
+    _p1: u32,
+    _p2: u32,
+    _p3: u32,
+}
+
 /// Fused GPU forward-pass orchestrator wrapping a `TransformerModel`.
 pub struct GpuEngine {
     /// CPU-side model. Owns the layers (which may themselves hold resident
@@ -229,6 +244,90 @@ impl GpuEngine {
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+    }
+
+    /// Build cos/sin lookup tables for the `rope_batch` shader, sized to
+    /// `max_seq` positions. Layout matches `rope_batch.wgsl`:
+    /// `cos_table[pos * half_dim + i]`, same for sin. Half_dim = inv_freq.len().
+    ///
+    /// Called once at construction (cos/sin are fixed for a given RoPE
+    /// config). Returns two storage buffers ready to be bound.
+    pub fn build_rope_tables(
+        gpu: &GpuDevice,
+        inv_freq: &[f32],
+        max_seq: usize,
+    ) -> (wgpu::Buffer, wgpu::Buffer) {
+        let half_dim = inv_freq.len();
+        let mut cos = Vec::with_capacity(max_seq * half_dim);
+        let mut sin = Vec::with_capacity(max_seq * half_dim);
+        for pos in 0..max_seq {
+            let p = pos as f32;
+            for &freq in inv_freq {
+                let angle = p * freq;
+                cos.push(angle.cos());
+                sin.push(angle.sin());
+            }
+        }
+
+        let cos_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("gpu_engine.rope.cos"),
+            contents: bytemuck::cast_slice(&cos),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let sin_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("gpu_engine.rope.sin"),
+            contents: bytemuck::cast_slice(&sin),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        (cos_buf, sin_buf)
+    }
+
+    /// Dispatch RoPE in place on `x_buf`, which must hold f32 values laid
+    /// out as `[n_tokens, n_heads, head_dim]`. Token `t` is rotated for
+    /// position `start_pos + t`. Halved (NeoX/HF) layout — Qwen and BitNet
+    /// both use this; interleaved (older llama.cpp) is not supported by the
+    /// shader yet.
+    pub fn dispatch_rope_into(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        x_buf: &wgpu::Buffer,
+        cos_buf: &wgpu::Buffer,
+        sin_buf: &wgpu::Buffer,
+        n_heads: usize,
+        head_dim: usize,
+        start_pos: usize,
+        n_tokens: usize,
+    ) {
+        assert!(head_dim % 2 == 0, "RoPE head_dim must be even");
+        let half_dim = head_dim / 2;
+
+        let params = RopeBatchParams {
+            n_heads: n_heads as u32,
+            head_dim: head_dim as u32,
+            start_pos: start_pos as u32,
+            half_dim: half_dim as u32,
+            n_tokens: n_tokens as u32,
+            _p1: 0, _p2: 0, _p3: 0,
+        };
+        let params_buf = self.gpu.create_params_buffer(&params);
+
+        let pipeline = &self.gpu.pipelines.rope_batch;
+        let bind_group = self.gpu.make_bind_group(
+            pipeline,
+            &[x_buf, cos_buf, sin_buf, &params_buf],
+        );
+
+        // Total threads = n_tokens * n_heads * half_dim. Workgroup size is 64.
+        let total_threads = (n_tokens * n_heads * half_dim) as u32;
+        let dispatch_x = (total_threads + 63) / 64;
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_engine.rope.pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(dispatch_x, 1, 1);
     }
 
     /// Convenience wrapper around `dispatch_matvec_into`: allocates input
@@ -518,6 +617,141 @@ mod tests {
         // Identical pipeline + identical resident buffer; should be bit-equal.
         for (i, (r, g)) in reference.iter().zip(&gpu_out).enumerate() {
             assert!((r - g).abs() < 1e-6, "row {i}: ref={r} gpu={g}");
+        }
+    }
+
+    #[test]
+    fn dispatch_rope_matches_cpu_rope() {
+        use crate::layers::rope::{RoPE, RoPELayout};
+
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let n_heads = 2;
+        let head_dim = 8;
+        let n_tokens = 3;
+        let start_pos = 0;
+        let max_seq = 16;
+
+        let rope = RoPE::with_layout(head_dim, 10000.0, RoPELayout::Halved);
+
+        // Build a deterministic input: [n_tokens, n_heads, head_dim] as f32.
+        let mut x: Vec<f32> = Vec::with_capacity(n_tokens * n_heads * head_dim);
+        for i in 0..(n_tokens * n_heads * head_dim) {
+            x.push((i as f32) * 0.01 - 0.5);
+        }
+
+        // CPU reference: rotate each (tok, head) head_dim slice at pos start_pos+tok.
+        let mut cpu_out = x.clone();
+        for tok in 0..n_tokens {
+            for h in 0..n_heads {
+                let off = tok * n_heads * head_dim + h * head_dim;
+                let slice = &x[off..off + head_dim].to_vec();
+                let rotated = rope.forward(slice, start_pos + tok);
+                cpu_out[off..off + head_dim].copy_from_slice(&rotated);
+            }
+        }
+
+        // GPU path
+        let (cos_buf, sin_buf) = GpuEngine::build_rope_tables(&gpu, rope.inv_freq(), max_seq);
+        let total_bytes = (x.len() * std::mem::size_of::<f32>()) as u64;
+        let x_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("rope_test.x"),
+            contents: bytemuck::cast_slice(&x),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let staging = gpu.create_staging_buffer(total_bytes);
+
+        let engine = GpuEngine::from_cpu_model(toy_model(), gpu.clone());
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("rope_test.encoder"),
+        });
+        engine.dispatch_rope_into(
+            &mut encoder, &x_buf, &cos_buf, &sin_buf,
+            n_heads, head_dim, start_pos, n_tokens,
+        );
+        encoder.copy_buffer_to_buffer(&x_buf, 0, &staging, 0, total_bytes);
+        gpu.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+        gpu.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        let gpu_out: Vec<f32> = data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        drop(data);
+        staging.unmap();
+
+        assert_eq!(cpu_out.len(), gpu_out.len());
+        for (i, (c, g)) in cpu_out.iter().zip(&gpu_out).enumerate() {
+            assert!(
+                (c - g).abs() < 1e-5,
+                "elem {i}: cpu={c} gpu={g} (diff={})",
+                (c - g).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_rope_nonzero_start_pos() {
+        // Smoke-test that start_pos plumbs through to the right cos/sin row.
+        use crate::layers::rope::{RoPE, RoPELayout};
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let n_heads = 1;
+        let head_dim = 4;
+        let n_tokens = 2;
+        let start_pos = 5;
+        let max_seq = 16;
+
+        let rope = RoPE::with_layout(head_dim, 10000.0, RoPELayout::Halved);
+        let x: Vec<f32> = (0..(n_tokens * n_heads * head_dim))
+            .map(|i| (i as f32) * 0.1)
+            .collect();
+
+        let mut cpu_out = x.clone();
+        for tok in 0..n_tokens {
+            for h in 0..n_heads {
+                let off = tok * n_heads * head_dim + h * head_dim;
+                let rotated = rope.forward(&x[off..off + head_dim].to_vec(), start_pos + tok);
+                cpu_out[off..off + head_dim].copy_from_slice(&rotated);
+            }
+        }
+
+        let (cos_buf, sin_buf) = GpuEngine::build_rope_tables(&gpu, rope.inv_freq(), max_seq);
+        let total_bytes = (x.len() * std::mem::size_of::<f32>()) as u64;
+        let x_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("rope_test2.x"),
+            contents: bytemuck::cast_slice(&x),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let staging = gpu.create_staging_buffer(total_bytes);
+        let engine = GpuEngine::from_cpu_model(toy_model(), gpu.clone());
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("rope_test2.encoder"),
+        });
+        engine.dispatch_rope_into(
+            &mut encoder, &x_buf, &cos_buf, &sin_buf,
+            n_heads, head_dim, start_pos, n_tokens,
+        );
+        encoder.copy_buffer_to_buffer(&x_buf, 0, &staging, 0, total_bytes);
+        gpu.queue.submit(Some(encoder.finish()));
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+        gpu.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        let gpu_out: Vec<f32> = data.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        drop(data); staging.unmap();
+        for (i, (c, g)) in cpu_out.iter().zip(&gpu_out).enumerate() {
+            assert!((c - g).abs() < 1e-5, "elem {i}: cpu={c} gpu={g}");
         }
     }
 
