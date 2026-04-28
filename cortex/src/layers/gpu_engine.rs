@@ -119,6 +119,22 @@ struct AttnValueBatchParams {
     n_tokens: u32,
 }
 
+/// Params struct for the silu_mul_batch shader. Two u32s.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct SiluMulBatchParams {
+    n: u32,
+    n_tokens: u32,
+}
+
+/// Params struct for the add_inplace_batch shader. Two u32s.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct AddInplaceBatchParams {
+    n: u32,
+    n_tokens: u32,
+}
+
 /// Fused GPU forward-pass orchestrator wrapping a `TransformerModel`.
 pub struct GpuEngine {
     /// CPU-side model. Owns the layers (which may themselves hold resident
@@ -494,6 +510,71 @@ impl GpuEngine {
             pass.set_bind_group(0, &value_bind, &[]);
             pass.dispatch_workgroups(value_groups, 1, 1);
         }
+    }
+
+    /// Dispatch element-wise SiLU(gate) * up into `out_buf`. Sized as
+    /// `[n_tokens, n]` flat. Used by the SwiGLU FFN. SiLU activation only;
+    /// ReLU² (BitNet variant) needs a separate shader and is deferred until
+    /// the ternary fused path lands.
+    pub fn dispatch_silu_mul_into(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        gate_buf: &wgpu::Buffer,
+        up_buf: &wgpu::Buffer,
+        out_buf: &wgpu::Buffer,
+        n: usize,
+        n_tokens: usize,
+    ) {
+        let params = SiluMulBatchParams { n: n as u32, n_tokens: n_tokens as u32 };
+        let params_buf = self.gpu.create_params_buffer(&params);
+
+        let pipeline = &self.gpu.pipelines.silu_mul_batch;
+        let bind = self.gpu.make_bind_group(
+            pipeline,
+            &[gate_buf, up_buf, out_buf, &params_buf],
+        );
+
+        let total = (n * n_tokens) as u32;
+        let groups = (total + 255) / 256;
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_engine.silu_mul.pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(groups, 1, 1);
+    }
+
+    /// Dispatch element-wise in-place add: `a_buf[i] += b_buf[i]`. Used for
+    /// residual connections (post-attention and post-FFN).
+    pub fn dispatch_add_into(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        a_buf: &wgpu::Buffer,
+        b_buf: &wgpu::Buffer,
+        n: usize,
+        n_tokens: usize,
+    ) {
+        let params = AddInplaceBatchParams { n: n as u32, n_tokens: n_tokens as u32 };
+        let params_buf = self.gpu.create_params_buffer(&params);
+
+        let pipeline = &self.gpu.pipelines.add_inplace_batch;
+        let bind = self.gpu.make_bind_group(
+            pipeline,
+            &[a_buf, b_buf, &params_buf],
+        );
+
+        let total = (n * n_tokens) as u32;
+        let groups = (total + 255) / 256;
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_engine.add.pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(groups, 1, 1);
     }
 
     /// Convenience wrapper around `dispatch_matvec_into`: allocates input
@@ -1126,6 +1207,110 @@ mod tests {
 
         for (i, (c, g)) in cpu_out.iter().zip(&gpu_out).enumerate() {
             assert!((c - g).abs() < 1e-4, "elem {i}: cpu={c} gpu={g}");
+        }
+    }
+
+    #[test]
+    fn dispatch_silu_mul_matches_cpu() {
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let n = 16;
+        let n_tokens = 3;
+        let total = n * n_tokens;
+
+        let gate: Vec<f32> = (0..total).map(|i| (i as f32) * 0.1 - 0.7).collect();
+        let up:   Vec<f32> = (0..total).map(|i| (i as f32) * -0.05 + 0.4).collect();
+
+        // CPU reference: silu(g) * u  where silu(x) = x / (1 + exp(-x))
+        let cpu_out: Vec<f32> = gate.iter().zip(&up)
+            .map(|(&g, &u)| (g / (1.0 + (-g).exp())) * u)
+            .collect();
+
+        let bytes = (total * 4) as u64;
+        let g_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("silu.g"), contents: bytemuck::cast_slice(&gate),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let u_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("silu.u"), contents: bytemuck::cast_slice(&up),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let o_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("silu.o"), size: bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging = gpu.create_staging_buffer(bytes);
+
+        let engine = GpuEngine::from_cpu_model(toy_model(), gpu.clone());
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("silu.encoder"),
+        });
+        engine.dispatch_silu_mul_into(&mut encoder, &g_buf, &u_buf, &o_buf, n, n_tokens);
+        encoder.copy_buffer_to_buffer(&o_buf, 0, &staging, 0, bytes);
+        gpu.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+        gpu.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        let gpu_out: Vec<f32> = data.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        drop(data); staging.unmap();
+
+        for (i, (c, g)) in cpu_out.iter().zip(&gpu_out).enumerate() {
+            assert!((c - g).abs() < 1e-5, "elem {i}: cpu={c} gpu={g}");
+        }
+    }
+
+    #[test]
+    fn dispatch_add_in_place_matches_cpu() {
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let n = 8;
+        let n_tokens = 4;
+        let total = n * n_tokens;
+
+        let mut a: Vec<f32> = (0..total).map(|i| i as f32 * 0.1).collect();
+        let b: Vec<f32>     = (0..total).map(|i| (total - i) as f32 * -0.05).collect();
+        let cpu_a: Vec<f32> = a.iter().zip(&b).map(|(&x, &y)| x + y).collect();
+
+        let bytes = (total * 4) as u64;
+        let a_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("add.a"), contents: bytemuck::cast_slice(&a),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let b_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("add.b"), contents: bytemuck::cast_slice(&b),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let staging = gpu.create_staging_buffer(bytes);
+
+        let engine = GpuEngine::from_cpu_model(toy_model(), gpu.clone());
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("add.encoder"),
+        });
+        engine.dispatch_add_into(&mut encoder, &a_buf, &b_buf, n, n_tokens);
+        encoder.copy_buffer_to_buffer(&a_buf, 0, &staging, 0, bytes);
+        gpu.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+        gpu.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        let gpu_a: Vec<f32> = data.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        drop(data); staging.unmap();
+
+        let _ = a; // silence unused-mut warning in case of future refactor
+        for (i, (c, g)) in cpu_a.iter().zip(&gpu_a).enumerate() {
+            assert!((c - g).abs() < 1e-6, "elem {i}: cpu={c} gpu={g}");
         }
     }
 
