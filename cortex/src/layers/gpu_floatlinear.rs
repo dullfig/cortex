@@ -132,6 +132,15 @@ impl LinearLayer for GpuFloatLinear {
 
     fn in_features(&self) -> usize { self.cols }
     fn out_features(&self) -> usize { self.rows }
+    fn as_any(&self) -> &dyn std::any::Any { self }
+}
+
+impl GpuFloatLinear {
+    /// Borrow the resident f16-packed weight buffer.
+    pub fn weight_buffer(&self) -> &wgpu::Buffer { &self.weight_buf }
+
+    /// Shared GPU device handle.
+    pub fn gpu(&self) -> &Arc<GpuDevice> { &self.gpu }
 }
 
 impl std::fmt::Debug for GpuFloatLinear {

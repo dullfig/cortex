@@ -143,6 +143,19 @@ impl LinearLayer for GpuBitLinear {
 
     fn in_features(&self) -> usize { self.cols }
     fn out_features(&self) -> usize { self.rows }
+    fn as_any(&self) -> &dyn std::any::Any { self }
+}
+
+impl GpuBitLinear {
+    /// Borrow the resident weight buffer (for fused-forward orchestrators
+    /// that need to chain matvec dispatches against this layer's weights).
+    pub fn weight_buffer(&self) -> &wgpu::Buffer { &self.weight_buf }
+
+    /// Per-layer weight scale γ used when rescaling integer accumulators.
+    pub fn weight_scale(&self) -> f32 { self.weight_scale }
+
+    /// Shared GPU device handle.
+    pub fn gpu(&self) -> &Arc<GpuDevice> { &self.gpu }
 }
 
 impl std::fmt::Debug for GpuBitLinear {

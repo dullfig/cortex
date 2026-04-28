@@ -20,4 +20,10 @@ pub trait LinearLayer: Send + Sync + std::fmt::Debug {
 
     /// Number of output features (rows).
     fn out_features(&self) -> usize;
+
+    /// Downcast hook for orchestrators (e.g., `GpuEngine`) that need to reach
+    /// the concrete type to access resident GPU buffers. Default panics with
+    /// a clear message — every impl that wants to participate in fused GPU
+    /// dispatch must provide `fn as_any(&self) -> &dyn Any { self }`.
+    fn as_any(&self) -> &dyn std::any::Any;
 }

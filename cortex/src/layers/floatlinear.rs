@@ -59,6 +59,7 @@ impl LinearLayer for FloatLinear {
 
     fn in_features(&self) -> usize { self.cols }
     fn out_features(&self) -> usize { self.rows }
+    fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
 impl std::fmt::Debug for FloatLinear {

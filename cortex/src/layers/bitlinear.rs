@@ -110,6 +110,7 @@ impl crate::layers::linear::LinearLayer for BitLinear {
     }
     fn in_features(&self) -> usize { self.in_features() }
     fn out_features(&self) -> usize { self.out_features() }
+    fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
 impl std::fmt::Debug for BitLinear {
