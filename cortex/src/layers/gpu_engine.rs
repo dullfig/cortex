@@ -76,6 +76,49 @@ struct RopeBatchParams {
     _p3: u32,
 }
 
+/// Params struct for the attn_score_batch shader. Twelve u32s; the trailing
+/// padding entries are required for std140-ish uniform alignment.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct AttnScoreBatchParams {
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    start_pos: u32,
+    max_seq: u32,
+    heads_per_kv: u32,
+    kv_dim: u32,
+    scale: f32,
+    n_tokens: u32,
+    _p1: u32,
+    _p2: u32,
+    _p3: u32,
+}
+
+/// Params struct for the softmax_batch shader. Four u32s.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct SoftmaxBatchParams {
+    n_heads: u32,
+    max_seq: u32,
+    start_pos: u32,
+    n_tokens: u32,
+}
+
+/// Params struct for the attn_value_batch shader. Eight u32s.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct AttnValueBatchParams {
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    start_pos: u32,
+    max_seq: u32,
+    heads_per_kv: u32,
+    kv_dim: u32,
+    n_tokens: u32,
+}
+
 /// Fused GPU forward-pass orchestrator wrapping a `TransformerModel`.
 pub struct GpuEngine {
     /// CPU-side model. Owns the layers (which may themselves hold resident
@@ -328,6 +371,129 @@ impl GpuEngine {
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups(dispatch_x, 1, 1);
+    }
+
+    /// Dispatch GQA attention math (attn_score → softmax → attn_value)
+    /// against pre-projected, RoPE-rotated Q/K/V buffers. Records all three
+    /// dispatches into the supplied `encoder`.
+    ///
+    /// Buffer layouts:
+    /// - `q_buf`:  [n_tokens, n_heads * head_dim]  f32
+    /// - `k_buf`:  [max_seq,  n_kv_heads * head_dim]  f32 (cache-shaped)
+    /// - `v_buf`:  [max_seq,  n_kv_heads * head_dim]  f32 (cache-shaped)
+    /// - `scores_buf`: [n_tokens, n_heads, max_seq] f32 (scratch; written
+    ///   by attn_score, read+written by softmax, read by attn_value)
+    /// - `out_buf`: [n_tokens, n_heads * head_dim]  f32 (output)
+    ///
+    /// Causal mask is applied in `attn_score_batch` (positions > start_pos+tok
+    /// are written as -inf so softmax zeros them). For prefill mode pass
+    /// `start_pos=0` and size K/V buffers as `max_seq=n_tokens`.
+    pub fn dispatch_attention_into(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        q_buf: &wgpu::Buffer,
+        k_buf: &wgpu::Buffer,
+        v_buf: &wgpu::Buffer,
+        scores_buf: &wgpu::Buffer,
+        out_buf: &wgpu::Buffer,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        start_pos: usize,
+        max_seq: usize,
+        n_tokens: usize,
+    ) {
+        assert!(n_heads % n_kv_heads == 0, "n_heads must be divisible by n_kv_heads");
+        let heads_per_kv = n_heads / n_kv_heads;
+        let kv_dim = n_kv_heads * head_dim;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        // ---- 1. attn_score: Q · K^T * scale, with causal mask ----
+        let score_params = AttnScoreBatchParams {
+            n_heads: n_heads as u32,
+            n_kv_heads: n_kv_heads as u32,
+            head_dim: head_dim as u32,
+            start_pos: start_pos as u32,
+            max_seq: max_seq as u32,
+            heads_per_kv: heads_per_kv as u32,
+            kv_dim: kv_dim as u32,
+            scale,
+            n_tokens: n_tokens as u32,
+            _p1: 0, _p2: 0, _p3: 0,
+        };
+        let score_params_buf = self.gpu.create_params_buffer(&score_params);
+        let score_pipeline = &self.gpu.pipelines.attn_score_batch;
+        let score_bind = self.gpu.make_bind_group(
+            score_pipeline,
+            &[q_buf, k_buf, scores_buf, &score_params_buf],
+        );
+        // One thread per (tok, head, t); workgroup_size=256.
+        let total_score_threads = (n_tokens * n_heads * max_seq) as u32;
+        let score_groups = (total_score_threads + 255) / 256;
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("gpu_engine.attn_score.pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(score_pipeline);
+            pass.set_bind_group(0, &score_bind, &[]);
+            pass.dispatch_workgroups(score_groups, 1, 1);
+        }
+
+        // ---- 2. softmax: in-place over scores ----
+        let softmax_params = SoftmaxBatchParams {
+            n_heads: n_heads as u32,
+            max_seq: max_seq as u32,
+            start_pos: start_pos as u32,
+            n_tokens: n_tokens as u32,
+        };
+        let softmax_params_buf = self.gpu.create_params_buffer(&softmax_params);
+        let softmax_pipeline = &self.gpu.pipelines.softmax_batch;
+        let softmax_bind = self.gpu.make_bind_group(
+            softmax_pipeline,
+            &[scores_buf, &softmax_params_buf],
+        );
+        // One workgroup per (tok, head) pair.
+        let softmax_groups = (n_tokens * n_heads) as u32;
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("gpu_engine.softmax.pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(softmax_pipeline);
+            pass.set_bind_group(0, &softmax_bind, &[]);
+            pass.dispatch_workgroups(softmax_groups, 1, 1);
+        }
+
+        // ---- 3. attn_value: weighted sum of V ----
+        let value_params = AttnValueBatchParams {
+            n_heads: n_heads as u32,
+            n_kv_heads: n_kv_heads as u32,
+            head_dim: head_dim as u32,
+            start_pos: start_pos as u32,
+            max_seq: max_seq as u32,
+            heads_per_kv: heads_per_kv as u32,
+            kv_dim: kv_dim as u32,
+            n_tokens: n_tokens as u32,
+        };
+        let value_params_buf = self.gpu.create_params_buffer(&value_params);
+        let value_pipeline = &self.gpu.pipelines.attn_value_batch;
+        let value_bind = self.gpu.make_bind_group(
+            value_pipeline,
+            &[scores_buf, v_buf, out_buf, &value_params_buf],
+        );
+        // One thread per (tok, head, d); workgroup_size=256.
+        let total_value_threads = (n_tokens * n_heads * head_dim) as u32;
+        let value_groups = (total_value_threads + 255) / 256;
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("gpu_engine.attn_value.pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(value_pipeline);
+            pass.set_bind_group(0, &value_bind, &[]);
+            pass.dispatch_workgroups(value_groups, 1, 1);
+        }
     }
 
     /// Convenience wrapper around `dispatch_matvec_into`: allocates input
@@ -752,6 +918,214 @@ mod tests {
         drop(data); staging.unmap();
         for (i, (c, g)) in cpu_out.iter().zip(&gpu_out).enumerate() {
             assert!((c - g).abs() < 1e-5, "elem {i}: cpu={c} gpu={g}");
+        }
+    }
+
+    /// CPU reference for the GPU attention chain: causal scaled dot-product
+    /// attention from pre-projected, RoPE-rotated Q/K/V to per-token output.
+    fn cpu_attention_reference(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        n_tokens: usize,
+    ) -> Vec<f32> {
+        let kv_dim = n_kv_heads * head_dim;
+        let q_dim = n_heads * head_dim;
+        let heads_per_kv = n_heads / n_kv_heads;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut out = vec![0.0f32; n_tokens * q_dim];
+
+        for tok in 0..n_tokens {
+            let seq_len = tok + 1;
+            for h in 0..n_heads {
+                let kv_h = h / heads_per_kv;
+                let q_off = tok * q_dim + h * head_dim;
+
+                let mut scores = vec![0.0f32; seq_len];
+                for t in 0..seq_len {
+                    let k_off = t * kv_dim + kv_h * head_dim;
+                    let dot: f32 = (0..head_dim).map(|d| q[q_off + d] * k[k_off + d]).sum();
+                    scores[t] = dot * scale;
+                }
+
+                let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exp_sum: f32 = scores.iter().map(|&s| (s - max).exp()).sum();
+                for s in &mut scores { *s = (*s - max).exp() / exp_sum; }
+
+                for t in 0..seq_len {
+                    let v_off = t * kv_dim + kv_h * head_dim;
+                    for d in 0..head_dim {
+                        out[tok * q_dim + h * head_dim + d] += scores[t] * v[v_off + d];
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn dispatch_attention_matches_cpu_gqa() {
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        // GQA: 4 query heads, 2 KV heads, head_dim=8, 5 tokens, prefill mode.
+        let n_heads = 4;
+        let n_kv_heads = 2;
+        let head_dim = 8;
+        let n_tokens = 5;
+        let max_seq = n_tokens; // prefill: K/V buffer sized to current sequence
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+
+        // Deterministic Q/K/V values.
+        let mut rng: u64 = 0xA77E_BEEFu64;
+        let mut roll = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng >> 33) as i32 % 1000 - 500) as f32 * 0.001
+        };
+        let q: Vec<f32> = (0..n_tokens * q_dim).map(|_| roll()).collect();
+        let k: Vec<f32> = (0..max_seq * kv_dim).map(|_| roll()).collect();
+        let v: Vec<f32> = (0..max_seq * kv_dim).map(|_| roll()).collect();
+
+        let cpu_out = cpu_attention_reference(&q, &k, &v, n_heads, n_kv_heads, head_dim, n_tokens);
+
+        // GPU path: upload Q/K/V, allocate scores+out scratch, dispatch.
+        let q_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("attn_test.q"),
+            contents: bytemuck::cast_slice(&q),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let k_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("attn_test.k"),
+            contents: bytemuck::cast_slice(&k),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let v_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("attn_test.v"),
+            contents: bytemuck::cast_slice(&v),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let scores_bytes = (n_tokens * n_heads * max_seq * std::mem::size_of::<f32>()) as u64;
+        let scores_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("attn_test.scores"),
+            size: scores_bytes,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let out_bytes = (n_tokens * q_dim * std::mem::size_of::<f32>()) as u64;
+        let out_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("attn_test.out"),
+            size: out_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging = gpu.create_staging_buffer(out_bytes);
+
+        let engine = GpuEngine::from_cpu_model(toy_model(), gpu.clone());
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("attn_test.encoder"),
+        });
+        engine.dispatch_attention_into(
+            &mut encoder, &q_buf, &k_buf, &v_buf, &scores_buf, &out_buf,
+            n_heads, n_kv_heads, head_dim, /*start_pos*/ 0, max_seq, n_tokens,
+        );
+        encoder.copy_buffer_to_buffer(&out_buf, 0, &staging, 0, out_bytes);
+        gpu.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+        gpu.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        let gpu_out: Vec<f32> = data.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        drop(data); staging.unmap();
+
+        assert_eq!(cpu_out.len(), gpu_out.len());
+        // f32 attention math; exp/softmax in shader matches CPU within ~1e-5
+        // for well-conditioned inputs.
+        for (i, (c, g)) in cpu_out.iter().zip(&gpu_out).enumerate() {
+            assert!(
+                (c - g).abs() < 1e-4,
+                "elem {i}: cpu={c} gpu={g} (diff={})",
+                (c - g).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_attention_single_token() {
+        // Smoke test the seq_len=1 case (most degenerate softmax: a single
+        // value -> probability 1.0).
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let n_heads = 2;
+        let n_kv_heads = 1;
+        let head_dim = 4;
+        let n_tokens = 1;
+        let max_seq = 1;
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+
+        let q: Vec<f32> = (0..n_tokens * q_dim).map(|i| i as f32 * 0.1).collect();
+        let k: Vec<f32> = (0..max_seq * kv_dim).map(|i| i as f32 * 0.2 - 0.5).collect();
+        let v: Vec<f32> = (0..max_seq * kv_dim).map(|i| i as f32 * -0.05 + 0.3).collect();
+
+        let cpu_out = cpu_attention_reference(&q, &k, &v, n_heads, n_kv_heads, head_dim, n_tokens);
+
+        let q_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("attn_test1.q"), contents: bytemuck::cast_slice(&q),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let k_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("attn_test1.k"), contents: bytemuck::cast_slice(&k),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let v_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("attn_test1.v"), contents: bytemuck::cast_slice(&v),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let scores_bytes = (n_tokens * n_heads * max_seq * 4) as u64;
+        let scores_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("attn_test1.scores"), size: scores_bytes,
+            usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false,
+        });
+        let out_bytes = (n_tokens * q_dim * 4) as u64;
+        let out_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("attn_test1.out"), size: out_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging = gpu.create_staging_buffer(out_bytes);
+
+        let engine = GpuEngine::from_cpu_model(toy_model(), gpu.clone());
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("attn_test1.encoder"),
+        });
+        engine.dispatch_attention_into(
+            &mut encoder, &q_buf, &k_buf, &v_buf, &scores_buf, &out_buf,
+            n_heads, n_kv_heads, head_dim, 0, max_seq, n_tokens,
+        );
+        encoder.copy_buffer_to_buffer(&out_buf, 0, &staging, 0, out_bytes);
+        gpu.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+        gpu.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        let gpu_out: Vec<f32> = data.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        drop(data); staging.unmap();
+
+        for (i, (c, g)) in cpu_out.iter().zip(&gpu_out).enumerate() {
+            assert!((c - g).abs() < 1e-4, "elem {i}: cpu={c} gpu={g}");
         }
     }
 
