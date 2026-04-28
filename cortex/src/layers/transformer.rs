@@ -151,6 +151,21 @@ impl TransformerBlock {
     }
 
     /// Access the attention layer (for querying head config).
+    /// Pre-attention RMSNorm.
+    pub fn attn_norm(&self) -> &RmsNorm { &self.attn_norm }
+
+    /// Pre-FFN RMSNorm.
+    pub fn ffn_norm(&self) -> &RmsNorm { &self.ffn_norm }
+
+    /// Feed-forward network (dense SwiGLU or MoE).
+    pub fn ffn(&self) -> &dyn FeedForward { self.ffn.as_ref() }
+
+    /// Attention residual scale.
+    pub fn attn_residual_scale(&self) -> f32 { self.attn_residual_scale }
+
+    /// FFN residual scale.
+    pub fn ffn_residual_scale(&self) -> f32 { self.ffn_residual_scale }
+
     pub fn attention(&self) -> &MultiHeadAttention {
         &self.attention
     }

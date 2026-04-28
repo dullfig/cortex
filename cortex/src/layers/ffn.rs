@@ -27,4 +27,9 @@ pub trait FeedForward: Send + Sync + std::fmt::Debug {
 
     /// Output dimension (embed_dim).
     fn out_features(&self) -> usize;
+
+    /// Downcast hook so orchestrators (`GpuEngine`) can reach the concrete
+    /// type to access weight buffers. Each impl provides:
+    /// `fn as_any(&self) -> &dyn Any { self }`.
+    fn as_any(&self) -> &dyn std::any::Any;
 }

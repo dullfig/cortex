@@ -160,6 +160,23 @@ impl MultiHeadAttention {
         self.head_dim
     }
 
+    /// Q projection (for GpuEngine to dispatch matvec against resident weights).
+    pub fn q_proj(&self) -> &dyn LinearLayer { self.q_proj.as_ref() }
+    pub fn k_proj(&self) -> &dyn LinearLayer { self.k_proj.as_ref() }
+    pub fn v_proj(&self) -> &dyn LinearLayer { self.v_proj.as_ref() }
+    pub fn o_proj(&self) -> &dyn LinearLayer { self.o_proj.as_ref() }
+
+    /// Rotary position embedding layer (shared by Q and K).
+    pub fn rope(&self) -> &RoPE { &self.rope }
+
+    /// Optional Q/K/V biases (Qwen2). None for most LLaMA-family models.
+    pub fn q_bias(&self) -> Option<&[f32]> { self.q_bias.as_deref() }
+    pub fn k_bias(&self) -> Option<&[f32]> { self.k_bias.as_deref() }
+    pub fn v_bias(&self) -> Option<&[f32]> { self.v_bias.as_deref() }
+
+    /// Optional sub-norm before O projection (BitNet b1.58).
+    pub fn o_sub_norm(&self) -> Option<&RmsNorm> { self.o_sub_norm.as_ref() }
+
     /// Number of Q heads per KV head group.
     fn heads_per_group(&self) -> usize {
         self.n_heads / self.n_kv_heads

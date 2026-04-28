@@ -122,6 +122,17 @@ impl SwiGLU {
         self.down_proj.out_features()
     }
 
+    /// Gate projection (for GpuEngine to dispatch matvec against resident weights).
+    pub fn gate_proj(&self) -> &dyn LinearLayer { self.gate_proj.as_ref() }
+    pub fn up_proj(&self) -> &dyn LinearLayer { self.up_proj.as_ref() }
+    pub fn down_proj(&self) -> &dyn LinearLayer { self.down_proj.as_ref() }
+
+    /// Optional sub-norm between activation and down projection (BitNet b1.58).
+    pub fn sub_norm(&self) -> Option<&RmsNorm> { self.sub_norm.as_ref() }
+
+    /// Activation function applied to the gate path.
+    pub fn activation(&self) -> GateActivation { self.activation }
+
     /// Forward pass for a single vector.
     ///
     /// Input: f32 slice of length `embed_dim`.
@@ -188,6 +199,8 @@ impl FeedForward for SwiGLU {
     fn out_features(&self) -> usize {
         SwiGLU::out_features(self)
     }
+
+    fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
 impl std::fmt::Debug for SwiGLU {

@@ -145,6 +145,8 @@ impl FeedForward for MoELayer {
     fn out_features(&self) -> usize {
         self.experts[0].out_features()
     }
+
+    fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
 impl std::fmt::Debug for MoELayer {

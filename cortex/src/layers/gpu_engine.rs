@@ -135,6 +135,70 @@ struct AddInplaceBatchParams {
     n_tokens: u32,
 }
 
+/// Per-block GPU resources extracted at construction time. Holds resident
+/// rmsnorm weights for the two norms inside a `TransformerBlock`. The matvec
+/// weights are accessed lazily via the CPU model's block at dispatch time
+/// (they live inside `Box<dyn LinearLayer>` and are reached via
+/// `as_any().downcast_ref::<GpuFloatLinear>()`).
+struct GpuBlock {
+    attn_norm_weight_buf: wgpu::Buffer,
+    attn_norm_eps: f32,
+    ffn_norm_weight_buf: wgpu::Buffer,
+    ffn_norm_eps: f32,
+}
+
+/// Per-block scratch buffers reused across all dispatches inside a single
+/// `forward_block_gpu` call. Caller allocates once per forward pass and
+/// reuses across blocks (since dimensions are constant).
+pub struct BlockScratch {
+    pub normed: wgpu::Buffer,    // [n_tokens, embed_dim] post-rmsnorm scratch
+    pub q: wgpu::Buffer,         // [n_tokens, n_heads * head_dim]
+    pub k: wgpu::Buffer,         // [n_tokens, n_kv_heads * head_dim]
+    pub v: wgpu::Buffer,         // [n_tokens, n_kv_heads * head_dim]
+    pub attn_out: wgpu::Buffer,  // [n_tokens, n_heads * head_dim]
+    pub scores: wgpu::Buffer,    // [n_tokens, n_heads, max_seq] attention scores
+    pub gate: wgpu::Buffer,      // [n_tokens, intermediate]
+    pub up: wgpu::Buffer,        // [n_tokens, intermediate]
+    pub activated: wgpu::Buffer, // [n_tokens, intermediate] SiLU(gate)*up
+    pub projected: wgpu::Buffer, // [n_tokens, embed_dim] both attn-out-proj and FFN-down output reuse this
+}
+
+impl BlockScratch {
+    /// Allocate scratch buffers sized for a single forward of `n_tokens`.
+    pub fn allocate(
+        gpu: &GpuDevice,
+        n_tokens: usize,
+        embed_dim: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        intermediate: usize,
+        max_seq: usize,
+    ) -> Self {
+        let mk = |size: u64, label: &str| -> wgpu::Buffer {
+            gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        };
+        let f32_bytes = std::mem::size_of::<f32>() as u64;
+        Self {
+            normed:    mk((n_tokens * embed_dim) as u64 * f32_bytes, "scratch.normed"),
+            q:         mk((n_tokens * n_heads * head_dim) as u64 * f32_bytes, "scratch.q"),
+            k:         mk((n_tokens * n_kv_heads * head_dim) as u64 * f32_bytes, "scratch.k"),
+            v:         mk((n_tokens * n_kv_heads * head_dim) as u64 * f32_bytes, "scratch.v"),
+            attn_out:  mk((n_tokens * n_heads * head_dim) as u64 * f32_bytes, "scratch.attn_out"),
+            scores:    mk((n_tokens * n_heads * max_seq) as u64 * f32_bytes, "scratch.scores"),
+            gate:      mk((n_tokens * intermediate) as u64 * f32_bytes, "scratch.gate"),
+            up:        mk((n_tokens * intermediate) as u64 * f32_bytes, "scratch.up"),
+            activated: mk((n_tokens * intermediate) as u64 * f32_bytes, "scratch.activated"),
+            projected: mk((n_tokens * embed_dim) as u64 * f32_bytes, "scratch.projected"),
+        }
+    }
+}
+
 /// Fused GPU forward-pass orchestrator wrapping a `TransformerModel`.
 pub struct GpuEngine {
     /// CPU-side model. Owns the layers (which may themselves hold resident
@@ -152,11 +216,30 @@ pub struct GpuEngine {
     final_norm_eps: f32,
     /// Captured for shader-param construction.
     embed_dim: usize,
+    /// Per-block resident resources.
+    blocks_gpu: Vec<GpuBlock>,
+    /// Resident RoPE cos lookup table, sized to `rope_max_seq * (head_dim/2)`.
+    rope_cos_buf: wgpu::Buffer,
+    /// Resident RoPE sin lookup table, same shape as `rope_cos_buf`.
+    rope_sin_buf: wgpu::Buffer,
+    /// Maximum sequence length the rope tables cover. Forward calls with
+    /// `start_pos + n_tokens > rope_max_seq` would index out of range, so
+    /// they assert.
+    rope_max_seq: usize,
 }
 
 impl GpuEngine {
-    /// Wrap a CPU `TransformerModel` with a shared GPU context.
+    /// Wrap a CPU `TransformerModel` with a shared GPU context. Uses the
+    /// default RoPE-table size (4096 positions); call `with_max_seq` if
+    /// you need a longer context window.
     pub fn from_cpu_model(cpu: TransformerModel, gpu: Arc<GpuDevice>) -> Self {
+        Self::with_max_seq(cpu, gpu, 4096)
+    }
+
+    /// Wrap a CPU `TransformerModel` with a shared GPU context, sizing the
+    /// RoPE cos/sin lookup tables to `max_seq` positions.
+    pub fn with_max_seq(cpu: TransformerModel, gpu: Arc<GpuDevice>, max_seq: usize) -> Self {
+        // Final norm
         let final_norm = cpu.final_norm();
         let final_norm_weight_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("gpu_engine.final_norm.weight"),
@@ -166,13 +249,127 @@ impl GpuEngine {
         let final_norm_eps = final_norm.eps();
         let embed_dim = cpu.embed_dim();
 
+        // Per-block norms
+        let blocks_gpu: Vec<GpuBlock> = cpu.blocks().iter().enumerate().map(|(i, blk)| {
+            let an = blk.attn_norm();
+            let fn_ = blk.ffn_norm();
+            GpuBlock {
+                attn_norm_weight_buf: gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(&format!("gpu_engine.block{i}.attn_norm.weight")),
+                    contents: bytemuck::cast_slice(an.weight()),
+                    usage: wgpu::BufferUsages::STORAGE,
+                }),
+                attn_norm_eps: an.eps(),
+                ffn_norm_weight_buf: gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(&format!("gpu_engine.block{i}.ffn_norm.weight")),
+                    contents: bytemuck::cast_slice(fn_.weight()),
+                    usage: wgpu::BufferUsages::STORAGE,
+                }),
+                ffn_norm_eps: fn_.eps(),
+            }
+        }).collect();
+
+        // RoPE tables. All blocks share one rope (same base + head_dim).
+        let attn0 = cpu.blocks()[0].attention();
+        let (rope_cos_buf, rope_sin_buf) =
+            Self::build_rope_tables(&gpu, attn0.rope().inv_freq(), max_seq);
+
         Self {
             cpu,
             gpu,
             final_norm_weight_buf,
             final_norm_eps,
             embed_dim,
+            blocks_gpu,
+            rope_cos_buf,
+            rope_sin_buf,
+            rope_max_seq: max_seq,
         }
+    }
+
+    /// Dispatch RMSNorm into `out_buf` from `in_buf`, using `weight_buf` for
+    /// the per-feature scale. Both buffers are `[n_tokens, n]` flat. One
+    /// workgroup per token via `rmsnorm_batch`.
+    pub fn dispatch_rmsnorm_into(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        in_buf: &wgpu::Buffer,
+        weight_buf: &wgpu::Buffer,
+        out_buf: &wgpu::Buffer,
+        n: usize,
+        n_tokens: usize,
+        eps: f32,
+    ) {
+        let params = RmsNormBatchParams {
+            n: n as u32, eps, n_tokens: n_tokens as u32, _pad: 0,
+        };
+        let params_buf = self.gpu.create_params_buffer(&params);
+        let pipeline = &self.gpu.pipelines.rmsnorm_batch;
+        let bind = self.gpu.make_bind_group(
+            pipeline, &[in_buf, weight_buf, out_buf, &params_buf],
+        );
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_engine.rmsnorm.pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(n_tokens as u32, 1, 1);
+    }
+
+    /// Dispatch a batch matmul against a `GpuFloatLinear` layer's resident
+    /// weights. Input is `[n_tokens, in_features]`, output is
+    /// `[n_tokens, out_features]`. Uses the `matmul` (batch) shader which
+    /// processes all tokens in one dispatch — the right primitive for prefill.
+    pub fn dispatch_matmul_into(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        layer: &dyn LinearLayer,
+        in_buf: &wgpu::Buffer,
+        out_buf: &wgpu::Buffer,
+        n_tokens: usize,
+    ) {
+        let float = layer
+            .as_any()
+            .downcast_ref::<crate::layers::gpu_floatlinear::GpuFloatLinear>()
+            .unwrap_or_else(|| {
+                panic!(
+                    "GpuEngine.dispatch_matmul_into: layer is not GpuFloatLinear \
+                     (concrete type: {:?})",
+                    layer
+                )
+            });
+
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct MatmulParams { rows: u32, cols: u32, n_tokens: u32, _pad: u32 }
+        let params = MatmulParams {
+            rows: float.out_features() as u32,
+            cols: float.in_features() as u32,
+            n_tokens: n_tokens as u32,
+            _pad: 0,
+        };
+        let params_buf = self.gpu.create_params_buffer(&params);
+
+        let pipeline = &self.gpu.pipelines.matmul;
+        let bind = self.gpu.make_bind_group(
+            pipeline,
+            &[float.weight_buffer(), in_buf, out_buf, &params_buf],
+        );
+
+        // Workgroup dispatch: x = row & 65535, y = row >> 16, z = tok.
+        let rows = float.out_features();
+        let dx = (rows.min(65535)) as u32;
+        let dy = ((rows + 65534) / 65535) as u32;
+        let dz = n_tokens as u32;
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_engine.matmul.pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(dx, dy, dz);
     }
 
     /// GPU-native dispatch of the per-token final RMSNorm using the
@@ -251,6 +448,122 @@ impl GpuEngine {
         let pre_norm = self.cpu.forward_pre_norm(tokens, start_pos);
         let normed = self.dispatch_final_norm(&pre_norm, tokens.len());
         self.cpu.finalize_logits(&normed, tokens.len())
+    }
+
+    /// Run one transformer block fully on GPU. Reads `hidden_buf` (shape
+    /// `[n_tokens, embed_dim]`), modifies it in place with the post-block
+    /// hidden state. All intermediate scratch buffers must be supplied by
+    /// the caller — `forward_blocks_gpu` allocates them once and reuses
+    /// across all blocks.
+    ///
+    /// Caveats (will be lifted in later phases):
+    /// - Q/K/V biases (Qwen2) ignored: panics if any are set.
+    /// - Attention sub-norm (BitNet) ignored: panics if set.
+    /// - FFN sub-norm (BitNet) ignored: panics if set.
+    /// - Residual scales must be 1.0.
+    /// - FFN must be a `SwiGLU` with `SiLU` activation.
+    /// - Matvec layers must be `GpuFloatLinear` (ternary fused not yet built).
+    /// - For prefill mode (no historical KV cache): `start_pos = 0`. Cached
+    ///   decoding lands in #9 along with the resident KV cache.
+    pub fn forward_block_gpu(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        block_idx: usize,
+        hidden_buf: &wgpu::Buffer,
+        n_tokens: usize,
+        start_pos: usize,
+        scratch: &BlockScratch,
+    ) {
+        let block = &self.cpu.blocks()[block_idx];
+        let block_gpu = &self.blocks_gpu[block_idx];
+        let attn = block.attention();
+
+        assert!(attn.q_bias().is_none() && attn.k_bias().is_none() && attn.v_bias().is_none(),
+            "forward_block_gpu does not support Q/K/V biases yet (Qwen2)");
+        assert!(attn.o_sub_norm().is_none(),
+            "forward_block_gpu does not support attention sub-norm yet (BitNet)");
+        assert!((block.attn_residual_scale() - 1.0).abs() < f32::EPSILON,
+            "forward_block_gpu requires attn_residual_scale == 1.0");
+        assert!((block.ffn_residual_scale() - 1.0).abs() < f32::EPSILON,
+            "forward_block_gpu requires ffn_residual_scale == 1.0");
+
+        let swiglu = block.ffn().as_any()
+            .downcast_ref::<crate::layers::swiglu::SwiGLU>()
+            .unwrap_or_else(|| panic!("forward_block_gpu requires SwiGLU FFN"));
+        assert!(swiglu.sub_norm().is_none(),
+            "forward_block_gpu does not support FFN sub-norm yet (BitNet)");
+        assert_eq!(swiglu.activation(), crate::layers::swiglu::GateActivation::SiLU,
+            "forward_block_gpu only supports SiLU activation");
+
+        let n_heads = attn.n_heads();
+        let n_kv_heads = attn.n_kv_heads();
+        let head_dim = attn.head_dim();
+        let embed_dim = self.embed_dim;
+        let intermediate = swiglu.intermediate_size();
+
+        assert!(start_pos + n_tokens <= self.rope_max_seq,
+            "start_pos + n_tokens ({}) exceeds rope_max_seq ({})",
+            start_pos + n_tokens, self.rope_max_seq);
+
+        // ===== ATTENTION SUBLAYER =====
+
+        // 1. attn_norm: hidden -> normed
+        self.dispatch_rmsnorm_into(
+            encoder, hidden_buf, &block_gpu.attn_norm_weight_buf, &scratch.normed,
+            embed_dim, n_tokens, block_gpu.attn_norm_eps,
+        );
+
+        // 2-4. Q, K, V projections (batch matmul)
+        self.dispatch_matmul_into(encoder, attn.q_proj(), &scratch.normed, &scratch.q, n_tokens);
+        self.dispatch_matmul_into(encoder, attn.k_proj(), &scratch.normed, &scratch.k, n_tokens);
+        self.dispatch_matmul_into(encoder, attn.v_proj(), &scratch.normed, &scratch.v, n_tokens);
+
+        // 5. RoPE on Q and K
+        self.dispatch_rope_into(
+            encoder, &scratch.q, &self.rope_cos_buf, &self.rope_sin_buf,
+            n_heads, head_dim, start_pos, n_tokens,
+        );
+        self.dispatch_rope_into(
+            encoder, &scratch.k, &self.rope_cos_buf, &self.rope_sin_buf,
+            n_kv_heads, head_dim, start_pos, n_tokens,
+        );
+
+        // 6. Attention math: Q · K^T, softmax, weighted V. For prefill mode
+        //    start_pos=0 and max_seq=n_tokens (the K/V buffers ARE the cache).
+        self.dispatch_attention_into(
+            encoder,
+            &scratch.q, &scratch.k, &scratch.v,
+            &scratch.scores, &scratch.attn_out,
+            n_heads, n_kv_heads, head_dim,
+            start_pos, n_tokens, n_tokens,
+        );
+
+        // 7. O projection: attn_out -> projected
+        self.dispatch_matmul_into(encoder, attn.o_proj(), &scratch.attn_out, &scratch.projected, n_tokens);
+
+        // 8. Residual: hidden += projected
+        self.dispatch_add_into(encoder, hidden_buf, &scratch.projected, embed_dim, n_tokens);
+
+        // ===== FFN SUBLAYER =====
+
+        // 9. ffn_norm: hidden -> normed
+        self.dispatch_rmsnorm_into(
+            encoder, hidden_buf, &block_gpu.ffn_norm_weight_buf, &scratch.normed,
+            embed_dim, n_tokens, block_gpu.ffn_norm_eps,
+        );
+
+        // 10-11. Gate / Up projections
+        self.dispatch_matmul_into(encoder, swiglu.gate_proj(), &scratch.normed, &scratch.gate, n_tokens);
+        self.dispatch_matmul_into(encoder, swiglu.up_proj(),   &scratch.normed, &scratch.up,   n_tokens);
+
+        // 12. silu(gate) * up
+        self.dispatch_silu_mul_into(encoder, &scratch.gate, &scratch.up, &scratch.activated, intermediate, n_tokens);
+
+        // 13. Down projection
+        self.dispatch_matmul_into(encoder, swiglu.down_proj(), &scratch.activated, &scratch.projected, n_tokens);
+
+        // 14. Residual: hidden += projected
+        self.dispatch_add_into(encoder, hidden_buf, &scratch.projected, embed_dim, n_tokens);
     }
 
     /// Dispatch a single-vector matvec on GPU using the given layer's
@@ -1207,6 +1520,196 @@ mod tests {
 
         for (i, (c, g)) in cpu_out.iter().zip(&gpu_out).enumerate() {
             assert!((c - g).abs() < 1e-4, "elem {i}: cpu={c} gpu={g}");
+        }
+    }
+
+    /// Build a TransformerModel where every linear layer is GpuFloatLinear,
+    /// suitable for the fused-forward path. Same shape as `toy_model()`
+    /// but with float weights instead of ternary, and resident on GPU.
+    fn toy_float_model_for_gpu(gpu: Arc<GpuDevice>) -> TransformerModel {
+        use crate::layers::attention::MultiHeadAttention;
+        use crate::layers::ffn::FeedForward;
+        use crate::layers::floatlinear::FloatLinear;
+        use crate::layers::gpu_floatlinear::GpuFloatLinear;
+        use crate::layers::model::OutputProjection;
+        use crate::layers::rmsnorm::RmsNorm;
+        use crate::layers::swiglu::SwiGLU;
+        use crate::layers::transformer::TransformerBlock;
+
+        let embed_dim = 4;
+        let n_heads = 1;
+        let head_dim = embed_dim;
+        let intermediate = 4;
+        let vocab_size = 4;
+
+        // Deterministic small float weights.
+        let mut rng: u64 = 0xF1A7_FACE;
+        let mut roll = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng >> 33) as i32 % 200 - 100) as f32 * 0.01
+        };
+        let mk_tensor = |rows: usize, cols: usize, roll: &mut dyn FnMut() -> f32| -> FloatTensor {
+            FloatTensor::new((0..rows * cols).map(|_| roll()).collect(), vec![rows, cols])
+        };
+        let mk_gpu = |rows: usize, cols: usize, roll: &mut dyn FnMut() -> f32| -> Box<dyn crate::layers::linear::LinearLayer> {
+            Box::new(GpuFloatLinear::from_float_tensor(gpu.clone(), mk_tensor(rows, cols, roll)))
+        };
+
+        let embedding = mk_tensor(vocab_size, embed_dim, &mut roll);
+
+        let q = mk_gpu(embed_dim, embed_dim, &mut roll);
+        let k = mk_gpu(embed_dim, embed_dim, &mut roll);
+        let v = mk_gpu(embed_dim, embed_dim, &mut roll);
+        let o = mk_gpu(embed_dim, embed_dim, &mut roll);
+        let attention = MultiHeadAttention::with_rope_layout(
+            q, k, v, o, n_heads, n_heads, head_dim, 10000.0,
+            crate::layers::rope::RoPELayout::Halved,
+        );
+
+        let gate = mk_gpu(intermediate, embed_dim, &mut roll);
+        let up   = mk_gpu(intermediate, embed_dim, &mut roll);
+        let down = mk_gpu(embed_dim, intermediate, &mut roll);
+        let ffn: Box<dyn FeedForward> = Box::new(SwiGLU::new(gate, up, down));
+
+        let attn_norm = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
+        let ffn_norm = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
+        let block = TransformerBlock::new(attn_norm, attention, ffn_norm, ffn);
+
+        let final_norm = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
+        // Use a separate float output projection so we don't tangle the test
+        // with tied-embedding logic that runs CPU-side anyway.
+        let out_proj = mk_tensor(vocab_size, embed_dim, &mut roll);
+        TransformerModel::new(embedding, vec![block], final_norm, OutputProjection::Float(out_proj))
+    }
+
+    /// Build a CPU-equivalent TransformerModel sharing the same weights as
+    /// `toy_float_model_for_gpu` — needed to compare GPU forward output to
+    /// a CPU reference. The two models use the same `roll` seed and produce
+    /// identical-tolerance outputs (subject to f16 rounding in GpuFloatLinear).
+    fn toy_float_model_cpu_reference() -> TransformerModel {
+        use crate::layers::attention::MultiHeadAttention;
+        use crate::layers::ffn::FeedForward;
+        use crate::layers::floatlinear::FloatLinear;
+        use crate::layers::model::OutputProjection;
+        use crate::layers::rmsnorm::RmsNorm;
+        use crate::layers::swiglu::SwiGLU;
+        use crate::layers::transformer::TransformerBlock;
+
+        let embed_dim = 4;
+        let n_heads = 1;
+        let head_dim = embed_dim;
+        let intermediate = 4;
+        let vocab_size = 4;
+
+        let mut rng: u64 = 0xF1A7_FACE;
+        let mut roll = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng >> 33) as i32 % 200 - 100) as f32 * 0.01
+        };
+        let mk_tensor = |rows: usize, cols: usize, roll: &mut dyn FnMut() -> f32| -> FloatTensor {
+            FloatTensor::new((0..rows * cols).map(|_| roll()).collect(), vec![rows, cols])
+        };
+        let mk_cpu = |rows: usize, cols: usize, roll: &mut dyn FnMut() -> f32| -> Box<dyn crate::layers::linear::LinearLayer> {
+            Box::new(FloatLinear::from_float_tensor(mk_tensor(rows, cols, roll)))
+        };
+
+        let embedding = mk_tensor(vocab_size, embed_dim, &mut roll);
+        let q = mk_cpu(embed_dim, embed_dim, &mut roll);
+        let k = mk_cpu(embed_dim, embed_dim, &mut roll);
+        let v = mk_cpu(embed_dim, embed_dim, &mut roll);
+        let o = mk_cpu(embed_dim, embed_dim, &mut roll);
+        let attention = MultiHeadAttention::with_rope_layout(
+            q, k, v, o, n_heads, n_heads, head_dim, 10000.0,
+            crate::layers::rope::RoPELayout::Halved,
+        );
+
+        let gate = mk_cpu(intermediate, embed_dim, &mut roll);
+        let up   = mk_cpu(intermediate, embed_dim, &mut roll);
+        let down = mk_cpu(embed_dim, intermediate, &mut roll);
+        let ffn: Box<dyn FeedForward> = Box::new(SwiGLU::new(gate, up, down));
+
+        let attn_norm = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
+        let ffn_norm = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
+        let block = TransformerBlock::new(attn_norm, attention, ffn_norm, ffn);
+
+        let final_norm = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
+        let out_proj = mk_tensor(vocab_size, embed_dim, &mut roll);
+        TransformerModel::new(embedding, vec![block], final_norm, OutputProjection::Float(out_proj))
+    }
+
+    #[test]
+    fn forward_block_gpu_matches_cpu_block() {
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let cpu_ref = toy_float_model_cpu_reference();
+        let n_tokens = 3;
+        let tokens: Vec<u32> = (0..n_tokens as u32).collect();
+
+        // CPU reference: embedding lookup + one block.forward.
+        let embed_data = cpu_ref.embedding_data();
+        let embed_dim = cpu_ref.embed_dim();
+        let mut hidden_cpu: Vec<f32> = Vec::with_capacity(n_tokens * embed_dim);
+        for &t in &tokens {
+            let off = t as usize * embed_dim;
+            hidden_cpu.extend_from_slice(&embed_data[off..off + embed_dim]);
+        }
+        let cpu_out = cpu_ref.blocks()[0].forward(&hidden_cpu, n_tokens, /*start_pos*/ 0);
+
+        // GPU path
+        let gpu_model = toy_float_model_for_gpu(gpu.clone());
+        let engine = GpuEngine::with_max_seq(gpu_model, gpu.clone(), 16);
+
+        // Upload the same hidden-state input.
+        let bytes = (n_tokens * embed_dim * 4) as u64;
+        let hidden_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("test.hidden"),
+            contents: bytemuck::cast_slice(&hidden_cpu),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let staging = gpu.create_staging_buffer(bytes);
+
+        let attn0 = engine.cpu().blocks()[0].attention();
+        let intermediate = engine.cpu().blocks()[0].ffn().out_features(); // == embed_dim
+        let _ = intermediate;
+        // FFN intermediate = SwiGLU.intermediate_size; access via downcast.
+        let intermediate = engine.cpu().blocks()[0].ffn().as_any()
+            .downcast_ref::<crate::layers::swiglu::SwiGLU>().unwrap()
+            .intermediate_size();
+
+        let scratch = BlockScratch::allocate(
+            &gpu, n_tokens, embed_dim,
+            attn0.n_heads(), attn0.n_kv_heads(), attn0.head_dim(),
+            intermediate, /*max_seq*/ n_tokens,
+        );
+
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test.encoder"),
+        });
+        engine.forward_block_gpu(&mut encoder, 0, &hidden_buf, n_tokens, 0, &scratch);
+        encoder.copy_buffer_to_buffer(&hidden_buf, 0, &staging, 0, bytes);
+        gpu.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+        gpu.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        let gpu_out: Vec<f32> = data.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        drop(data); staging.unmap();
+
+        assert_eq!(cpu_out.len(), gpu_out.len(), "shape mismatch");
+        // f16 weight rounding inside GpuFloatLinear vs CPU FloatLinear's f32
+        // weights — generous tolerance. For the toy 4-dim values this is
+        // tight enough to catch real bugs; loosen if the dim grows.
+        for (i, (c, g)) in cpu_out.iter().zip(&gpu_out).enumerate() {
+            assert!(
+                (c - g).abs() < 0.01,
+                "elem {i}: cpu={c} gpu={g} (diff={})",
+                (c - g).abs()
+            );
         }
     }
 
