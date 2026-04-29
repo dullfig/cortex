@@ -145,6 +145,10 @@ struct GpuBlock {
     attn_norm_eps: f32,
     ffn_norm_weight_buf: wgpu::Buffer,
     ffn_norm_eps: f32,
+    /// Optional Q/K/V biases (Qwen2 family). None for most LLaMA-style models.
+    q_bias_buf: Option<wgpu::Buffer>,
+    k_bias_buf: Option<wgpu::Buffer>,
+    v_bias_buf: Option<wgpu::Buffer>,
 }
 
 /// Per-block scratch buffers reused across all dispatches inside a single
@@ -249,10 +253,18 @@ impl GpuEngine {
         let final_norm_eps = final_norm.eps();
         let embed_dim = cpu.embed_dim();
 
-        // Per-block norms
+        // Per-block norms + optional Q/K/V biases (Qwen2)
+        let upload_bias = |bias: &[f32], i: usize, name: &str| -> wgpu::Buffer {
+            gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(&format!("gpu_engine.block{i}.{name}_bias")),
+                contents: bytemuck::cast_slice(bias),
+                usage: wgpu::BufferUsages::STORAGE,
+            })
+        };
         let blocks_gpu: Vec<GpuBlock> = cpu.blocks().iter().enumerate().map(|(i, blk)| {
             let an = blk.attn_norm();
             let fn_ = blk.ffn_norm();
+            let attn = blk.attention();
             GpuBlock {
                 attn_norm_weight_buf: gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some(&format!("gpu_engine.block{i}.attn_norm.weight")),
@@ -266,6 +278,9 @@ impl GpuEngine {
                     usage: wgpu::BufferUsages::STORAGE,
                 }),
                 ffn_norm_eps: fn_.eps(),
+                q_bias_buf: attn.q_bias().map(|b| upload_bias(b, i, "q")),
+                k_bias_buf: attn.k_bias().map(|b| upload_bias(b, i, "k")),
+                v_bias_buf: attn.v_bias().map(|b| upload_bias(b, i, "v")),
             }
         }).collect();
 
@@ -500,20 +515,28 @@ impl GpuEngine {
             attn0.n_heads(), attn0.n_kv_heads(), attn0.head_dim(),
             intermediate, n_tokens,
         );
-
-        // ---- 2-3. All blocks + final_norm in one encoder ----
-        let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("forward_full.encoder"),
-        });
+        // Per-block submit (one encoder per layer) keeps intra-block fusion
+        // (~14 dispatches share an encoder) but lets the queue drain between
+        // blocks. Single-encoder over all 36 blocks runs into a wgpu
+        // validation error specific to large-tensor models like Qwen 3B
+        // (toy 30-block models work fine in one encoder); investigation
+        // pending.
         for i in 0..self.cpu.n_layers() {
+            let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("forward_full.block_encoder"),
+            });
             self.forward_block_gpu(&mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch);
+            self.gpu.queue.submit(Some(encoder.finish()));
         }
+        let mut tail_encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("forward_full.tail_encoder"),
+        });
         self.dispatch_rmsnorm_into(
-            &mut encoder, &hidden_buf, &self.final_norm_weight_buf, &normed_buf,
+            &mut tail_encoder, &hidden_buf, &self.final_norm_weight_buf, &normed_buf,
             self.embed_dim, n_tokens, self.final_norm_eps,
         );
-        encoder.copy_buffer_to_buffer(&normed_buf, 0, &staging, 0, bytes);
-        self.gpu.queue.submit(Some(encoder.finish()));
+        tail_encoder.copy_buffer_to_buffer(&normed_buf, 0, &staging, 0, bytes);
+        self.gpu.queue.submit(Some(tail_encoder.finish()));
 
         // ---- Read back final-normed hidden state ----
         let slice = staging.slice(..);
@@ -559,8 +582,6 @@ impl GpuEngine {
         let block_gpu = &self.blocks_gpu[block_idx];
         let attn = block.attention();
 
-        assert!(attn.q_bias().is_none() && attn.k_bias().is_none() && attn.v_bias().is_none(),
-            "forward_block_gpu does not support Q/K/V biases yet (Qwen2)");
         assert!(attn.o_sub_norm().is_none(),
             "forward_block_gpu does not support attention sub-norm yet (BitNet)");
         assert!((block.attn_residual_scale() - 1.0).abs() < f32::EPSILON,
@@ -594,10 +615,21 @@ impl GpuEngine {
             embed_dim, n_tokens, block_gpu.attn_norm_eps,
         );
 
-        // 2-4. Q, K, V projections (batch matmul)
+        // 2-4. Q, K, V projections (batch matmul) + optional Qwen-style biases
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
         self.dispatch_matmul_into(encoder, attn.q_proj(), &scratch.normed, &scratch.q, n_tokens);
+        if let Some(buf) = block_gpu.q_bias_buf.as_ref() {
+            self.dispatch_bias_add_into(encoder, &scratch.q, buf, q_dim, n_tokens);
+        }
         self.dispatch_matmul_into(encoder, attn.k_proj(), &scratch.normed, &scratch.k, n_tokens);
+        if let Some(buf) = block_gpu.k_bias_buf.as_ref() {
+            self.dispatch_bias_add_into(encoder, &scratch.k, buf, kv_dim, n_tokens);
+        }
         self.dispatch_matmul_into(encoder, attn.v_proj(), &scratch.normed, &scratch.v, n_tokens);
+        if let Some(buf) = block_gpu.v_bias_buf.as_ref() {
+            self.dispatch_bias_add_into(encoder, &scratch.v, buf, kv_dim, n_tokens);
+        }
 
         // 5. RoPE on Q and K
         self.dispatch_rope_into(
@@ -933,6 +965,38 @@ impl GpuEngine {
 
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("gpu_engine.silu_mul.pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(groups, 1, 1);
+    }
+
+    /// Dispatch broadcast bias add: `a[tok, i] += bias[i]` for all tokens.
+    /// Used for Q/K/V projection biases in Qwen-family models.
+    pub fn dispatch_bias_add_into(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        a_buf: &wgpu::Buffer,
+        bias_buf: &wgpu::Buffer,
+        n: usize,
+        n_tokens: usize,
+    ) {
+        // Reuses AddInplaceBatchParams layout (n, n_tokens — same shape).
+        let params = AddInplaceBatchParams { n: n as u32, n_tokens: n_tokens as u32 };
+        let params_buf = self.gpu.create_params_buffer(&params);
+
+        let pipeline = &self.gpu.pipelines.bias_add_batch;
+        let bind = self.gpu.make_bind_group(
+            pipeline,
+            &[a_buf, bias_buf, &params_buf],
+        );
+
+        let total = (n * n_tokens) as u32;
+        let groups = (total + 255) / 256;
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_engine.bias_add.pass"),
             timestamp_writes: None,
         });
         pass.set_pipeline(pipeline);
@@ -1828,6 +1892,101 @@ mod tests {
         TransformerModel::new(embedding, blocks, final_norm, OutputProjection::Float(out_proj))
     }
 
+    /// Build CPU + GPU one-block models with Q/K/V biases set, sharing the
+    /// same seeded weights (deterministic RNG state). Used to validate the
+    /// bias dispatch path lights up correctly.
+    fn toy_with_biases_pair(gpu: Arc<GpuDevice>) -> (TransformerModel, TransformerModel) {
+        let cpu = build_toy_with_biases(None);
+        let gpu_model = build_toy_with_biases(Some(gpu));
+        (cpu, gpu_model)
+    }
+
+    /// One-block model with biases. If `gpu` is Some, layers are GpuFloatLinear;
+    /// otherwise CPU FloatLinear. Same RNG seed → identical weights.
+    fn build_toy_with_biases(gpu: Option<Arc<GpuDevice>>) -> TransformerModel {
+        use crate::layers::attention::MultiHeadAttention;
+        use crate::layers::ffn::FeedForward;
+        use crate::layers::floatlinear::FloatLinear;
+        use crate::layers::gpu_floatlinear::GpuFloatLinear;
+        use crate::layers::model::OutputProjection;
+        use crate::layers::rmsnorm::RmsNorm;
+        use crate::layers::swiglu::SwiGLU;
+        use crate::layers::transformer::TransformerBlock;
+
+        let embed_dim = 4;
+        let n_heads = 1;
+        let head_dim = embed_dim;
+        let intermediate = 4;
+        let vocab_size = 4;
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_heads * head_dim;
+
+        let mut rng: u64 = 0xB1A5_C0DE;
+        let mut roll = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng >> 33) as i32 % 200 - 100) as f32 * 0.01
+        };
+
+        let mk_tensor = |rows: usize, cols: usize, roll: &mut dyn FnMut() -> f32| -> FloatTensor {
+            FloatTensor::new((0..rows * cols).map(|_| roll()).collect(), vec![rows, cols])
+        };
+        let mk_layer = |rows: usize, cols: usize, roll: &mut dyn FnMut() -> f32|
+            -> Box<dyn crate::layers::linear::LinearLayer> {
+            let t = mk_tensor(rows, cols, roll);
+            match &gpu {
+                Some(g) => Box::new(GpuFloatLinear::from_float_tensor(g.clone(), t)),
+                None    => Box::new(FloatLinear::from_float_tensor(t)),
+            }
+        };
+
+        let embedding = mk_tensor(vocab_size, embed_dim, &mut roll);
+        let q = mk_layer(embed_dim, embed_dim, &mut roll);
+        let k = mk_layer(embed_dim, embed_dim, &mut roll);
+        let v = mk_layer(embed_dim, embed_dim, &mut roll);
+        let o = mk_layer(embed_dim, embed_dim, &mut roll);
+        let mut attention = MultiHeadAttention::with_rope_layout(
+            q, k, v, o, n_heads, n_heads, head_dim, 10000.0,
+            crate::layers::rope::RoPELayout::Halved,
+        );
+        let q_bias: Vec<f32> = (0..q_dim).map(|_| roll()).collect();
+        let k_bias: Vec<f32> = (0..kv_dim).map(|_| roll()).collect();
+        let v_bias: Vec<f32> = (0..kv_dim).map(|_| roll()).collect();
+        attention.set_biases(q_bias, k_bias, v_bias);
+
+        let gate = mk_layer(intermediate, embed_dim, &mut roll);
+        let up   = mk_layer(intermediate, embed_dim, &mut roll);
+        let down = mk_layer(embed_dim, intermediate, &mut roll);
+        let ffn: Box<dyn FeedForward> = Box::new(SwiGLU::new(gate, up, down));
+        let attn_norm = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
+        let ffn_norm = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
+        let block = TransformerBlock::new(attn_norm, attention, ffn_norm, ffn);
+        let final_norm = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
+        let out_proj = mk_tensor(vocab_size, embed_dim, &mut roll);
+        TransformerModel::new(embedding, vec![block], final_norm, OutputProjection::Float(out_proj))
+    }
+
+    #[test]
+    fn forward_full_gpu_matches_cpu_with_biases() {
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let (cpu_ref, gpu_model) = toy_with_biases_pair(gpu.clone());
+        let engine = GpuEngine::with_max_seq(gpu_model, gpu, 16);
+
+        let tokens = vec![0u32, 1, 2];
+        let cpu_logits = cpu_ref.forward(&tokens, 0);
+        let gpu_logits = engine.forward_full_gpu(&tokens, 0);
+
+        assert_eq!(cpu_logits.len(), gpu_logits.len());
+        for (i, (c, g)) in cpu_logits.iter().zip(&gpu_logits).enumerate() {
+            assert!(
+                (c - g).abs() < 0.05,
+                "logit {i}: cpu={c} gpu={g} (diff={})",
+                (c - g).abs()
+            );
+        }
+    }
+
     #[test]
     fn forward_full_gpu_matches_cpu_single_block() {
         let Some(gpu) = GpuDevice::try_new() else { return };
@@ -1849,6 +2008,22 @@ mod tests {
                 (c - g).abs()
             );
         }
+    }
+
+    #[test]
+    fn forward_full_gpu_thirty_blocks_no_crash() {
+        // Reproducer for the validation error that hits the bench at ~block
+        // 26 with Qwen 3B. Just runs forward without comparing to CPU
+        // (32-block deep f16 chains diverge precision-wise; this test only
+        // cares about "does it complete without a wgpu validation panic").
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let gpu_model = toy_float_multi_block_for_gpu(gpu.clone(), 30);
+        let engine = GpuEngine::with_max_seq(gpu_model, gpu.clone(), 16);
+
+        let tokens = vec![0u32, 1, 2];
+        let _ = engine.forward_full_gpu(&tokens, 0); // must not panic
     }
 
     #[test]

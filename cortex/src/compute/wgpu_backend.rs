@@ -214,6 +214,8 @@ pub struct Pipelines {
     pub attn_value_batch: wgpu::ComputePipeline,
     // Resident-weight ternary path (GpuBitLinear)
     pub ternary_matvec: wgpu::ComputePipeline,
+    // Broadcast bias add (Q/K/V biases for Qwen-family)
+    pub bias_add_batch: wgpu::ComputePipeline,
 }
 
 impl Pipelines {
@@ -276,6 +278,7 @@ impl Pipelines {
             attn_value_batch: make(include_str!("shaders/attn_value_batch.wgsl"), "attn_value_batch"),
             // Resident-weight ternary path — entry point differs from "main"
             ternary_matvec: make_with_entry(TERNARY_SHADER, "ternary_matvec_resident", "ternary_matvec"),
+            bias_add_batch: make(include_str!("shaders/bias_add_batch.wgsl"), "bias_add_batch"),
         }
     }
 }
@@ -334,7 +337,7 @@ impl GpuDevice {
         .ok()?;
 
         let pipelines = Pipelines::compile(&device);
-        tracing::info!("compiled 23 GPU compute pipelines");
+        tracing::info!("compiled 24 GPU compute pipelines");
 
         Some(Self { device, queue, pipelines })
     }
@@ -364,15 +367,24 @@ impl GpuDevice {
     }
 
     /// Create a uniform buffer from a bytemuck-able params struct.
+    ///
+    /// Uses `queue.write_buffer` to populate the data rather than
+    /// `create_buffer_init`. The latter uses an internal staging belt that
+    /// could not recycle reliably across hundreds of per-dispatch params
+    /// buffers — we hit a "staging buffer in bind group" validation error
+    /// around the 200th call. `queue.write_buffer` manages its own staging
+    /// at the queue level and is the wgpu-recommended pattern for frequent
+    /// small writes.
     pub fn create_params_buffer<T: bytemuck::Pod>(&self, params: &T) -> wgpu::Buffer {
-        wgpu::util::DeviceExt::create_buffer_init(
-            &self.device,
-            &wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytemuck::bytes_of(params),
-                usage: wgpu::BufferUsages::UNIFORM,
-            },
-        )
+        let size = std::mem::size_of::<T>() as u64;
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&buf, 0, bytemuck::bytes_of(params));
+        buf
     }
 
     /// Create a storage buffer with initial data.
@@ -837,9 +849,9 @@ mod tests {
 
     #[test]
     fn gpu_device_creation() {
-        // Test that GpuDevice compiles all 23 pipelines
+        // Test that GpuDevice compiles all 24 pipelines
         let Some(_gpu) = GpuDevice::try_new() else { return };
-        // If we got here, all 23 shaders compiled successfully
+        // If we got here, all 24 shaders compiled successfully
     }
 
     #[test]
