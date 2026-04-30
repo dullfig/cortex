@@ -2027,6 +2027,294 @@ mod tests {
     }
 
     #[test]
+    fn forward_full_gpu_fifty_blocks_no_crash() {
+        // Bisection probe for the Qwen failure: if dispatch count is the
+        // culprit (~494 dispatches at the Qwen failure point), 50 toy
+        // blocks × 16 dispatches = 800 dispatches should reproduce.
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let gpu_model = toy_float_multi_block_for_gpu(gpu.clone(), 50);
+        let engine = GpuEngine::with_max_seq(gpu_model, gpu.clone(), 16);
+
+        let tokens = vec![0u32, 1, 2];
+        let _ = engine.forward_full_gpu(&tokens, 0);
+    }
+
+    /// Multi-block toy model WITH Q/K/V biases set.
+    fn toy_float_multi_block_with_biases_for_gpu(
+        gpu: Arc<GpuDevice>, n_blocks: usize,
+    ) -> TransformerModel {
+        use crate::layers::attention::MultiHeadAttention;
+        use crate::layers::ffn::FeedForward;
+        use crate::layers::gpu_floatlinear::GpuFloatLinear;
+        use crate::layers::model::OutputProjection;
+        use crate::layers::rmsnorm::RmsNorm;
+        use crate::layers::swiglu::SwiGLU;
+        use crate::layers::transformer::TransformerBlock;
+
+        let embed_dim = 4;
+        let n_heads = 1;
+        let head_dim = embed_dim;
+        let intermediate = 4;
+        let vocab_size = 4;
+        let q_dim = n_heads * head_dim;
+
+        let mut rng: u64 = 0xBEAD_BEAD;
+        let mut roll = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng >> 33) as i32 % 200 - 100) as f32 * 0.01
+        };
+        let mk_tensor = |rows: usize, cols: usize, roll: &mut dyn FnMut() -> f32| -> FloatTensor {
+            FloatTensor::new((0..rows * cols).map(|_| roll()).collect(), vec![rows, cols])
+        };
+        let mk_gpu = |rows: usize, cols: usize, roll: &mut dyn FnMut() -> f32| -> Box<dyn crate::layers::linear::LinearLayer> {
+            Box::new(GpuFloatLinear::from_float_tensor(gpu.clone(), mk_tensor(rows, cols, roll)))
+        };
+
+        let embedding = mk_tensor(vocab_size, embed_dim, &mut roll);
+        let mut blocks = Vec::with_capacity(n_blocks);
+        for _ in 0..n_blocks {
+            let q = mk_gpu(embed_dim, embed_dim, &mut roll);
+            let k = mk_gpu(embed_dim, embed_dim, &mut roll);
+            let v = mk_gpu(embed_dim, embed_dim, &mut roll);
+            let o = mk_gpu(embed_dim, embed_dim, &mut roll);
+            let mut attention = MultiHeadAttention::with_rope_layout(
+                q, k, v, o, n_heads, n_heads, head_dim, 10000.0,
+                crate::layers::rope::RoPELayout::Halved,
+            );
+            let qb: Vec<f32> = (0..q_dim).map(|_| roll()).collect();
+            let kb: Vec<f32> = (0..q_dim).map(|_| roll()).collect();
+            let vb: Vec<f32> = (0..q_dim).map(|_| roll()).collect();
+            attention.set_biases(qb, kb, vb);
+
+            let gate = mk_gpu(intermediate, embed_dim, &mut roll);
+            let up   = mk_gpu(intermediate, embed_dim, &mut roll);
+            let down = mk_gpu(embed_dim, intermediate, &mut roll);
+            let ffn: Box<dyn FeedForward> = Box::new(SwiGLU::new(gate, up, down));
+            let attn_norm = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
+            let ffn_norm = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
+            blocks.push(TransformerBlock::new(attn_norm, attention, ffn_norm, ffn));
+        }
+        let final_norm = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
+        let out_proj = mk_tensor(vocab_size, embed_dim, &mut roll);
+        TransformerModel::new(embedding, blocks, final_norm, OutputProjection::Float(out_proj))
+    }
+
+    /// Larger-tensor multi-block model. n_heads != n_kv_heads (GQA).
+    fn toy_gqa_multi_block_for_gpu(
+        gpu: Arc<GpuDevice>, n_blocks: usize,
+        embed_dim: usize, intermediate: usize,
+        n_heads: usize, n_kv_heads: usize,
+    ) -> TransformerModel {
+        toy_gqa_multi_block_for_gpu_inner(gpu, n_blocks, embed_dim, intermediate, n_heads, n_kv_heads, /*with_biases*/ false)
+    }
+
+    fn toy_gqa_multi_block_for_gpu_inner(
+        gpu: Arc<GpuDevice>, n_blocks: usize,
+        embed_dim: usize, intermediate: usize,
+        n_heads: usize, n_kv_heads: usize,
+        with_biases: bool,
+    ) -> TransformerModel {
+        use crate::layers::attention::MultiHeadAttention;
+        use crate::layers::ffn::FeedForward;
+        use crate::layers::gpu_floatlinear::GpuFloatLinear;
+        use crate::layers::model::OutputProjection;
+        use crate::layers::rmsnorm::RmsNorm;
+        use crate::layers::swiglu::SwiGLU;
+        use crate::layers::transformer::TransformerBlock;
+
+        let head_dim = embed_dim / n_heads;
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let vocab_size = 32;
+
+        let mut rng: u64 = 0xCAFE_F00D;
+        let mut roll = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng >> 33) as i32 % 200 - 100) as f32 * 0.001
+        };
+        let mk_tensor = |rows: usize, cols: usize, roll: &mut dyn FnMut() -> f32| -> FloatTensor {
+            FloatTensor::new((0..rows * cols).map(|_| roll()).collect(), vec![rows, cols])
+        };
+        let mk_gpu = |rows: usize, cols: usize, roll: &mut dyn FnMut() -> f32| -> Box<dyn crate::layers::linear::LinearLayer> {
+            Box::new(GpuFloatLinear::from_float_tensor(gpu.clone(), mk_tensor(rows, cols, roll)))
+        };
+
+        let embedding = mk_tensor(vocab_size, embed_dim, &mut roll);
+        let mut blocks = Vec::with_capacity(n_blocks);
+        for _ in 0..n_blocks {
+            let q = mk_gpu(q_dim, embed_dim, &mut roll);
+            let k = mk_gpu(kv_dim, embed_dim, &mut roll);
+            let v = mk_gpu(kv_dim, embed_dim, &mut roll);
+            let o = mk_gpu(embed_dim, q_dim, &mut roll);
+            let mut attention = MultiHeadAttention::with_rope_layout(
+                q, k, v, o, n_heads, n_kv_heads, head_dim, 10000.0,
+                crate::layers::rope::RoPELayout::Halved,
+            );
+            if with_biases {
+                let qb: Vec<f32> = (0..q_dim).map(|_| roll()).collect();
+                let kb: Vec<f32> = (0..kv_dim).map(|_| roll()).collect();
+                let vb: Vec<f32> = (0..kv_dim).map(|_| roll()).collect();
+                attention.set_biases(qb, kb, vb);
+            }
+            let gate = mk_gpu(intermediate, embed_dim, &mut roll);
+            let up   = mk_gpu(intermediate, embed_dim, &mut roll);
+            let down = mk_gpu(embed_dim, intermediate, &mut roll);
+            let ffn: Box<dyn FeedForward> = Box::new(SwiGLU::new(gate, up, down));
+            let attn_norm = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
+            let ffn_norm = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
+            blocks.push(TransformerBlock::new(attn_norm, attention, ffn_norm, ffn));
+        }
+        let final_norm = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
+        let out_proj = mk_tensor(vocab_size, embed_dim, &mut roll);
+        TransformerModel::new(embedding, blocks, final_norm, OutputProjection::Float(out_proj))
+    }
+
+    #[test]
+    fn forward_full_gpu_qwen_shaped_with_biases_no_crash() {
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let gpu_model = toy_gqa_multi_block_for_gpu_inner(
+            gpu.clone(), 36,
+            /*embed*/ 2048, /*intermediate*/ 11008,
+            /*n_heads*/ 16, /*n_kv_heads*/ 2,
+            /*with_biases*/ true,
+        );
+        let engine = GpuEngine::with_max_seq(gpu_model, gpu.clone(), 16);
+        let tokens = vec![0u32, 1, 2];
+        let _ = engine.forward_full_gpu(&tokens, 0);
+    }
+
+    #[test]
+    #[ignore = "loads Qwen 3B from disk; run with --ignored on workstation"]
+    fn forward_full_gpu_real_qwen3b_no_crash() {
+        // Loads the actual Qwen 2.5-3B Q4_K_M from disk (same path the bench
+        // uses). If this crashes inside the test framework, we have a
+        // standalone reproducer of the bench failure.
+        let path = "C:\\Users\\danu\\AppData\\Roaming\\memory-rlm\\models\\model-qwen2.5-3b-q4km.gguf";
+        if !std::path::Path::new(path).exists() { return; }
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let loaded = crate::load_model(path).expect("load_model");
+        let engine = GpuEngine::with_max_seq(loaded.model, gpu, 4096);
+        let tokens: Vec<u32> = (0..16u32).collect();
+        let _ = engine.forward_full_gpu(&tokens, 0);
+    }
+
+    #[test]
+    fn forward_full_gpu_qwen_shape_with_gpu_output_proj_no_crash() {
+        // Final bisection: same shape as the bench, biases on, output proj
+        // routed through GpuFloatLinear (matches what loader.rs does for
+        // float models with GPU available). If THIS panics, we've isolated
+        // the trigger to "GpuFloatLinear on the output projection".
+        use crate::layers::attention::MultiHeadAttention;
+        use crate::layers::ffn::FeedForward;
+        use crate::layers::gpu_floatlinear::GpuFloatLinear;
+        use crate::layers::model::OutputProjection;
+        use crate::layers::rmsnorm::RmsNorm;
+        use crate::layers::swiglu::SwiGLU;
+        use crate::layers::transformer::TransformerBlock;
+
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        // Smaller vocab to keep memory in check; the bug should still
+        // trigger if output-proj-via-GpuFloatLinear is the cause.
+        let embed_dim = 2048;
+        let n_heads = 16;
+        let n_kv_heads = 2;
+        let head_dim = embed_dim / n_heads;
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let intermediate = 11008;
+        let vocab_size = 151_936; // Qwen 2.5 vocab
+        let n_blocks = 36;
+
+        let mut rng: u64 = 0xDEAD_F00D;
+        let mut roll = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng >> 33) as i32 % 200 - 100) as f32 * 0.001
+        };
+        let mk_tensor = |rows: usize, cols: usize, roll: &mut dyn FnMut() -> f32| -> FloatTensor {
+            FloatTensor::new((0..rows * cols).map(|_| roll()).collect(), vec![rows, cols])
+        };
+        let mk_gpu = |rows: usize, cols: usize, roll: &mut dyn FnMut() -> f32| -> Box<dyn crate::layers::linear::LinearLayer> {
+            Box::new(GpuFloatLinear::from_float_tensor(gpu.clone(), mk_tensor(rows, cols, roll)))
+        };
+
+        let embedding = mk_tensor(vocab_size, embed_dim, &mut roll);
+        let mut blocks = Vec::with_capacity(n_blocks);
+        for _ in 0..n_blocks {
+            let q = mk_gpu(q_dim, embed_dim, &mut roll);
+            let k = mk_gpu(kv_dim, embed_dim, &mut roll);
+            let v = mk_gpu(kv_dim, embed_dim, &mut roll);
+            let o = mk_gpu(embed_dim, q_dim, &mut roll);
+            let mut attention = MultiHeadAttention::with_rope_layout(
+                q, k, v, o, n_heads, n_kv_heads, head_dim, 10000.0,
+                crate::layers::rope::RoPELayout::Halved,
+            );
+            let qb: Vec<f32> = (0..q_dim).map(|_| roll()).collect();
+            let kb: Vec<f32> = (0..kv_dim).map(|_| roll()).collect();
+            let vb: Vec<f32> = (0..kv_dim).map(|_| roll()).collect();
+            attention.set_biases(qb, kb, vb);
+            let gate = mk_gpu(intermediate, embed_dim, &mut roll);
+            let up   = mk_gpu(intermediate, embed_dim, &mut roll);
+            let down = mk_gpu(embed_dim, intermediate, &mut roll);
+            let ffn: Box<dyn FeedForward> = Box::new(SwiGLU::new(gate, up, down));
+            let attn_norm = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
+            let ffn_norm = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
+            blocks.push(TransformerBlock::new(attn_norm, attention, ffn_norm, ffn));
+        }
+        let final_norm = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
+
+        // The candidate trigger: output proj through GpuFloatLinear.
+        let out_proj_gpu = mk_gpu(vocab_size, embed_dim, &mut roll);
+
+        let model = TransformerModel::new(embedding, blocks, final_norm, OutputProjection::Linear(out_proj_gpu));
+        let engine = GpuEngine::with_max_seq(model, gpu.clone(), 16);
+        let tokens = vec![0u32, 1, 2];
+        let _ = engine.forward_full_gpu(&tokens, 0);
+    }
+
+    #[test]
+    fn forward_full_gpu_qwen_shaped_no_crash() {
+        // Qwen 2.5-3B shape (embed=2048, GQA 16/2, intermediate=11008,
+        // 36 blocks) — the actual case that crashes via cortex-bench-fwd.
+        // If THIS panics in tests, the bug is reproducible without the
+        // bench harness; if it doesn't, something about the bench's
+        // execution path matters (warmup ordering, finalize_logits, etc.).
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let gpu_model = toy_gqa_multi_block_for_gpu(
+            gpu.clone(), 36,
+            /*embed*/ 2048, /*intermediate*/ 11008,
+            /*n_heads*/ 16, /*n_kv_heads*/ 2,
+        );
+        let engine = GpuEngine::with_max_seq(gpu_model, gpu.clone(), 16);
+
+        let tokens = vec![0u32, 1, 2];
+        let _ = engine.forward_full_gpu(&tokens, 0);
+    }
+
+    #[test]
+    fn forward_full_gpu_fifty_blocks_with_biases_no_crash() {
+        // Probe: does adding biases (extra 3 dispatches per block) trigger
+        // the Qwen failure with toy-size tensors?
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let gpu_model = toy_float_multi_block_with_biases_for_gpu(gpu.clone(), 50);
+        let engine = GpuEngine::with_max_seq(gpu_model, gpu.clone(), 16);
+
+        let tokens = vec![0u32, 1, 2];
+        let _ = engine.forward_full_gpu(&tokens, 0);
+    }
+
+    #[test]
     fn forward_full_gpu_matches_cpu_two_blocks() {
         // Validates the block-stacking loop: that hidden state correctly
         // flows from block 0 -> block 1 inside one encoder.
