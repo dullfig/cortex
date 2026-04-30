@@ -46,12 +46,19 @@ impl GpuFloatLinear {
         );
 
         let packed = GpuDevice::pack_f16(tensor.data());
+        let bytes = bytemuck::cast_slice(&packed);
 
-        let weight_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        // Use create_buffer + queue.write_buffer (persistent staging belt)
+        // instead of create_buffer_init (per-call staging buffer create/drop).
+        // The latter, called ~252 times during Qwen 3B load, churns enough
+        // staging buffers to confuse wgpu's validator (#16 stale-ID bug).
+        let weight_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("gpu_floatlinear.weights"),
-            contents: bytemuck::cast_slice(&packed),
-            usage: wgpu::BufferUsages::STORAGE,
+            size: bytes.len() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
+        gpu.queue.write_buffer(&weight_buf, 0, bytes);
 
         Self { gpu, weight_buf, rows, cols }
     }

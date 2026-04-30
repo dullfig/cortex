@@ -54,11 +54,16 @@ impl GpuBitLinear {
             packed.resize(packed.len() + (4 - remainder), 0);
         }
 
-        let weight_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        // create_buffer + queue.write_buffer (persistent staging belt) over
+        // create_buffer_init (per-call staging churn) — same fix as
+        // GpuFloatLinear, see #16.
+        let weight_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("gpu_bitlinear.weights"),
-            contents: &packed,
-            usage: wgpu::BufferUsages::STORAGE,
+            size: packed.len() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
+        gpu.queue.write_buffer(&weight_buf, 0, &packed);
 
         Self { gpu, weight_buf, rows, cols, weight_scale }
     }

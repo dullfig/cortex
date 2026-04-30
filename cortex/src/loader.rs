@@ -94,6 +94,13 @@ pub struct LoadedModel {
     pub tokenizer: Tokenizer,
     /// Model hyperparameters.
     pub config: ModelConfig,
+    /// Shared GPU context the model's layers are tied to (when GPU available).
+    /// Callers building a `GpuEngine` MUST reuse this `Arc` rather than calling
+    /// `compute::detect_gpu_device()` again — a second device produces
+    /// cross-device buffer-binding errors that surface as confusing wgpu
+    /// validation panics (see #16).
+    #[cfg(feature = "gpu")]
+    pub gpu: Option<std::sync::Arc<crate::compute::wgpu_backend::GpuDevice>>,
 }
 
 /// Load a transformer model and tokenizer from a GGUF file.
@@ -372,5 +379,7 @@ pub fn load_model(path: &str) -> Result<LoadedModel, GgufError> {
         model,
         tokenizer,
         config,
+        #[cfg(feature = "gpu")]
+        gpu,
     })
 }

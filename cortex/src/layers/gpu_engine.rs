@@ -515,28 +515,21 @@ impl GpuEngine {
             attn0.n_heads(), attn0.n_kv_heads(), attn0.head_dim(),
             intermediate, n_tokens,
         );
-        // Per-block submit (one encoder per layer) keeps intra-block fusion
-        // (~14 dispatches share an encoder) but lets the queue drain between
-        // blocks. Single-encoder over all 36 blocks runs into a wgpu
-        // validation error specific to large-tensor models like Qwen 3B
-        // (toy 30-block models work fine in one encoder); investigation
-        // pending.
-        for i in 0..self.cpu.n_layers() {
-            let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("forward_full.block_encoder"),
-            });
-            self.forward_block_gpu(&mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch);
-            self.gpu.queue.submit(Some(encoder.finish()));
-        }
-        let mut tail_encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("forward_full.tail_encoder"),
+        // Single encoder for all blocks + final norm = one submit for the
+        // whole forward pass. Earlier per-block submit was a workaround for
+        // what turned out to be a separate cross-device bug (#16).
+        let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("forward_full.encoder"),
         });
+        for i in 0..self.cpu.n_layers() {
+            self.forward_block_gpu(&mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch);
+        }
         self.dispatch_rmsnorm_into(
-            &mut tail_encoder, &hidden_buf, &self.final_norm_weight_buf, &normed_buf,
+            &mut encoder, &hidden_buf, &self.final_norm_weight_buf, &normed_buf,
             self.embed_dim, n_tokens, self.final_norm_eps,
         );
-        tail_encoder.copy_buffer_to_buffer(&normed_buf, 0, &staging, 0, bytes);
-        self.gpu.queue.submit(Some(tail_encoder.finish()));
+        encoder.copy_buffer_to_buffer(&normed_buf, 0, &staging, 0, bytes);
+        self.gpu.queue.submit(Some(encoder.finish()));
 
         // ---- Read back final-normed hidden state ----
         let slice = staging.slice(..);
@@ -2195,10 +2188,9 @@ mod tests {
         // standalone reproducer of the bench failure.
         let path = "C:\\Users\\danu\\AppData\\Roaming\\memory-rlm\\models\\model-qwen2.5-3b-q4km.gguf";
         if !std::path::Path::new(path).exists() { return; }
-        let Some(gpu) = GpuDevice::try_new() else { return };
-        let gpu = Arc::new(gpu);
 
         let loaded = crate::load_model(path).expect("load_model");
+        let gpu = loaded.gpu.clone().expect("model loaded without GPU");
         let engine = GpuEngine::with_max_seq(loaded.model, gpu, 4096);
         let tokens: Vec<u32> = (0..16u32).collect();
         let _ = engine.forward_full_gpu(&tokens, 0);

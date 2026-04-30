@@ -24,9 +24,12 @@ fn main() {
     // Build a deterministic prompt: tokens 0..n_tokens, clamped to vocab size.
     let tokens: Vec<u32> = (0..n_tokens).map(|i| (i as u32) % (vocab as u32)).collect();
 
-    let gpu = cortex::compute::detect_gpu_device()
-        .expect("no discrete GPU — bench requires one");
-    eprintln!("[bench] discrete GPU detected, building GpuEngine");
+    // Reuse the GpuDevice the loader created (the model's layers are bound to
+    // it). Calling detect_gpu_device() again would build a second device and
+    // produce cross-device buffer-binding errors (#16).
+    let gpu = loaded.gpu.clone()
+        .expect("no discrete GPU detected by loader — bench requires one");
+    eprintln!("[bench] reusing loader's GpuDevice, building GpuEngine");
 
     // Construct GpuEngine. with_max_seq sized to fit our prompt.
     let max_seq = (n_tokens + 16).max(1024);
