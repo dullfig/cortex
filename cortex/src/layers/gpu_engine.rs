@@ -1531,6 +1531,18 @@ impl GpuEngine {
         self.cpu.create_kv_cache(max_seq_len)
     }
 
+    /// Allocate a GPU-resident KV cache sized for this model.
+    pub fn create_gpu_kv_cache(&self, max_seq_len: usize) -> crate::layers::gpu_kv_cache::GpuKvCache {
+        let attn0 = self.cpu.blocks()[0].attention();
+        crate::layers::gpu_kv_cache::GpuKvCache::new(
+            self.gpu.clone(),
+            self.cpu.n_layers(),
+            attn0.n_kv_heads(),
+            attn0.head_dim(),
+            max_seq_len,
+        )
+    }
+
     pub fn forward(&self, tokens: &[u32], start_pos: usize) -> Vec<f32> {
         self.cpu.forward(tokens, start_pos)
     }

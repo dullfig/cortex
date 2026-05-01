@@ -24,9 +24,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::info;
 
-use cortex::layers::model::TransformerModel;
+use cortex::layers::gpu_engine::GpuEngine;
+use cortex::layers::gpu_kv_cache::GpuKvCache;
 use cortex::layers::sampler::{Sampler, SamplerConfig};
-use cortex::layers::kv_cache::ModelKvCache;
 use cortex::{ForwardTrace, ModelConfig, Tokenizer};
 
 // ---------------------------------------------------------------------------
@@ -78,7 +78,7 @@ const SINK_TOKENS: usize = 4;
 
 /// Per-cache metadata stored alongside the KV cache in the pool.
 struct CacheEntry {
-    cache: ModelKvCache,
+    cache: GpuKvCache,
     /// Token history that built this cache. Stored so shards can be composed
     /// by replaying tokens in sequence (which gives correct RoPE positions).
     tokens: Vec<u32>,
@@ -458,9 +458,9 @@ impl ShardMap {
 /// Generate tokens with an existing KV cache. Prefills the prompt tokens
 /// into the cache, then samples autoregressively up to max_tokens.
 fn generate_with_cache(
-    model: &TransformerModel,
+    engine: &GpuEngine,
     prompt_tokens: &[u32],
-    cache: &mut ModelKvCache,
+    cache: &mut GpuKvCache,
     sampler_config: SamplerConfig,
     seed: u64,
     eos: u32,
@@ -468,9 +468,10 @@ fn generate_with_cache(
 ) -> Vec<u32> {
     let mut sampler = Sampler::new(sampler_config, seed);
 
-    let prefill_logits = model.forward_cached(prompt_tokens, cache);
-    let last_logits_start = (prompt_tokens.len() - 1) * model.vocab_size();
-    let last_logits = &prefill_logits[last_logits_start..last_logits_start + model.vocab_size()];
+    let prefill_logits = engine.forward_full_gpu_with_cache(prompt_tokens, cache);
+    let vocab = engine.vocab_size();
+    let last_logits_start = (prompt_tokens.len() - 1) * vocab;
+    let last_logits = &prefill_logits[last_logits_start..last_logits_start + vocab];
     let mut next_token = sampler.sample(last_logits);
 
     let mut out = Vec::new();
@@ -480,7 +481,7 @@ fn generate_with_cache(
     out.push(next_token);
 
     for _ in 1..max_tokens {
-        let logits = model.forward_cached(&[next_token], cache);
+        let logits = engine.forward_full_gpu_with_cache(&[next_token], cache);
         next_token = sampler.sample(&logits);
         if next_token == eos {
             break;
@@ -734,7 +735,7 @@ async fn chat_completions(
             let entry = pool.get_mut(&shards[0]).unwrap();
             let generated = tokio::task::block_in_place(|| {
                 generate_with_cache(
-                    state.engine.cpu(),
+                    &state.engine,
                     &prompt_tokens,
                     &mut entry.cache,
                     sampler_config,
@@ -758,17 +759,17 @@ async fn chat_completions(
                 all_tokens.extend_from_slice(&entry.tokens);
             }
 
-            let mut composed_cache = state.engine.create_kv_cache(state.max_seq_len);
+            let mut composed_cache = state.engine.create_gpu_kv_cache(state.max_seq_len);
             tokio::task::block_in_place(|| {
                 if !all_tokens.is_empty() {
-                    let _ = state.engine.forward_cached(&all_tokens, &mut composed_cache);
+                    let _ = state.engine.forward_full_gpu_with_cache(&all_tokens, &mut composed_cache);
                 }
             });
 
             // Now generate with the composed cache
             let generated = tokio::task::block_in_place(|| {
                 generate_with_cache(
-                    state.engine.cpu(),
+                    &state.engine,
                     &prompt_tokens,
                     &mut composed_cache,
                     sampler_config,
@@ -866,7 +867,7 @@ async fn cache_load(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<CacheLoadRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    let mut cache = state.engine.create_kv_cache(state.max_seq_len);
+    let mut cache = state.engine.create_gpu_kv_cache(state.max_seq_len);
 
     // Prepend sink tokens (BOS repeated) to absorb position-0 attention
     // sink artifact. Real content starts at position SINK_TOKENS.
@@ -877,7 +878,7 @@ async fn cache_load(
 
     if !all_tokens.is_empty() {
         tokio::task::block_in_place(|| {
-            let _ = state.engine.forward_cached(&all_tokens, &mut cache);
+            let _ = state.engine.forward_full_gpu_with_cache(&all_tokens, &mut cache);
         });
     }
 
@@ -937,7 +938,7 @@ async fn cache_append(
 
     if !req.tokens.is_empty() {
         tokio::task::block_in_place(|| {
-            let _ = state.engine.forward_cached(&req.tokens, &mut entry.cache);
+            let _ = state.engine.forward_full_gpu_with_cache(&req.tokens, &mut entry.cache);
         });
         entry.tokens.extend_from_slice(&req.tokens);
     }
