@@ -19,6 +19,8 @@ pub mod gpu_bitlinear;
 pub mod gpu_engine;
 #[cfg(feature = "gpu")]
 pub mod gpu_floatlinear;
+#[cfg(feature = "gpu")]
+pub mod gpu_kv_cache;
 pub mod kv_cache;
 pub mod linear;
 pub mod memory;
