@@ -659,6 +659,145 @@ impl GpuEngine {
         (logits, per_layer_scores)
     }
 
+    /// Cached + traced forward: process new `query_tokens` against a
+    /// pre-populated `cache`, capturing pre-softmax attention scores for
+    /// the requested layers. **Does not advance the cache cursor** — the
+    /// cache stays at its original `seq_len`, so this is safe to call
+    /// repeatedly with different queries against the same shard cache.
+    ///
+    /// The query tokens' K/V do get written into the cache buffers at
+    /// offset `cache.seq_len()` during the dispatch, but those positions
+    /// are logically unallocated (`cache.seq_len()` is the end of the
+    /// real prefix), so the next call simply overwrites them. Subsequent
+    /// `forward_full_gpu_with_cache` calls would also overwrite that
+    /// region — the contract is "K/V at offsets >= seq_len are scratch."
+    ///
+    /// Returns per-layer pre-softmax score tensors flat as
+    /// `[n_query_tokens, n_heads, max_seq]` where `max_seq = cache.seq_len()
+    /// + n_query_tokens`. The score from query position q to corpus
+    /// position k is `scores[q * n_heads * max_seq + h * max_seq + k]`,
+    /// which is what cortex-cloud's retrieve handler aggregates over.
+    pub fn forward_full_gpu_with_cache_traced(
+        &self,
+        query_tokens: &[u32],
+        cache: &crate::layers::gpu_kv_cache::GpuKvCache,
+        capture_layers: &[usize],
+    ) -> Vec<Vec<f32>> {
+        let n_tokens = query_tokens.len();
+        assert!(n_tokens > 0, "must have at least one query token");
+
+        let n_layers = self.cpu.n_layers();
+        assert_eq!(n_layers, cache.n_layers(), "cache layer count mismatch");
+        for &l in capture_layers {
+            assert!(l < n_layers, "capture layer {l} out of range (n_layers={n_layers})");
+        }
+
+        let attn0 = self.cpu.blocks()[0].attention();
+        assert_eq!(cache.n_kv_heads(), attn0.n_kv_heads(), "cache n_kv_heads mismatch");
+        assert_eq!(cache.head_dim(), attn0.head_dim(), "cache head_dim mismatch");
+
+        let start_pos = cache.seq_len();
+        let attn_max_seq = start_pos + n_tokens;
+        assert!(
+            attn_max_seq <= cache.max_seq_len(),
+            "cache overflow: {} + {} > {}",
+            start_pos, n_tokens, cache.max_seq_len(),
+        );
+
+        // ---- Embedding lookup (CPU) ----
+        let embed_data = self.cpu.embedding_data();
+        let vocab_size = self.cpu.vocab_size();
+        let mut hidden_init: Vec<f32> = Vec::with_capacity(n_tokens * self.embed_dim);
+        for &tok in query_tokens {
+            assert!((tok as usize) < vocab_size, "token {tok} out of vocab");
+            let off = tok as usize * self.embed_dim;
+            hidden_init.extend_from_slice(&embed_data[off..off + self.embed_dim]);
+        }
+
+        let bytes = (hidden_init.len() * std::mem::size_of::<f32>()) as u64;
+        let hidden_buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("forward_traced_with_cache.hidden"),
+            contents: bytemuck::cast_slice(&hidden_init),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+
+        let intermediate = self.cpu.blocks()[0].ffn().as_any()
+            .downcast_ref::<crate::layers::swiglu::SwiGLU>()
+            .unwrap_or_else(|| panic!("forward_full_gpu_with_cache_traced requires SwiGLU FFN"))
+            .intermediate_size();
+        let n_heads = attn0.n_heads();
+        let scratch = BlockScratch::allocate(
+            &self.gpu, n_tokens, self.embed_dim,
+            n_heads, attn0.n_kv_heads(), attn0.head_dim(),
+            intermediate, attn_max_seq,
+        );
+
+        // Per-captured-layer score storage. Shape: [n_tokens, n_heads, max_seq]
+        // where max_seq = start_pos + n_tokens (the full attention window).
+        let scores_bytes = (n_tokens * n_heads * attn_max_seq * std::mem::size_of::<f32>()) as u64;
+        let capture_bufs: Vec<wgpu::Buffer> = capture_layers.iter().map(|&l| {
+            self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("forward_traced_with_cache.scores.layer{l}")),
+                size: scores_bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        }).collect();
+        let capture_stagings: Vec<wgpu::Buffer> = (0..capture_layers.len())
+            .map(|_| self.gpu.create_staging_buffer(scores_bytes))
+            .collect();
+        let capture_lookup: std::collections::HashMap<usize, &wgpu::Buffer> =
+            capture_layers.iter().zip(capture_bufs.iter())
+                .map(|(&l, buf)| (l, buf))
+                .collect();
+
+        // ---- All blocks in one encoder, with cache target + optional capture ----
+        let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("forward_traced_with_cache.encoder"),
+        });
+        for i in 0..n_layers {
+            let capture = capture_lookup.get(&i).copied();
+            let target = (cache.k_layer(i), cache.v_layer(i));
+            self.forward_block_gpu_inner(
+                &mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch,
+                capture, Some(target),
+            );
+        }
+        // Skip final_norm + output projection — retrieval doesn't need
+        // logits, only the captured scores.
+        for (cap_buf, stg_buf) in capture_bufs.iter().zip(capture_stagings.iter()) {
+            encoder.copy_buffer_to_buffer(cap_buf, 0, stg_buf, 0, scores_bytes);
+        }
+        self.gpu.queue.submit(Some(encoder.finish()));
+
+        // Batched readback (single poll for all stagings).
+        use std::sync::mpsc;
+        let mut receivers: Vec<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>> = Vec::with_capacity(capture_stagings.len());
+        let capture_slices: Vec<wgpu::BufferSlice> = capture_stagings.iter().map(|stg| {
+            let slice = stg.slice(..);
+            let (tx, rx) = mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+            receivers.push(rx);
+            slice
+        }).collect();
+        self.gpu.device.poll(wgpu::Maintain::Wait);
+        for rx in &receivers {
+            rx.recv().expect("readback channel closed").expect("buffer map failed");
+        }
+
+        let per_layer_scores: Vec<Vec<f32>> = capture_slices.iter().zip(capture_stagings.iter()).map(|(slice, stg)| {
+            let data = slice.get_mapped_range();
+            let v: Vec<f32> = data[..scores_bytes as usize].chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            drop(data);
+            stg.unmap();
+            v
+        }).collect();
+
+        // NOTE: we deliberately do NOT call cache.advance() — see method docs.
+        per_layer_scores
+    }
+
     /// Forward pass that writes new K/V into the supplied `cache` and reads
     /// the full prefix from the cache during attention. Both prefill (cache
     /// initially empty, `cache.seq_len() == 0`) and decode (cache populated,
@@ -2520,6 +2659,76 @@ mod tests {
                 (a - b).abs()
             );
         }
+    }
+
+    #[test]
+    fn forward_traced_with_cache_matches_fresh_traced() {
+        // Compare:
+        //   A) prefill shard tokens into cache, then forward_full_gpu_with_cache_traced
+        //      on the query tokens with that cache
+        //   B) forward_full_gpu_traced over [shard_tokens; query_tokens] from
+        //      scratch (the path retrieve uses today)
+        //
+        // The pre-softmax scores at the QUERY positions should match.
+        use crate::layers::gpu_kv_cache::GpuKvCache;
+
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let gpu_model = toy_float_multi_block_for_gpu(gpu.clone(), 2);
+        let attn0 = gpu_model.blocks()[0].attention();
+        let n_layers = gpu_model.n_layers();
+        let n_heads = attn0.n_heads();
+        let n_kv_heads = attn0.n_kv_heads();
+        let head_dim = attn0.head_dim();
+
+        let engine = GpuEngine::with_max_seq(gpu_model, gpu.clone(), 16);
+
+        let shard_tokens = vec![1u32, 2, 3];
+        let query_tokens = vec![0u32, 1];
+        let all: Vec<u32> = shard_tokens.iter().chain(query_tokens.iter()).copied().collect();
+
+        let capture_layers: Vec<usize> = (0..n_layers).collect();
+
+        // Path A: cached
+        let mut cache = GpuKvCache::new(gpu, n_layers, n_kv_heads, head_dim, 16);
+        let _ = engine.forward_full_gpu_with_cache(&shard_tokens, &mut cache);
+        assert_eq!(cache.seq_len(), shard_tokens.len());
+        let cached_scores = engine.forward_full_gpu_with_cache_traced(
+            &query_tokens, &cache, &capture_layers,
+        );
+
+        // Path B: fresh
+        let (_, fresh_scores) = engine.forward_full_gpu_traced(&all, 0, &capture_layers);
+
+        // Compare scores at query positions. Cached layout is
+        // [n_query=2, n_heads, max_seq=5]; fresh layout is
+        // [n_total=5, n_heads, max_seq=5]. For query token q in [0, 2),
+        // global position is shard.len() + q. Compare row-by-row.
+        let n_query = query_tokens.len();
+        let max_seq = shard_tokens.len() + query_tokens.len();
+        let n_total = all.len();
+        for layer in 0..n_layers {
+            for q in 0..n_query {
+                for h in 0..n_heads {
+                    let global_pos = shard_tokens.len() + q;
+                    for k in 0..=global_pos { // causal
+                        let cached_idx = q * n_heads * max_seq + h * max_seq + k;
+                        let fresh_idx = global_pos * n_heads * n_total + h * n_total + k;
+                        let c = cached_scores[layer][cached_idx];
+                        let f = fresh_scores[layer][fresh_idx];
+                        assert!(
+                            (c - f).abs() < 0.05,
+                            "layer={layer} q={q} (global {global_pos}) h={h} k={k}: cached={c} fresh={f}",
+                        );
+                    }
+                }
+            }
+        }
+
+        // Cache must NOT have advanced.
+        assert_eq!(cache.seq_len(), shard_tokens.len(),
+            "forward_full_gpu_with_cache_traced should not advance the cache");
     }
 
     #[test]

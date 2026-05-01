@@ -592,68 +592,77 @@ async fn chat_completions(
             }
         }
 
-        // Build the full token sequence and track shard boundaries
-        let mut all_tokens: Vec<u32> = Vec::new();
+        // Build the shard_map from cached shard token lists. Note we no
+        // longer concatenate tokens client-side: with cached retrieval, the
+        // K/V prefix already lives on the GPU, so we only forward the QUERY.
         let mut shard_map = ShardMap::new();
-
+        let mut corpus_len = 0usize;
         for shard_name in &shards {
             let entry = pool.get(shard_name).unwrap();
-            let start = all_tokens.len();
-            all_tokens.extend_from_slice(&entry.tokens);
-            let end = all_tokens.len();
-            shard_map.add(shard_name.clone(), start, end);
+            let start = corpus_len;
+            corpus_len += entry.tokens.len();
+            shard_map.add(shard_name.clone(), start, corpus_len);
         }
 
-        let corpus_len = all_tokens.len();
-
-        // Append the prompt tokens (the query)
-        all_tokens.extend_from_slice(&prompt_tokens);
+        // Single-shard fast path is straightforward; multi-shard composition
+        // would need to merge per-shard caches into a temporary one (similar
+        // to the chat path) — for now retrieval requires a single shard
+        // matching what cache_load already populated.
+        if shards.len() != 1 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "type": "unsupported",
+                        "message": "GPU-cached retrieval currently supports a single shard; multi-shard composition is a follow-up.",
+                    }
+                })),
+            ));
+        }
+        let shard_entry = pool.get(&shards[0]).unwrap();
 
         info!(
-            shards = ?shards,
+            shard = %shards[0],
             corpus_tokens = corpus_len,
             query_tokens = prompt_tokens.len(),
-            total_tokens = all_tokens.len(),
-            "retrieval mode: running forward_traced",
+            "retrieval mode: cached forward_full_gpu_with_cache_traced",
         );
 
         let retrieve_start = Instant::now();
 
-        // GPU forward_full_gpu_traced. Capture only the last 4 layers'
-        // pre-softmax scores (memex architecture: "last few layers carry
-        // the retrieval signal"). Capturing all 36 layers of Qwen 3B at
-        // 2300 tokens × 16 heads would need ~12 GB extra VRAM.
+        // Capture only the last 4 layers' pre-softmax scores (memex
+        // architecture: "last few layers carry the retrieval signal").
         let n_layers_total = state.engine.n_layers();
         let n_heads = state.engine.cpu().blocks()[0].attention().n_heads();
         let capture_start = n_layers_total.saturating_sub(4);
         let capture_layers: Vec<usize> = (capture_start..n_layers_total).collect();
 
-        let n_tokens = all_tokens.len();
-        let (per_layer_scores, query_start) = tokio::task::block_in_place(|| {
-            let scores = state.engine.forward_traced_scores_only(
-                &all_tokens, 0, &capture_layers,
-            );
-            (scores, corpus_len)
+        let cache_seq = shard_entry.cache.seq_len();
+        let n_query = prompt_tokens.len();
+        let attn_max_seq = cache_seq + n_query;
+        let query_start = corpus_len;
+
+        let per_layer_scores = tokio::task::block_in_place(|| {
+            state.engine.forward_full_gpu_with_cache_traced(
+                &prompt_tokens, &shard_entry.cache, &capture_layers,
+            )
         });
 
-        // Score each corpus position by mean pre-softmax attention from
-        // the last few query positions, averaged over captured layers and heads.
-        let query_window = 3.min(prompt_tokens.len());
-        let q_lo = n_tokens.saturating_sub(query_window);
-        let q_hi = n_tokens;
+        // Per-layer score layout: [n_query, n_heads, attn_max_seq] flat.
+        // Score from query position q to corpus position k is at index
+        // q * n_heads * attn_max_seq + h * attn_max_seq + k.
+        let query_window = 3.min(n_query);
+        let q_lo = n_query.saturating_sub(query_window);
+        let q_hi = n_query;
 
         let mut scores = vec![f32::NEG_INFINITY; corpus_len];
         for k in 0..corpus_len {
             let mut total = 0.0f32;
             let mut count = 0usize;
             for layer_scores in &per_layer_scores {
-                // Layout: [n_tokens, n_heads, n_tokens] flat (matches
-                // attn_score_batch shader output).
                 for h in 0..n_heads {
                     for q in q_lo..q_hi {
-                        // Causal: only positions 0..=q are valid.
-                        if k > q { continue; }
-                        let idx = q * n_heads * n_tokens + h * n_tokens + k;
+                        let idx = q * n_heads * attn_max_seq + h * attn_max_seq + k;
                         total += layer_scores[idx];
                         count += 1;
                     }
@@ -664,6 +673,7 @@ async fn chat_completions(
             }
         }
         let selected_layers = capture_layers;
+        let _ = query_start; // already captured in retrieval_ms timing
 
         // Rank and take top-K
         let mut ranked: Vec<(usize, f32)> = scores
