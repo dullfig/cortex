@@ -23,17 +23,14 @@ struct Params {
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    // Decompose: idx = tok * (n_heads * max_seq_for_tok) + head * max_seq_for_tok + t
-    // But seq_len varies per token. Simpler: flat index over (tok, head, t_max)
+    // 2D dispatch: gid.x covers (head, t); gid.y is tok.
+    // 1D over n_tokens × n_heads × max_seq trips wgpu's 65535 per-dim
+    // workgroup limit at long-corpus scales (e.g. Qwen 3B + 2300 tokens).
+    let tok = gid.y;
     let max_total_seq = params.start_pos + params.n_tokens;
-    let per_head = max_total_seq;
-    let per_tok = params.n_heads * per_head;
-
-    let tok = idx / per_tok;
-    let rem = idx % per_tok;
-    let head = rem / per_head;
-    let t = rem % per_head;
+    let inner = gid.x;
+    let head = inner / max_total_seq;
+    let t = inner % max_total_seq;
 
     if (tok >= params.n_tokens || head >= params.n_heads) { return; }
 

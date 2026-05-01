@@ -88,7 +88,10 @@ struct CacheEntry {
 }
 
 struct ServerState {
-    model: TransformerModel,
+    /// GPU-resident inference engine. Owns the underlying TransformerModel
+    /// and the GPU device. CPU-side calls go through `engine.cpu()`; the
+    /// GPU-native retrieve path goes through `engine.forward_full_gpu_traced()`.
+    engine: cortex::layers::gpu_engine::GpuEngine,
     tokenizer: Tokenizer,
     #[allow(dead_code)]
     config: ModelConfig,
@@ -615,36 +618,43 @@ async fn chat_completions(
 
         let retrieve_start = Instant::now();
 
-        // Run forward_traced over the full sequence
-        let (trace, query_start, n_layers, n_heads) = tokio::task::block_in_place(|| {
-            let (_logits, trace) = state.model.forward_traced(&all_tokens);
-            let n_layers = trace.n_layers;
-            let n_heads = trace.n_heads;
-            (trace, corpus_len, n_layers, n_heads)
+        // GPU forward_full_gpu_traced. Capture only the last 4 layers'
+        // pre-softmax scores (memex architecture: "last few layers carry
+        // the retrieval signal"). Capturing all 36 layers of Qwen 3B at
+        // 2300 tokens × 16 heads would need ~12 GB extra VRAM.
+        let n_layers_total = state.engine.n_layers();
+        let n_heads = state.engine.cpu().blocks()[0].attention().n_heads();
+        let capture_start = n_layers_total.saturating_sub(4);
+        let capture_layers: Vec<usize> = (capture_start..n_layers_total).collect();
+
+        let n_tokens = all_tokens.len();
+        let (per_layer_scores, query_start) = tokio::task::block_in_place(|| {
+            let scores = state.engine.forward_traced_scores_only(
+                &all_tokens, 0, &capture_layers,
+            );
+            (scores, corpus_len)
         });
 
         // Score each corpus position by mean pre-softmax attention from
-        // the last N query positions (same scoring as morsel-retrieve).
+        // the last few query positions, averaged over captured layers and heads.
         let query_window = 3.min(prompt_tokens.len());
-        let q_lo = (all_tokens.len()).saturating_sub(query_window);
-        let q_hi = all_tokens.len();
-
-        // Use all layers (the morsel-retrieve experiment showed all-layers
-        // averaged gives the best signal for cross-document retrieval).
-        let selected_layers: Vec<usize> = (0..n_layers).collect();
+        let q_lo = n_tokens.saturating_sub(query_window);
+        let q_hi = n_tokens;
 
         let mut scores = vec![f32::NEG_INFINITY; corpus_len];
         for k in 0..corpus_len {
             let mut total = 0.0f32;
             let mut count = 0usize;
-            for &layer in &selected_layers {
+            for layer_scores in &per_layer_scores {
+                // Layout: [n_tokens, n_heads, n_tokens] flat (matches
+                // attn_score_batch shader output).
                 for h in 0..n_heads {
                     for q in q_lo..q_hi {
-                        let row = trace.pre_score_row(layer, h, q);
-                        if k < row.len() {
-                            total += row[k];
-                            count += 1;
-                        }
+                        // Causal: only positions 0..=q are valid.
+                        if k > q { continue; }
+                        let idx = q * n_heads * n_tokens + h * n_tokens + k;
+                        total += layer_scores[idx];
+                        count += 1;
                     }
                 }
             }
@@ -652,6 +662,7 @@ async fn chat_completions(
                 scores[k] = total / count as f32;
             }
         }
+        let selected_layers = capture_layers;
 
         // Rank and take top-K
         let mut ranked: Vec<(usize, f32)> = scores
@@ -723,7 +734,7 @@ async fn chat_completions(
             let entry = pool.get_mut(&shards[0]).unwrap();
             let generated = tokio::task::block_in_place(|| {
                 generate_with_cache(
-                    &state.model,
+                    state.engine.cpu(),
                     &prompt_tokens,
                     &mut entry.cache,
                     sampler_config,
@@ -747,17 +758,17 @@ async fn chat_completions(
                 all_tokens.extend_from_slice(&entry.tokens);
             }
 
-            let mut composed_cache = state.model.create_kv_cache(state.max_seq_len);
+            let mut composed_cache = state.engine.create_kv_cache(state.max_seq_len);
             tokio::task::block_in_place(|| {
                 if !all_tokens.is_empty() {
-                    let _ = state.model.forward_cached(&all_tokens, &mut composed_cache);
+                    let _ = state.engine.forward_cached(&all_tokens, &mut composed_cache);
                 }
             });
 
             // Now generate with the composed cache
             let generated = tokio::task::block_in_place(|| {
                 generate_with_cache(
-                    &state.model,
+                    state.engine.cpu(),
                     &prompt_tokens,
                     &mut composed_cache,
                     sampler_config,
@@ -785,7 +796,7 @@ async fn chat_completions(
     } else {
         // Stateless: create a temporary cache, generate, discard.
         let output_tokens = tokio::task::block_in_place(|| {
-            state.model.generate(&prompt_tokens, max_tokens, sampler_config, seed, Some(eos))
+            state.engine.generate(&prompt_tokens, max_tokens, sampler_config, seed, Some(eos))
         });
         let generated = output_tokens[prompt_tokens.len()..].to_vec();
         let len = generated.len() as u32;
@@ -855,7 +866,7 @@ async fn cache_load(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<CacheLoadRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    let mut cache = state.model.create_kv_cache(state.max_seq_len);
+    let mut cache = state.engine.create_kv_cache(state.max_seq_len);
 
     // Prepend sink tokens (BOS repeated) to absorb position-0 attention
     // sink artifact. Real content starts at position SINK_TOKENS.
@@ -866,7 +877,7 @@ async fn cache_load(
 
     if !all_tokens.is_empty() {
         tokio::task::block_in_place(|| {
-            let _ = state.model.forward_cached(&all_tokens, &mut cache);
+            let _ = state.engine.forward_cached(&all_tokens, &mut cache);
         });
     }
 
@@ -926,7 +937,7 @@ async fn cache_append(
 
     if !req.tokens.is_empty() {
         tokio::task::block_in_place(|| {
-            let _ = state.model.forward_cached(&req.tokens, &mut entry.cache);
+            let _ = state.engine.forward_cached(&req.tokens, &mut entry.cache);
         });
         entry.tokens.extend_from_slice(&req.tokens);
     }
@@ -1121,8 +1132,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cache_enabled = cli.enable_cache || cli.enable_retrieve;
     let retrieve_enabled = cli.enable_retrieve;
 
+    // Wrap the loaded model in a GpuEngine. Reuses the GpuDevice the loader
+    // built (the layers' resident weights are tied to it — building a second
+    // device produces cross-device buffer-binding errors, see #16).
+    let gpu = loaded.gpu.clone()
+        .ok_or_else(|| std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "cortex-server requires a discrete GPU; none detected",
+        ))?;
+    let engine = cortex::layers::gpu_engine::GpuEngine::with_max_seq(
+        loaded.model, gpu, cli.max_seq_len,
+    );
+
     let state = Arc::new(ServerState {
-        model: loaded.model,
+        engine,
         tokenizer: loaded.tokenizer,
         config: loaded.config,
         cache_pool: Mutex::new(HashMap::new()),

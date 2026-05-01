@@ -8,8 +8,13 @@ struct Params { n: u32, n_tokens: u32 }
 @group(0) @binding(3) var<uniform> params: Params;
 
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) num_wg: vec3<u32>,
+) {
+    // 2D dispatch when 1D would exceed 65535 workgroups (Qwen 3B intermediate
+    // 11008 × 2318 tokens / 256 = ~99k). i = gid.x + gid.y * (num_wg.x * 256).
+    let i = gid.x + gid.y * num_wg.x * 256u;
     let total = params.n * params.n_tokens;
     if (i >= total) { return; }
     let g = gate[i];

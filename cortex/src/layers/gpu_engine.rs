@@ -465,6 +465,190 @@ impl GpuEngine {
         self.cpu.finalize_logits(&normed, tokens.len())
     }
 
+    /// Like `forward_full_gpu_traced` but skips the output projection
+    /// entirely (no logits computed). Retrieval doesn't need logits; the
+    /// per-token GpuFloatLinear vocab projection across 2000+ tokens is the
+    /// expensive part and was hanging the server.
+    pub fn forward_traced_scores_only(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        capture_layers: &[usize],
+    ) -> Vec<Vec<f32>> {
+        let (_logits, scores) = self.forward_traced_inner(tokens, start_pos, capture_layers, false);
+        scores
+    }
+
+    /// Forward pass that captures pre-softmax attention scores for the
+    /// requested layers. Used by retrieval (memex) — the per-position
+    /// attention weight aggregation in `cortex-cloud`'s `/v1/retrieve`
+    /// handler reads these scores.
+    ///
+    /// `capture_layers`: indices of blocks whose pre-softmax attention
+    /// scores should be captured. Each capture is sized
+    /// `[n_tokens, n_heads, n_tokens]` f32 = O(n_tokens² × n_heads × 4)
+    /// bytes per layer. For Qwen 3B at 2300 tokens × 16 heads × 4 bytes,
+    /// that's ~340 MB per layer, so callers should keep the set small.
+    /// memex architecture suggests "last few layers" carry the retrieval
+    /// signal; default in cortex-cloud is the last 4.
+    ///
+    /// Returns `(logits, per_layer_scores)` where `per_layer_scores[i]`
+    /// is the captured pre-softmax tensor for `capture_layers[i]`,
+    /// flat as `[n_tokens, n_heads, n_tokens]`.
+    pub fn forward_full_gpu_traced(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        capture_layers: &[usize],
+    ) -> (Vec<f32>, Vec<Vec<f32>>) {
+        self.forward_traced_inner(tokens, start_pos, capture_layers, true)
+    }
+
+    fn forward_traced_inner(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        capture_layers: &[usize],
+        compute_logits: bool,
+    ) -> (Vec<f32>, Vec<Vec<f32>>) {
+        let n_tokens = tokens.len();
+        assert!(n_tokens > 0, "must have at least one token");
+        let n_layers = self.cpu.n_layers();
+        for &l in capture_layers {
+            assert!(l < n_layers, "capture layer {l} out of range (n_layers={n_layers})");
+        }
+
+        // ---- 1. Embedding lookup (CPU) ----
+        let embed_data = self.cpu.embedding_data();
+        let vocab_size = self.cpu.vocab_size();
+        let mut hidden_init: Vec<f32> = Vec::with_capacity(n_tokens * self.embed_dim);
+        for &tok in tokens {
+            assert!((tok as usize) < vocab_size, "token {tok} out of vocab");
+            let off = tok as usize * self.embed_dim;
+            hidden_init.extend_from_slice(&embed_data[off..off + self.embed_dim]);
+        }
+
+        // ---- Allocate buffers ----
+        let bytes = (hidden_init.len() * std::mem::size_of::<f32>()) as u64;
+        let hidden_buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("forward_full_traced.hidden"),
+            contents: bytemuck::cast_slice(&hidden_init),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let normed_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("forward_full_traced.normed"),
+            size: bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let normed_staging = self.gpu.create_staging_buffer(bytes);
+
+        let attn0 = self.cpu.blocks()[0].attention();
+        let intermediate = self.cpu.blocks()[0].ffn().as_any()
+            .downcast_ref::<crate::layers::swiglu::SwiGLU>()
+            .unwrap_or_else(|| panic!("forward_full_gpu_traced requires SwiGLU FFN"))
+            .intermediate_size();
+        let n_heads = attn0.n_heads();
+        let scratch = BlockScratch::allocate(
+            &self.gpu, n_tokens, self.embed_dim,
+            n_heads, attn0.n_kv_heads(), attn0.head_dim(),
+            intermediate, n_tokens,
+        );
+
+        // Per-captured-layer score storage buffers. Same shape as scratch.scores
+        // but persistent across the whole forward.
+        let scores_bytes = (n_tokens * n_heads * n_tokens * std::mem::size_of::<f32>()) as u64;
+        let capture_bufs: Vec<wgpu::Buffer> = capture_layers.iter().map(|&l| {
+            self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("forward_full_traced.scores.layer{l}")),
+                size: scores_bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        }).collect();
+        let capture_stagings: Vec<wgpu::Buffer> = (0..capture_layers.len())
+            .map(|_| self.gpu.create_staging_buffer(scores_bytes))
+            .collect();
+
+        // Build a layer_idx -> capture_buf lookup for O(1) access in the loop.
+        let capture_lookup: std::collections::HashMap<usize, &wgpu::Buffer> =
+            capture_layers.iter().zip(capture_bufs.iter())
+                .map(|(&l, buf)| (l, buf))
+                .collect();
+
+        // ---- 2-3. All blocks + final_norm in one encoder ----
+        let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("forward_full_traced.encoder"),
+        });
+        for i in 0..n_layers {
+            let capture = capture_lookup.get(&i).copied();
+            self.forward_block_gpu_inner(&mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch, capture);
+        }
+        self.dispatch_rmsnorm_into(
+            &mut encoder, &hidden_buf, &self.final_norm_weight_buf, &normed_buf,
+            self.embed_dim, n_tokens, self.final_norm_eps,
+        );
+        encoder.copy_buffer_to_buffer(&normed_buf, 0, &normed_staging, 0, bytes);
+        for (cap_buf, stg_buf) in capture_bufs.iter().zip(capture_stagings.iter()) {
+            encoder.copy_buffer_to_buffer(cap_buf, 0, stg_buf, 0, scores_bytes);
+        }
+        self.gpu.queue.submit(Some(encoder.finish()));
+
+        // Issue all map_async calls together, then poll once. Sequential
+        // poll(Wait) per buffer was hanging — possibly because the wgpu
+        // device only fires callbacks inside poll, and re-polling after
+        // a buffer's already mapped doesn't re-fire pending callbacks for
+        // others in some cases. Single poll drives all of them at once.
+        use std::sync::mpsc;
+        let mut receivers: Vec<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>> = Vec::with_capacity(1 + capture_stagings.len());
+        let normed_slice = normed_staging.slice(..);
+        let (tx, rx) = mpsc::channel();
+        normed_slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+        receivers.push(rx);
+        let capture_slices: Vec<wgpu::BufferSlice> = capture_stagings.iter().map(|stg| {
+            let slice = stg.slice(..);
+            let (tx, rx) = mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+            receivers.push(rx);
+            slice
+        }).collect();
+
+        self.gpu.device.poll(wgpu::Maintain::Wait);
+        for rx in &receivers {
+            rx.recv().expect("readback channel closed").expect("buffer map failed");
+        }
+
+        // ---- Decode the readbacks ----
+        let normed: Vec<f32> = {
+            let data = normed_slice.get_mapped_range();
+            let v: Vec<f32> = data[..bytes as usize].chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            drop(data);
+            normed_staging.unmap();
+            v
+        };
+        let per_layer_scores: Vec<Vec<f32>> = capture_slices.iter().zip(capture_stagings.iter()).map(|(slice, stg)| {
+            let data = slice.get_mapped_range();
+            let v: Vec<f32> = data[..scores_bytes as usize].chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            drop(data);
+            stg.unmap();
+            v
+        }).collect();
+
+        // ---- 4. Output projection (CPU; vocab matmul deferred). Skipped
+        //         when caller doesn't need logits (retrieve path) — that
+        //         saves 2000+ per-token GpuFloatLinear calls and the
+        //         staging-buffer churn that comes with them. ----
+        let logits = if compute_logits {
+            self.cpu.finalize_logits(&normed, n_tokens)
+        } else {
+            Vec::new()
+        };
+
+        (logits, per_layer_scores)
+    }
+
     /// **Phase 1 close — full forward on GPU.** Embedding lookup runs CPU
     /// (cheap; saves an embedding-gather shader for now), then ALL N blocks
     /// chain into one command encoder against resident weights, then
@@ -571,6 +755,21 @@ impl GpuEngine {
         start_pos: usize,
         scratch: &BlockScratch,
     ) {
+        self.forward_block_gpu_inner(encoder, block_idx, hidden_buf, n_tokens, start_pos, scratch, None);
+    }
+
+    /// Same as `forward_block_gpu` but with optional pre-softmax score
+    /// capture for retrieval / traced forward use.
+    fn forward_block_gpu_inner(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        block_idx: usize,
+        hidden_buf: &wgpu::Buffer,
+        n_tokens: usize,
+        start_pos: usize,
+        scratch: &BlockScratch,
+        pre_softmax_capture: Option<&wgpu::Buffer>,
+    ) {
         let block = &self.cpu.blocks()[block_idx];
         let block_gpu = &self.blocks_gpu[block_idx];
         let attn = block.attention();
@@ -636,12 +835,14 @@ impl GpuEngine {
 
         // 6. Attention math: Q · K^T, softmax, weighted V. For prefill mode
         //    start_pos=0 and max_seq=n_tokens (the K/V buffers ARE the cache).
-        self.dispatch_attention_into(
+        //    If we're tracing, also capture pre-softmax scores.
+        self.dispatch_attention_inner(
             encoder,
             &scratch.q, &scratch.k, &scratch.v,
             &scratch.scores, &scratch.attn_out,
             n_heads, n_kv_heads, head_dim,
             start_pos, n_tokens, n_tokens,
+            pre_softmax_capture,
         );
 
         // 7. O projection: attn_out -> projected
@@ -838,6 +1039,35 @@ impl GpuEngine {
         max_seq: usize,
         n_tokens: usize,
     ) {
+        self.dispatch_attention_inner(
+            encoder, q_buf, k_buf, v_buf, scores_buf, out_buf,
+            n_heads, n_kv_heads, head_dim, start_pos, max_seq, n_tokens,
+            None,
+        );
+    }
+
+    /// Same as `dispatch_attention_into` but if `pre_softmax_capture` is
+    /// `Some`, the pre-softmax `scores_buf` contents are copied into it
+    /// after the attn_score dispatch and before softmax overwrites them.
+    /// Used by the retrieval / traced forward path to extract per-layer
+    /// raw attention scores.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_attention_inner(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        q_buf: &wgpu::Buffer,
+        k_buf: &wgpu::Buffer,
+        v_buf: &wgpu::Buffer,
+        scores_buf: &wgpu::Buffer,
+        out_buf: &wgpu::Buffer,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        start_pos: usize,
+        max_seq: usize,
+        n_tokens: usize,
+        pre_softmax_capture: Option<&wgpu::Buffer>,
+    ) {
         assert!(n_heads % n_kv_heads == 0, "n_heads must be divisible by n_kv_heads");
         let heads_per_kv = n_heads / n_kv_heads;
         let kv_dim = n_kv_heads * head_dim;
@@ -862,9 +1092,12 @@ impl GpuEngine {
             score_pipeline,
             &[q_buf, k_buf, scores_buf, &score_params_buf],
         );
-        // One thread per (tok, head, t); workgroup_size=256.
-        let total_score_threads = (n_tokens * n_heads * max_seq) as u32;
-        let score_groups = (total_score_threads + 255) / 256;
+        // 2D dispatch matches the updated attn_score_batch shader:
+        // gid.x covers (head, t), gid.y covers tok. 1D would exceed the
+        // 65535-per-dim limit for big corpora.
+        let inner_threads = (n_heads * max_seq) as u32;
+        let score_groups_x = (inner_threads + 255) / 256;
+        let score_groups_y = n_tokens as u32;
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("gpu_engine.attn_score.pass"),
@@ -872,7 +1105,13 @@ impl GpuEngine {
             });
             pass.set_pipeline(score_pipeline);
             pass.set_bind_group(0, &score_bind, &[]);
-            pass.dispatch_workgroups(score_groups, 1, 1);
+            pass.dispatch_workgroups(score_groups_x, score_groups_y, 1);
+        }
+
+        // ---- 1.5. (optional) capture pre-softmax scores ----
+        if let Some(capture_buf) = pre_softmax_capture {
+            let bytes = (n_tokens * n_heads * max_seq * std::mem::size_of::<f32>()) as u64;
+            encoder.copy_buffer_to_buffer(scores_buf, 0, capture_buf, 0, bytes);
         }
 
         // ---- 2. softmax: in-place over scores ----
@@ -953,8 +1192,12 @@ impl GpuEngine {
             &[gate_buf, up_buf, out_buf, &params_buf],
         );
 
+        // 2D dispatch when total exceeds 65535 X-dim workgroups (Qwen 3B
+        // FFN intermediate=11008 × 2318 tokens / 256 = ~99k).
         let total = (n * n_tokens) as u32;
         let groups = (total + 255) / 256;
+        let dx = groups.min(65535);
+        let dy = (groups + 65534) / 65535;
 
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("gpu_engine.silu_mul.pass"),
@@ -962,7 +1205,7 @@ impl GpuEngine {
         });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind, &[]);
-        pass.dispatch_workgroups(groups, 1, 1);
+        pass.dispatch_workgroups(dx, dy, 1);
     }
 
     /// Dispatch broadcast bias add: `a[tok, i] += bias[i]` for all tokens.
@@ -1135,6 +1378,27 @@ impl GpuEngine {
     ) -> Vec<u32> {
         self.cpu.generate(prompt, max_tokens, sampler_config, seed, stop_token)
     }
+}
+
+/// Read back a buffer's contents to a `Vec<f32>`. The buffer must have
+/// `MAP_READ` usage (typically created via `create_staging_buffer`) and
+/// must already be the destination of a copy_buffer_to_buffer that was
+/// included in the most recent submit.
+fn read_back_buffer(gpu: &GpuDevice, staging: &wgpu::Buffer, bytes: usize) -> Vec<f32> {
+    let slice = staging.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        tx.send(result).ok();
+    });
+    gpu.device.poll(wgpu::Maintain::Wait);
+    rx.recv().expect("readback failed").expect("buffer map failed");
+    let data = slice.get_mapped_range();
+    let out: Vec<f32> = data[..bytes].chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    drop(data);
+    staging.unmap();
+    out
 }
 
 impl std::fmt::Debug for GpuEngine {
@@ -1978,6 +2242,77 @@ mod tests {
                 (c - g).abs()
             );
         }
+    }
+
+    #[test]
+    fn forward_full_gpu_traced_matches_cpu_traced() {
+        // Validates that the captured pre-softmax scores match what CPU
+        // forward_traced would produce. Same toy model in both paths
+        // (CPU FloatLinear vs GPU GpuFloatLinear, identical seeded weights).
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let cpu_ref = toy_float_multi_block_cpu(2);
+        let gpu_model = toy_float_multi_block_for_gpu(gpu.clone(), 2);
+        let engine = GpuEngine::with_max_seq(gpu_model, gpu.clone(), 16);
+
+        let tokens = vec![1u32, 2, 3];
+        let n_tokens = tokens.len();
+        let n_layers = 2;
+        let n_heads = 1;
+
+        let (cpu_logits, cpu_trace) = cpu_ref.forward_traced(&tokens);
+        let (gpu_logits, gpu_per_layer) =
+            engine.forward_full_gpu_traced(&tokens, 0, &(0..n_layers).collect::<Vec<_>>());
+
+        // Logits should match within tolerance (same as forward_full_gpu test).
+        assert_eq!(cpu_logits.len(), gpu_logits.len());
+        for (i, (c, g)) in cpu_logits.iter().zip(&gpu_logits).enumerate() {
+            assert!((c - g).abs() < 0.1, "logit {i}: cpu={c} gpu={g}");
+        }
+
+        // Pre-softmax scores: per-layer comparison.
+        // CPU layout: [n_heads, seq_len, seq_len] flat; row(layer, h, q) returns &[seq_len].
+        // GPU layout: [n_tokens, n_heads, n_tokens] flat (matches attn_score_batch shader).
+        // These are different orderings — we have to index carefully.
+        for layer in 0..n_layers {
+            let gpu_scores = &gpu_per_layer[layer];
+            assert_eq!(gpu_scores.len(), n_tokens * n_heads * n_tokens);
+            for h in 0..n_heads {
+                for q in 0..n_tokens {
+                    let cpu_row = cpu_trace.pre_score_row(layer, h, q);
+                    // Causal: only positions 0..=q are real; rest -inf -> filtered by callers.
+                    for k in 0..=q {
+                        let gpu_idx = q * n_heads * n_tokens + h * n_tokens + k;
+                        let gpu_v = gpu_scores[gpu_idx];
+                        let cpu_v = cpu_row[k];
+                        assert!(
+                            (cpu_v - gpu_v).abs() < 0.05,
+                            "layer={layer} h={h} q={q} k={k}: cpu={cpu_v} gpu={gpu_v}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn forward_full_gpu_traced_capture_subset() {
+        // Capturing only a subset of layers: check we get back exactly
+        // those layers' worth of buffers.
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let gpu_model = toy_float_multi_block_for_gpu(gpu.clone(), 4);
+        let engine = GpuEngine::with_max_seq(gpu_model, gpu, 16);
+
+        let tokens = vec![0u32, 1, 2];
+        // Capture only layers 1 and 3.
+        let (_logits, per_layer) = engine.forward_full_gpu_traced(&tokens, 0, &[1, 3]);
+        assert_eq!(per_layer.len(), 2);
+        // Each capture is [n_tokens=3, n_heads=1, n_tokens=3] = 9 floats.
+        assert_eq!(per_layer[0].len(), 9);
+        assert_eq!(per_layer[1].len(), 9);
     }
 
     #[test]
