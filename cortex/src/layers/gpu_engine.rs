@@ -127,6 +127,16 @@ struct SiluMulBatchParams {
     n_tokens: u32,
 }
 
+/// Params struct for the kv_write_batch shader. Four u32s.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct KvWriteBatchParams {
+    kv_dim: u32,
+    start_pos: u32,
+    n_tokens: u32,
+    _pad: u32,
+}
+
 /// Params struct for the add_inplace_batch shader. Two u32s.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -582,7 +592,7 @@ impl GpuEngine {
         });
         for i in 0..n_layers {
             let capture = capture_lookup.get(&i).copied();
-            self.forward_block_gpu_inner(&mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch, capture);
+            self.forward_block_gpu_inner(&mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch, capture, None);
         }
         self.dispatch_rmsnorm_into(
             &mut encoder, &hidden_buf, &self.final_norm_weight_buf, &normed_buf,
@@ -647,6 +657,103 @@ impl GpuEngine {
         };
 
         (logits, per_layer_scores)
+    }
+
+    /// Forward pass that writes new K/V into the supplied `cache` and reads
+    /// the full prefix from the cache during attention. Both prefill (cache
+    /// initially empty, `cache.seq_len() == 0`) and decode (cache populated,
+    /// new tokens at positions `[cache.seq_len(), cache.seq_len() + n_tokens)`)
+    /// are handled by the same code path — `cache.seq_len()` becomes the
+    /// RoPE/attention `start_pos`, and the cache buffers are sized for the
+    /// full prefix.
+    ///
+    /// On success the cache's write cursor is advanced by `n_tokens`.
+    /// Returns logits over vocab for each new token (same shape as
+    /// `forward_full_gpu`).
+    pub fn forward_full_gpu_with_cache(
+        &self,
+        tokens: &[u32],
+        cache: &mut crate::layers::gpu_kv_cache::GpuKvCache,
+    ) -> Vec<f32> {
+        let n_tokens = tokens.len();
+        assert!(n_tokens > 0, "must have at least one token");
+
+        let n_layers = self.cpu.n_layers();
+        assert_eq!(n_layers, cache.n_layers(), "cache layer count mismatch");
+
+        let attn0 = self.cpu.blocks()[0].attention();
+        assert_eq!(cache.n_kv_heads(), attn0.n_kv_heads(), "cache n_kv_heads mismatch");
+        assert_eq!(cache.head_dim(), attn0.head_dim(), "cache head_dim mismatch");
+
+        let start_pos = cache.seq_len();
+        assert!(
+            start_pos + n_tokens <= cache.max_seq_len(),
+            "cache overflow: {} + {} > {}",
+            start_pos, n_tokens, cache.max_seq_len(),
+        );
+
+        // ---- Embedding lookup (CPU) ----
+        let embed_data = self.cpu.embedding_data();
+        let vocab_size = self.cpu.vocab_size();
+        let mut hidden_init: Vec<f32> = Vec::with_capacity(n_tokens * self.embed_dim);
+        for &tok in tokens {
+            assert!((tok as usize) < vocab_size, "token {tok} out of vocab");
+            let off = tok as usize * self.embed_dim;
+            hidden_init.extend_from_slice(&embed_data[off..off + self.embed_dim]);
+        }
+
+        let bytes = (hidden_init.len() * std::mem::size_of::<f32>()) as u64;
+        let hidden_buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("forward_with_cache.hidden"),
+            contents: bytemuck::cast_slice(&hidden_init),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let normed_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("forward_with_cache.normed"),
+            size: bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging = self.gpu.create_staging_buffer(bytes);
+
+        let intermediate = self.cpu.blocks()[0].ffn().as_any()
+            .downcast_ref::<crate::layers::swiglu::SwiGLU>()
+            .unwrap_or_else(|| panic!("forward_full_gpu_with_cache requires SwiGLU FFN"))
+            .intermediate_size();
+
+        // Scratch sized for ATTENTION over the full prefix (max_seq =
+        // start_pos + n_tokens). Scores buffer must hold the score grid.
+        let attn_max_seq = start_pos + n_tokens;
+        let scratch = BlockScratch::allocate(
+            &self.gpu, n_tokens, self.embed_dim,
+            attn0.n_heads(), attn0.n_kv_heads(), attn0.head_dim(),
+            intermediate, attn_max_seq,
+        );
+
+        // ---- All blocks + final_norm in one encoder ----
+        let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("forward_with_cache.encoder"),
+        });
+        for i in 0..n_layers {
+            let target = (cache.k_layer(i), cache.v_layer(i));
+            self.forward_block_gpu_inner(
+                &mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch,
+                None, Some(target),
+            );
+        }
+        self.dispatch_rmsnorm_into(
+            &mut encoder, &hidden_buf, &self.final_norm_weight_buf, &normed_buf,
+            self.embed_dim, n_tokens, self.final_norm_eps,
+        );
+        encoder.copy_buffer_to_buffer(&normed_buf, 0, &staging, 0, bytes);
+        self.gpu.queue.submit(Some(encoder.finish()));
+
+        let normed = read_back_buffer(&self.gpu, &staging, bytes as usize);
+        let logits = self.cpu.finalize_logits(&normed, n_tokens);
+
+        // Successful forward — bump the cache's write cursor.
+        cache.advance(n_tokens);
+        logits
     }
 
     /// **Phase 1 close — full forward on GPU.** Embedding lookup runs CPU
@@ -755,11 +862,20 @@ impl GpuEngine {
         start_pos: usize,
         scratch: &BlockScratch,
     ) {
-        self.forward_block_gpu_inner(encoder, block_idx, hidden_buf, n_tokens, start_pos, scratch, None);
+        self.forward_block_gpu_inner(encoder, block_idx, hidden_buf, n_tokens, start_pos, scratch, None, None);
     }
 
     /// Same as `forward_block_gpu` but with optional pre-softmax score
-    /// capture for retrieval / traced forward use.
+    /// capture for retrieval / traced forward use, plus optional KV cache
+    /// targeting for cached forward (decode + cached prefill).
+    ///
+    /// When `kv_cache_target` is Some, this block's projected K/V get
+    /// written into the supplied cache buffers at offset `start_pos`, and
+    /// the attention dispatch reads K/V back from the cache (with
+    /// max_seq = start_pos + n_tokens) so the new tokens attend over the
+    /// full prefix. When None, K/V live only in scratch and attention reads
+    /// scratch (the prefill-only path).
+    #[allow(clippy::too_many_arguments)]
     fn forward_block_gpu_inner(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -769,6 +885,7 @@ impl GpuEngine {
         start_pos: usize,
         scratch: &BlockScratch,
         pre_softmax_capture: Option<&wgpu::Buffer>,
+        kv_cache_target: Option<(&wgpu::Buffer, &wgpu::Buffer)>,
     ) {
         let block = &self.cpu.blocks()[block_idx];
         let block_gpu = &self.blocks_gpu[block_idx];
@@ -833,15 +950,33 @@ impl GpuEngine {
             n_kv_heads, head_dim, start_pos, n_tokens,
         );
 
-        // 6. Attention math: Q · K^T, softmax, weighted V. For prefill mode
-        //    start_pos=0 and max_seq=n_tokens (the K/V buffers ARE the cache).
-        //    If we're tracing, also capture pre-softmax scores.
+        // 5.5 (cached path) Write the freshly-projected, RoPE-rotated K/V
+        // into the layer's resident cache buffers at offset start_pos.
+        // Attention will then read K/V from the cache covering the full
+        // prefix [0, start_pos + n_tokens).
+        if let Some((k_cache, v_cache)) = kv_cache_target {
+            self.dispatch_kv_write_into(
+                encoder, &scratch.k, &scratch.v, k_cache, v_cache,
+                kv_dim, start_pos, n_tokens,
+            );
+        }
+
+        // 6. Attention math: Q · K^T, softmax, weighted V.
+        //
+        // - Prefill-only (no cache): K/V live in scratch.k / scratch.v;
+        //   start_pos=0, max_seq=n_tokens.
+        // - Cached: K/V come from the cache buffers; max_seq = start_pos +
+        //   n_tokens covers the full prefix the new tokens attend to.
+        let (k_for_attn, v_for_attn, attn_max_seq) = match kv_cache_target {
+            Some((kc, vc)) => (kc, vc, start_pos + n_tokens),
+            None => (&scratch.k, &scratch.v, n_tokens),
+        };
         self.dispatch_attention_inner(
             encoder,
-            &scratch.q, &scratch.k, &scratch.v,
+            &scratch.q, k_for_attn, v_for_attn,
             &scratch.scores, &scratch.attn_out,
             n_heads, n_kv_heads, head_dim,
-            start_pos, n_tokens, n_tokens,
+            start_pos, attn_max_seq, n_tokens,
             pre_softmax_capture,
         );
 
@@ -1201,6 +1336,50 @@ impl GpuEngine {
 
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("gpu_engine.silu_mul.pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(dx, dy, 1);
+    }
+
+    /// Dispatch kv_write_batch: copy K and V vectors for `n_tokens` new
+    /// positions from per-block scratch buffers into the layer's resident
+    /// cache buffers, starting at offset `start_pos` (in tokens). Used by
+    /// the cached forward path.
+    pub fn dispatch_kv_write_into(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        k_src: &wgpu::Buffer,
+        v_src: &wgpu::Buffer,
+        k_cache: &wgpu::Buffer,
+        v_cache: &wgpu::Buffer,
+        kv_dim: usize,
+        start_pos: usize,
+        n_tokens: usize,
+    ) {
+        let params = KvWriteBatchParams {
+            kv_dim: kv_dim as u32,
+            start_pos: start_pos as u32,
+            n_tokens: n_tokens as u32,
+            _pad: 0,
+        };
+        let params_buf = self.gpu.create_params_buffer(&params);
+
+        let pipeline = &self.gpu.pipelines.kv_write_batch;
+        let bind = self.gpu.make_bind_group(
+            pipeline,
+            &[k_src, v_src, k_cache, v_cache, &params_buf],
+        );
+
+        // 2D dispatch in case kv_dim * n_tokens / 128 exceeds 65535.
+        let total = (kv_dim * n_tokens) as u32;
+        let groups = (total + 127) / 128;
+        let dx = groups.min(65535);
+        let dy = (groups + 65534) / 65535;
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_engine.kv_write.pass"),
             timestamp_writes: None,
         });
         pass.set_pipeline(pipeline);
@@ -2292,6 +2471,90 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn forward_with_cache_prefill_matches_no_cache() {
+        // Cached forward starting from an EMPTY cache should be identical
+        // to plain forward_full_gpu — both run the same dispatches over
+        // start_pos=0, n_tokens=N. Validates the kv_write + cache-read path.
+        use crate::layers::gpu_kv_cache::GpuKvCache;
+
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let gpu_model = toy_float_multi_block_for_gpu(gpu.clone(), 2);
+        let attn0 = gpu_model.blocks()[0].attention();
+        let n_layers = gpu_model.n_layers();
+        let n_kv_heads = attn0.n_kv_heads();
+        let head_dim = attn0.head_dim();
+
+        let engine = GpuEngine::with_max_seq(gpu_model, gpu.clone(), 16);
+
+        let tokens = vec![1u32, 2, 3];
+        let no_cache_logits = engine.forward_full_gpu(&tokens, 0);
+
+        let mut cache = GpuKvCache::new(gpu, n_layers, n_kv_heads, head_dim, 16);
+        let cached_logits = engine.forward_full_gpu_with_cache(&tokens, &mut cache);
+
+        assert_eq!(cache.seq_len(), tokens.len());
+        assert_eq!(no_cache_logits.len(), cached_logits.len());
+        for (i, (a, b)) in no_cache_logits.iter().zip(&cached_logits).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-3,
+                "logit {i}: no_cache={a} cached={b} (diff={})",
+                (a - b).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn forward_with_cache_decode_matches_full_forward() {
+        // Validates the decode path: prefill [1,2,3] then decode [4,5]
+        // through the cache should produce logits matching positions 3
+        // and 4 of forward_full_gpu([1,2,3,4,5]).
+        use crate::layers::gpu_kv_cache::GpuKvCache;
+
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let gpu_model = toy_float_multi_block_for_gpu(gpu.clone(), 2);
+        let attn0 = gpu_model.blocks()[0].attention();
+        let n_layers = gpu_model.n_layers();
+        let n_kv_heads = attn0.n_kv_heads();
+        let head_dim = attn0.head_dim();
+        let vocab_size = gpu_model.vocab_size();
+
+        let engine = GpuEngine::with_max_seq(gpu_model, gpu.clone(), 16);
+
+        let prefill = vec![1u32, 2, 3];
+        let decode = vec![0u32, 1];
+        let all: Vec<u32> = prefill.iter().chain(decode.iter()).copied().collect();
+
+        // Reference: single big forward over [1,2,3,0,1].
+        let ref_logits = engine.forward_full_gpu(&all, 0);
+
+        // Cached path: prefill then decode.
+        let mut cache = GpuKvCache::new(gpu, n_layers, n_kv_heads, head_dim, 16);
+        let _ = engine.forward_full_gpu_with_cache(&prefill, &mut cache);
+        assert_eq!(cache.seq_len(), 3);
+        let decode_logits = engine.forward_full_gpu_with_cache(&decode, &mut cache);
+        assert_eq!(cache.seq_len(), 5);
+
+        // decode_logits is logits for the 2 decode tokens (positions 3 and 4
+        // of the full sequence). They should match the corresponding rows
+        // of ref_logits.
+        for tok_idx in 0..decode.len() {
+            let global_pos = prefill.len() + tok_idx;
+            let ref_row = &ref_logits[global_pos * vocab_size..(global_pos + 1) * vocab_size];
+            let decode_row = &decode_logits[tok_idx * vocab_size..(tok_idx + 1) * vocab_size];
+            for (i, (r, d)) in ref_row.iter().zip(decode_row).enumerate() {
+                assert!(
+                    (r - d).abs() < 1e-2,
+                    "tok {tok_idx} (global pos {global_pos}) logit {i}: ref={r} decoded={d}",
+                );
             }
         }
     }
