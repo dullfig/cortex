@@ -630,8 +630,8 @@ async fn chat_completions(
 
         let retrieve_start = Instant::now();
 
-        // Capture only the last 4 layers' pre-softmax scores (memex
-        // architecture: "last few layers carry the retrieval signal").
+        // Capture the last 4 layers' pre-softmax scores (memex architecture:
+        // "last few layers carry the retrieval signal").
         let n_layers_total = state.engine.n_layers();
         let n_heads = state.engine.cpu().blocks()[0].attention().n_heads();
         let capture_start = n_layers_total.saturating_sub(4);
@@ -655,21 +655,30 @@ async fn chat_completions(
         let q_lo = n_query.saturating_sub(query_window);
         let q_hi = n_query;
 
+        // Score each corpus position by MAX pre-softmax attention across
+        // the captured layers x heads x last-N query positions.
+        //
+        // Empirical (2026-05-04 experiment vs MEAN, Qwen 2.5-3B base, 1941
+        // Harmonizer): MEAN aggregation produced identical top-4 hits for
+        // 7 different queries — the always-high-attention positions
+        // (masthead, end-of-doc, vivid quote) dominate. MAX preserved
+        // those in slots #1-2 but gave query-specific variation in slots
+        // #3-5. memex iteration may want to add baseline subtraction to
+        // cancel the always-hot positions and surface differential signal.
         let mut scores = vec![f32::NEG_INFINITY; corpus_len];
         for k in 0..corpus_len {
-            let mut total = 0.0f32;
-            let mut count = 0usize;
+            let mut max_val = f32::NEG_INFINITY;
             for layer_scores in &per_layer_scores {
                 for h in 0..n_heads {
                     for q in q_lo..q_hi {
                         let idx = q * n_heads * attn_max_seq + h * attn_max_seq + k;
-                        total += layer_scores[idx];
-                        count += 1;
+                        let v = layer_scores[idx];
+                        if v > max_val { max_val = v; }
                     }
                 }
             }
-            if count > 0 {
-                scores[k] = total / count as f32;
+            if max_val.is_finite() {
+                scores[k] = max_val;
             }
         }
         let selected_layers = capture_layers;

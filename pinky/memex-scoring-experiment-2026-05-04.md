@@ -1,0 +1,125 @@
+# Memex retrieval scoring: MEAN vs MAX (2026-05-04)
+
+**TL;DR:** With Qwen 2.5-3B base + 1941 Harmonizer corpus, **mean-aggregated**
+attention scoring returns identical top-4 hits across 7 different queries
+(the algorithm finds "high-attention everywhere" positions, not
+query-relevant ones). **Max-aggregated** scoring preserves those positions
+in slots #1-2 but produces query-discriminating hits in slots #3-5. Cortex
+default switched to MAX; memex iteration may want a baseline-subtraction
+step to also remove the always-hot positions.
+
+## Setup
+
+- Model: Qwen 2.5-3B base (Q4_K_M, downloaded from `bartowski/Qwen2.5-3B-GGUF`)
+- Corpus: `1941-11_rechordings-vol1-no1.md` (2284 tokens, hand-curated
+  markdown of the first Harmonizer-precursor newsletter)
+- Cache: 4 sink tokens prepended (`SINK_TOKENS = 4`); shard seq_len = 2288
+- Path: `forward_full_gpu_with_cache_traced` — captures pre-softmax
+  attention scores from the last 4 layers, returns scores for the query
+  positions over the full prefix (corpus + query).
+- Scoring (variable): aggregate `(layers x heads x last 3 query positions)
+  -> per-corpus-position score`, then rank.
+
+## Run 1: MEAN aggregation, base model, 7 queries
+
+Same exact top-4 positions for every query. Position #5 wiggled slightly.
+
+| Query | #1 | #2 | #3 | #4 | #5 |
+|---|---|---|---|---|---|
+| Who founded the society? | 28 | 417 | 2100 | 42 | 44 |
+| Where did O.C. Cash grow up? | 28 | 417 | 2100 | 42 | 128 |
+| Who was the first president? | 28 | 417 | 2100 | 42 | 44 |
+| Tell me about Bluejacket Oklahoma | 28 | 417 | 2100 | 42 | 128 |
+| Who were Ambassadors of Good Will? | 28 | 417 | 2100 | 42 | 44 |
+| What did Joe Wolff say? | 28 | 417 | 2100 | 42 | 44 |
+| What is the masthead address? | 28 | 417 | 2100 | 42 | 128 |
+
+Decoded:
+- 28 = "Q.S.A. Barber Shop Re-Chordings - Vol. 1, No. 1, November 1941" (masthead title)
+- 417 = "City taught us the night I dated her on that hay ride in June, 1910" (Cash's autobiographical hayride paragraph)
+- 2100 = "vault - the seed of the Old Songs Library (now 100,000+ titles) 3." (late meta-commentary)
+- 42 = "Vol. 1, No. 1, November 1941 **The first issue of what would become..."
+- 44 / 128 = nearby title-area / editor-address tokens
+
+These are all "high information density" tokens that the model finds
+useful for almost any query. Averaging across 16 heads * 4 layers *
+3 query positions washes out the query-specific differentiation.
+
+Note: base model removed the SINK ARTIFACT hits that Instruct showed.
+That's a real architectural difference (instruct-tuning adds a softmax-
+sink artifact at position 0/1; base doesn't). But the dominant
+"always hot positions" pattern is the same.
+
+## Run 2: same MEAN, last 1 layer only
+
+Hypothesis: averaging fewer things preserves more signal.
+
+Result: still identical top 4 across all 6 queries (28, 417, 2100, 42).
+SINK artifacts crept back into slot 4-5 (offsets 0/1) — the early
+layers without the masthead averaging "compete" with the dominant
+positions less effectively. **Negative result** — last-N tuning is not
+the lever.
+
+## Run 3: MAX aggregation across layers x heads x query positions
+
+Hypothesis: any single (layer, head, query-position) lighting up for a
+specific corpus position should make that position rank highly. Mean
+washes that out; max preserves it.
+
+| Query | #1 | #2 | #3 | #4 | #5 |
+|---|---|---|---|---|---|
+| Who founded the society? | 28 | 2283 | **2224** | **286** | **330** |
+| Where did O.C. Cash grow up? | 28 | 2283 | **417** | **2100** | **2180** |
+| Who was first president? | 28 | 2283 | **2224** | **330** | **417** |
+| Tell me about Bluejacket Oklahoma | 2283 | 28 | **271** | **124** | **286** |
+| Who were Ambassadors of Good Will? | 28 | 2283 | **417** | **2100** | **271** |
+| What did Joe Wolff say? | 2283 | 28 | **2224** | **330** | **286** |
+
+Slots #1-2 are still 28/2283 (the always-hot positions). **Slots #3-5
+genuinely vary by query.** "Bluejacket Oklahoma" gives uniquely 271, 124
+in its top-5 — neither appears in any other query's top-5. That's real
+query-specific signal.
+
+This is the discriminating evidence the memex architecture predicted
+should exist.
+
+## Open questions for memex iteration
+
+1. **Baseline subtraction.** Run a "neutral" forward (just BOS, or empty
+   prompt) and capture its attention pattern. Subtract from each query's
+   attention. The remainder should highlight the positions a query
+   *differentially* attends to vs the baseline. Specifically:
+       q_score(k) = max_attention_for_query(k) - max_attention_for_baseline(k)
+   The always-hot positions (28, 2283, 417, 2100) would cancel out, and
+   true query-specific positions would surface.
+
+2. **Head selection.** With MAX, *some* heads are doing query-relevant
+   attention. Which ones? Per-head analysis on a known-answer dataset
+   would let us pre-select discriminating heads instead of averaging.
+
+3. **Position-frequency filter.** Track which positions get top-K hits
+   *across* a sample of queries. Positions that appear in >50% of
+   queries' top-5 are "always hot" and can be down-weighted at
+   inference time.
+
+4. **Different layer subsets.** This experiment used last 4 layers.
+   Middle layers (where syntactic vs semantic features differentiate)
+   might give different signal than the last layers' "summary attention."
+
+## What changed in cortex
+
+`/v1/chat/completions` (mode=retrieve) now uses MAX-of-(layers x heads
+x query positions) instead of MEAN. Same shape, same latency (~250ms
+per query against the 1941 corpus on Qwen 3B base).
+
+Implementation: `cortex-cloud/src/main.rs` retrieve handler scoring
+loop. The aggregation knob is currently hardcoded; if memex needs to
+experiment further, the cleanest extension is a per-request scoring
+config (mean | max | baseline-subtract) added to the request schema.
+
+## Latency reference
+
+- Ingest: ~60s for 2284 tokens (slower than Instruct's 27s — could be
+  base-model first-cold-start; not investigated)
+- Retrieve: 250-550ms per query (first query ~550ms warmup, subsequent
+  ~250ms each)
