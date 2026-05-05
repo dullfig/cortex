@@ -257,3 +257,57 @@ in the response correctly identifies which shard each hit came from.
 
 Smoke harness: `multishard-smoke.ps1` at repo root. It assumes the
 server is running and pool is empty.
+
+## Run 6: Composition cache (2026-05-05)
+
+Added a single-slot composition cache to `ServerState`: holds at most
+one `GpuKvCache`, keyed on the ordered list of `(shard_name, version)`.
+Each shard has a `version: u64` that bumps on `cache_load` (overwrite),
+`cache_append`, and chat completions that mutate the shard.
+
+On a multi-shard retrieve request:
+- Snapshot `(shard, version, tokens)` under the pool lock; drop pool lock
+- Lock composition; if `composition.key == request_key`, **reuse**
+- Else clear the existing buffer in place and re-prefill (no buffer alloc;
+  `GpuKvCache::clear()` just resets the cursor, the underlying wgpu
+  buffers stay resident)
+
+Result on the same `multishard-smoke.ps1` harness:
+
+| Query | Before | After | Composition |
+|---|---|---|---|
+| Q1 "Who founded the society?" | 66034 ms | 66434 ms | rebuilt |
+| Q2 "What is barbershop singing?" | 65699 ms | **319 ms** | reused |
+| Q3 "Where did O.C. Cash grow up?" | hung | **337 ms** | reused |
+
+200x speedup on warm queries. Hang gone — Q3 used to hang the wgpu
+driver after the third per-request alloc-and-drop of the composed K/V
+buffers; now there's only one alloc, ever, for a given `max_seq_len`.
+
+Q3's top hit (offset 324 in harm1941, "youth in Bluejacket, Oklahoma")
+also matches what single-shard MAX-with-baseline produced in Run 4
+(offset 324). Cross-shard composition + composition-cache reuse
+preserves the discriminating signal.
+
+### Cache invalidation
+
+Explicit drop on `cache_load` (any shard insert/replace),
+`cache_append` (when tokens were actually appended), and
+`cache_delete`. Plus a passive staleness check on the version field —
+chat completions that mutate a shard bump its version; the next
+multi-shard retrieve sees the version mismatch and rebuilds.
+
+The cache invalidation is intentionally pessimistic: any pool mutation
+drops the composition even if the mutated shard wasn't in the
+composition's key. The cost is a single rebuild on the next
+multi-shard query (~65s for our two-shard demo). Smarter granular
+invalidation is a future tweak if it matters.
+
+### Scope
+
+Composition cache is **retrieve-only**. Chat-mode multi-shard still
+allocates a fresh composed cache per request (and mutates it during
+generation, then drops it). Chat is interactive enough that the
+allocation pressure pattern hasn't surfaced there. If it does, the
+fix is the same idea but harder because chat mutates the composed
+cache during generation.

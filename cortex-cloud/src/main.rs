@@ -82,9 +82,26 @@ struct CacheEntry {
     /// Token history that built this cache. Stored so shards can be composed
     /// by replaying tokens in sequence (which gives correct RoPE positions).
     tokens: Vec<u32>,
+    /// Bumps any time the shard's K/V content changes (load replaces, append
+    /// extends). Used as the staleness witness for the multi-shard
+    /// retrieval `composition` cache below.
+    version: u64,
     #[allow(dead_code)]
     created_at: Instant,
     last_used: Instant,
+}
+
+/// One composed-cache slot, reused across multi-shard retrieve requests so
+/// each query doesn't re-allocate and re-prefill ~85 MiB of K/V buffers.
+/// Populated lazily on first multi-shard retrieve and reused while the
+/// cached `(shard_name, version)` key keeps matching incoming requests.
+struct ComposedEntry {
+    /// Ordered list of `(shard_name, version_at_compose_time)`. Matches
+    /// the request key exactly: same shards, same order, same versions.
+    /// Order matters because RoPE positions depend on token order.
+    key: Vec<(String, u64)>,
+    /// The composed cache itself.
+    cache: GpuKvCache,
 }
 
 struct ServerState {
@@ -99,6 +116,13 @@ struct ServerState {
     /// (librarian deployment). When false (32B Bob deployment), the pool
     /// is empty and cache_shards on requests are ignored.
     cache_pool: Mutex<HashMap<String, CacheEntry>>,
+    /// Single-slot composition cache for multi-shard retrieve. Holds at most
+    /// one composed `GpuKvCache`; reused when the next request's
+    /// `(shard, version)` key matches; rebuilt in place (clear + re-prefill,
+    /// no buffer alloc) when it differs. Critical for stability: rapid
+    /// per-request alloc-and-drop of ~85 MiB buffer arrays hangs the wgpu
+    /// driver after ~3 requests.
+    composition: Mutex<Option<ComposedEntry>>,
     model_name: String,
     start_time: Instant,
     max_seq_len: usize,
@@ -574,72 +598,38 @@ async fn chat_completions(
             ));
         }
 
-        let pool = state.cache_pool.lock().await;
-
-        // Verify all shards exist
-        for shard_name in &shards {
-            if !pool.contains_key(shard_name) {
-                return Err((
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({
-                        "error": {
-                            "type": "cache_not_found",
-                            "message": format!("shard '{}' not found", shard_name),
-                            "cache_id": shard_name,
-                        }
-                    })),
-                ));
-            }
-        }
-
-        // Build the shard_map from cached shard token lists. Note we no
-        // longer concatenate tokens client-side: with cached retrieval, the
-        // K/V prefix already lives on the GPU, so we only forward the QUERY.
+        // Phase 1: under the pool lock, verify every requested shard exists,
+        // snapshot the bits we need (name, version, tokens, length), and
+        // build `shard_map`. After this block we drop the pool lock so the
+        // long forward(s) below don't block other handlers.
+        let snapshot: Vec<(String, u64, Vec<u32>)>;
         let mut shard_map = ShardMap::new();
         let mut corpus_len = 0usize;
-        for shard_name in &shards {
-            let entry = pool.get(shard_name).unwrap();
-            let start = corpus_len;
-            corpus_len += entry.tokens.len();
-            shard_map.add(shard_name.clone(), start, corpus_len);
-        }
-
-        // Single-shard: borrow the existing cache from the pool (fast path).
-        // Multi-shard: replay all shard tokens into a fresh temporary cache,
-        // mirroring the chat path's composition. Either way, the scoring code
-        // below operates on `cache_ref: &GpuKvCache`.
-        let composed_cache: Option<cortex::layers::gpu_kv_cache::GpuKvCache>;
-        let cache_ref: &cortex::layers::gpu_kv_cache::GpuKvCache;
-        if shards.len() == 1 {
-            cache_ref = &pool.get(&shards[0]).unwrap().cache;
-            composed_cache = None;
-            info!(
-                shard = %shards[0],
-                corpus_tokens = corpus_len,
-                query_tokens = prompt_tokens.len(),
-                "retrieval mode: single-shard cached forward",
-            );
-        } else {
-            let mut all_tokens: Vec<u32> = Vec::new();
+        {
+            let pool = state.cache_pool.lock().await;
             for shard_name in &shards {
-                let entry = pool.get(shard_name).unwrap();
-                all_tokens.extend_from_slice(&entry.tokens);
-            }
-            let mut tmp = state.engine.create_gpu_kv_cache(state.max_seq_len);
-            tokio::task::block_in_place(|| {
-                if !all_tokens.is_empty() {
-                    let _ = state.engine.forward_full_gpu_with_cache(&all_tokens, &mut tmp);
+                if !pool.contains_key(shard_name) {
+                    return Err((
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({
+                            "error": {
+                                "type": "cache_not_found",
+                                "message": format!("shard '{}' not found", shard_name),
+                                "cache_id": shard_name,
+                            }
+                        })),
+                    ));
                 }
-            });
-            composed_cache = Some(tmp);
-            cache_ref = composed_cache.as_ref().unwrap();
-            info!(
-                shards = ?shards,
-                composed_tokens = cache_ref.seq_len(),
-                corpus_tokens = corpus_len,
-                query_tokens = prompt_tokens.len(),
-                "retrieval mode: multi-shard composed cached forward",
-            );
+            }
+            snapshot = shards.iter().map(|s| {
+                let e = pool.get(s).unwrap();
+                (s.clone(), e.version, e.tokens.clone())
+            }).collect();
+            for (name, _, tokens) in &snapshot {
+                let start = corpus_len;
+                corpus_len += tokens.len();
+                shard_map.add(name.clone(), start, corpus_len);
+            }
         }
 
         let retrieve_start = Instant::now();
@@ -651,10 +641,105 @@ async fn chat_completions(
         let capture_start = n_layers_total.saturating_sub(4);
         let capture_layers: Vec<usize> = (capture_start..n_layers_total).collect();
 
-        let cache_seq = cache_ref.seq_len();
         let n_query = prompt_tokens.len();
+        let bos = state.tokenizer.bos_token_id();
+        let baseline_tokens = vec![bos];
+        let _ = corpus_len; // already captured in shard_map
+
+        // Phase 2: pick a cache to score against. Single-shard borrows from
+        // the pool's resident cache (no composition needed). Multi-shard
+        // goes through the single-slot `composition` cache: reuse if the
+        // request key matches the cached one, otherwise clear the existing
+        // buffer and re-prefill in place. Critically, multi-shard must NOT
+        // alloc a fresh GpuKvCache per request — that's what hangs the
+        // wgpu driver after a few consecutive requests.
+        //
+        // Each branch returns the same shape so scoring can stay shared.
+        let (per_layer_scores, baseline_per_layer, cache_seq) = if shards.len() == 1 {
+            // Re-acquire the pool lock briefly to borrow the resident cache
+            // for the trace forwards. Holding the lock through the forwards
+            // is fine here — trace forwards are ~250ms and other handlers
+            // can wait. Composition is not touched on this path.
+            let pool = state.cache_pool.lock().await;
+            let cache_ref = &pool.get(&shards[0]).unwrap().cache;
+            let cache_seq = cache_ref.seq_len();
+            info!(
+                shard = %shards[0],
+                corpus_tokens = corpus_len,
+                query_tokens = n_query,
+                "retrieval mode: single-shard cached forward",
+            );
+            let (q, b) = tokio::task::block_in_place(|| {
+                let q = state.engine.forward_full_gpu_with_cache_traced(
+                    &prompt_tokens, cache_ref, &capture_layers,
+                );
+                let b = state.engine.forward_full_gpu_with_cache_traced(
+                    &baseline_tokens, cache_ref, &capture_layers,
+                );
+                (q, b)
+            });
+            (q, b, cache_seq)
+        } else {
+            // Build the request key from the snapshot. Order-preserving so
+            // shards=[A,B] and shards=[B,A] are different keys (RoPE
+            // positions depend on order).
+            let key: Vec<(String, u64)> = snapshot.iter()
+                .map(|(s, v, _)| (s.clone(), *v))
+                .collect();
+            let total_tokens_len: usize = snapshot.iter().map(|(_, _, t)| t.len()).sum();
+
+            let mut composition = state.composition.lock().await;
+            let reused = composition.as_ref().map(|e| e.key == key).unwrap_or(false);
+            if !reused {
+                // Reuse the existing buffer if its allocation is large enough
+                // for our composition. Otherwise allocate fresh (rare: only
+                // when total_tokens_len > current buffer's max_seq_len).
+                let mut cache_buf = match composition.take() {
+                    Some(e) if e.cache.max_seq_len() >= total_tokens_len => {
+                        let mut c = e.cache;
+                        c.clear();
+                        c
+                    }
+                    _ => state.engine.create_gpu_kv_cache(state.max_seq_len),
+                };
+                let all_tokens: Vec<u32> = snapshot.iter()
+                    .flat_map(|(_, _, t)| t.iter().copied())
+                    .collect();
+                tokio::task::block_in_place(|| {
+                    if !all_tokens.is_empty() {
+                        let _ = state.engine.forward_full_gpu_with_cache(&all_tokens, &mut cache_buf);
+                    }
+                });
+                *composition = Some(ComposedEntry {
+                    key,
+                    cache: cache_buf,
+                });
+            }
+            let entry_ref = composition.as_ref().unwrap();
+            let cache_ref = &entry_ref.cache;
+            let cache_seq = cache_ref.seq_len();
+            info!(
+                shards = ?shards,
+                composed_tokens = cache_seq,
+                corpus_tokens = corpus_len,
+                query_tokens = n_query,
+                composition = if reused { "reused" } else { "rebuilt" },
+                "retrieval mode: multi-shard composed cached forward",
+            );
+            let (q, b) = tokio::task::block_in_place(|| {
+                let q = state.engine.forward_full_gpu_with_cache_traced(
+                    &prompt_tokens, cache_ref, &capture_layers,
+                );
+                let b = state.engine.forward_full_gpu_with_cache_traced(
+                    &baseline_tokens, cache_ref, &capture_layers,
+                );
+                (q, b)
+            });
+            (q, b, cache_seq)
+        };
+
         let attn_max_seq = cache_seq + n_query;
-        let query_start = corpus_len;
+        let baseline_attn_max = cache_seq + baseline_tokens.len();
 
         // Closure: compute per-corpus-position MAX score from a captured
         // per-layer attention tensor (layout [n_q, n_heads, attn_max]).
@@ -678,24 +763,6 @@ async fn chat_completions(
             out
         };
 
-        // Run TWO forwards: query and a baseline (single BOS token) over the
-        // SAME cached prefix. Subtracting the baseline cancels the
-        // "always-hot" attention positions (masthead, end-of-doc) and
-        // surfaces the differential signal that's actually query-specific.
-        let bos = state.tokenizer.bos_token_id();
-        let baseline_tokens = vec![bos];
-        let baseline_attn_max = cache_ref.seq_len() + baseline_tokens.len();
-
-        let (per_layer_scores, baseline_per_layer) = tokio::task::block_in_place(|| {
-            let q = state.engine.forward_full_gpu_with_cache_traced(
-                &prompt_tokens, cache_ref, &capture_layers,
-            );
-            let b = state.engine.forward_full_gpu_with_cache_traced(
-                &baseline_tokens, cache_ref, &capture_layers,
-            );
-            (q, b)
-        });
-
         let query_max = aggregate_max(&per_layer_scores, n_query, attn_max_seq);
         let baseline_max = aggregate_max(&baseline_per_layer, baseline_tokens.len(), baseline_attn_max);
 
@@ -709,7 +776,6 @@ async fn chat_completions(
             }
         }
         let selected_layers = capture_layers;
-        let _ = query_start; // already captured in retrieval_ms timing
 
         // Rank and take top-K
         let mut ranked: Vec<(usize, f32)> = scores
@@ -792,6 +858,7 @@ async fn chat_completions(
             });
             entry.tokens.extend_from_slice(&prompt_tokens);
             entry.tokens.extend_from_slice(&generated);
+            entry.version += 1;
             entry.last_used = Instant::now();
             let len = generated.len() as u32;
             (generated, len)
@@ -832,6 +899,7 @@ async fn chat_completions(
                 if let Some(entry) = pool.get_mut(last_shard) {
                     entry.tokens.extend_from_slice(&prompt_tokens);
                     entry.tokens.extend_from_slice(&generated);
+                    entry.version += 1;
                     entry.last_used = Instant::now();
                 }
             }
@@ -932,21 +1000,31 @@ async fn cache_load(
     let now = Instant::now();
 
     let mut pool = state.cache_pool.lock().await;
+    // If overwriting an existing shard, bump from its current version so the
+    // composition cache's staleness check sees the change. New shards start
+    // at version 0; any subsequent insert / append bumps it monotonically.
+    let next_version = pool.get(&req.cache_id).map(|e| e.version + 1).unwrap_or(0);
     pool.insert(
         req.cache_id.clone(),
         CacheEntry {
             cache,
             tokens: all_tokens,
+            version: next_version,
             created_at: now,
             last_used: now,
         },
     );
+    let pool_size = pool.len();
+    drop(pool);
+    // Drop any stale composition that referenced the old (or absent) version
+    // of this shard. Cheap: a single buffer-array drop on the GPU.
+    *state.composition.lock().await = None;
 
     info!(
         cache_id = %req.cache_id,
         seq_len = seq_len,
         tokens_replayed = req.tokens.len(),
-        pool_size = pool.len(),
+        pool_size = pool_size,
         "cache loaded",
     );
 
@@ -987,10 +1065,17 @@ async fn cache_append(
             let _ = state.engine.forward_full_gpu_with_cache(&req.tokens, &mut entry.cache);
         });
         entry.tokens.extend_from_slice(&req.tokens);
+        entry.version += 1;
     }
 
     entry.last_used = Instant::now();
     let seq_len = entry.cache.seq_len();
+    drop(pool);
+    // Invalidate composition cache; any composition that included this
+    // shard is now stale (version bumped above).
+    if !req.tokens.is_empty() {
+        *state.composition.lock().await = None;
+    }
 
     info!(
         cache_id = %req.cache_id,
@@ -1039,7 +1124,11 @@ async fn cache_delete(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let mut pool = state.cache_pool.lock().await;
     if pool.remove(&cache_id).is_some() {
-        info!(cache_id = %cache_id, pool_size = pool.len(), "cache evicted");
+        let pool_size = pool.len();
+        drop(pool);
+        // Composition might reference the evicted shard; safest to drop.
+        *state.composition.lock().await = None;
+        info!(cache_id = %cache_id, pool_size = pool_size, "cache evicted");
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err((
@@ -1196,6 +1285,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokenizer: loaded.tokenizer,
         config: loaded.config,
         cache_pool: Mutex::new(HashMap::new()),
+        composition: Mutex::new(None),
         model_name: model_name.clone(),
         start_time: Instant::now(),
         max_seq_len: cli.max_seq_len,
