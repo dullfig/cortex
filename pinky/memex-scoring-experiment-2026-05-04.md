@@ -83,15 +83,56 @@ query-specific signal.
 This is the discriminating evidence the memex architecture predicted
 should exist.
 
-## Open questions for memex iteration
+## Run 4: MAX with baseline-subtraction (the breakthrough)
 
-1. **Baseline subtraction.** Run a "neutral" forward (just BOS, or empty
-   prompt) and capture its attention pattern. Subtract from each query's
-   attention. The remainder should highlight the positions a query
-   *differentially* attends to vs the baseline. Specifically:
-       q_score(k) = max_attention_for_query(k) - max_attention_for_baseline(k)
-   The always-hot positions (28, 2283, 417, 2100) would cancel out, and
-   true query-specific positions would surface.
+Hypothesis: run two forwards — one with the actual query, one with a
+"neutral" baseline (single BOS token). For each corpus position k,
+compute MAX attention from the query's last position, MAX attention
+from the baseline's last position. Score = query_max - baseline_max.
+
+Always-hot positions (28, 2283) get cancelled (they're high in both).
+Query-specific positions (where the query's heads attend differently
+than a neutral baseline) survive.
+
+Implementation note: query and baseline must aggregate over the SAME
+denominator (same number of (layer, head, query_position) candidates)
+or the MAX is asymmetric. Both use last query position only.
+
+**5 of 6 queries hit the exact relevant passage:**
+
+| Query | Top hit context | Match |
+|---|---|---|
+| Who founded the society? | "O.C. Cash (Founder)" at 682, 680 | ✅ exact |
+| Where did O.C. Cash grow up? | "his youth in Bluejacket, Oklahoma" at 324 | ✅ exact |
+| Who was the first president? | "Carroll P. Adams First National President" at 574 | ✅ exact |
+| Tell me about Bluejacket Oklahoma | "youth in Bluejacket, Oklahoma" at 324 + "old home town of Bluejacket" at 353 | ✅ exact |
+| Who were the Ambassadors of Good Will? | Officer-list context at 672, 661 | ⚠️ partial — adjacent but missed the actual Ambassadors enumeration |
+| What did Joe Wolff say? | "Quotes Joe Wolff: the Society is 'a haven'" at 690 | ✅ exact |
+
+The always-hot positions (28, 417, 2100, 2283) are GONE from the top 5
+across all queries — exactly as predicted.
+
+Semantically related queries also share top hits in expected ways:
+- Q3 (first president) and Q5 (Ambassadors) share 4 positions — both
+  about official Society roles.
+- Q2 (Cash grew up) and Q4 (Bluejacket) share offset 324 — Bluejacket
+  IS where Cash grew up.
+
+This is genuine semantic retrieval. The memex architecture works.
+
+**Cost:** 2 forwards per query instead of 1. Latency ~500ms instead of
+~250ms. Worth it for the quality jump.
+
+**Default in cortex:** baseline-subtraction is now wired into
+`/v1/retrieve`. Single BOS token as baseline; same `capture_layers` and
+shard cache as the query.
+
+## Open questions for further memex iteration
+
+1. **Better baseline.** Single BOS may not be the most "neutral" reference.
+   Could use 4 BOS sinks. Could use a generic question like "tell me
+   about this" to pick up "general info" attention without query-specific
+   weighting. The choice is empirical.
 
 2. **Head selection.** With MAX, *some* heads are doing query-relevant
    attention. Which ones? Per-head analysis on a known-answer dataset

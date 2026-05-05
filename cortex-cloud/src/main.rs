@@ -642,43 +642,56 @@ async fn chat_completions(
         let attn_max_seq = cache_seq + n_query;
         let query_start = corpus_len;
 
-        let per_layer_scores = tokio::task::block_in_place(|| {
-            state.engine.forward_full_gpu_with_cache_traced(
-                &prompt_tokens, &shard_entry.cache, &capture_layers,
-            )
-        });
-
-        // Per-layer score layout: [n_query, n_heads, attn_max_seq] flat.
-        // Score from query position q to corpus position k is at index
-        // q * n_heads * attn_max_seq + h * attn_max_seq + k.
-        let query_window = 3.min(n_query);
-        let q_lo = n_query.saturating_sub(query_window);
-        let q_hi = n_query;
-
-        // Score each corpus position by MAX pre-softmax attention across
-        // the captured layers x heads x last-N query positions.
-        //
-        // Empirical (2026-05-04 experiment vs MEAN, Qwen 2.5-3B base, 1941
-        // Harmonizer): MEAN aggregation produced identical top-4 hits for
-        // 7 different queries — the always-high-attention positions
-        // (masthead, end-of-doc, vivid quote) dominate. MAX preserved
-        // those in slots #1-2 but gave query-specific variation in slots
-        // #3-5. memex iteration may want to add baseline subtraction to
-        // cancel the always-hot positions and surface differential signal.
-        let mut scores = vec![f32::NEG_INFINITY; corpus_len];
-        for k in 0..corpus_len {
-            let mut max_val = f32::NEG_INFINITY;
-            for layer_scores in &per_layer_scores {
-                for h in 0..n_heads {
-                    for q in q_lo..q_hi {
-                        let idx = q * n_heads * attn_max_seq + h * attn_max_seq + k;
+        // Closure: compute per-corpus-position MAX score from a captured
+        // per-layer attention tensor (layout [n_q, n_heads, attn_max]).
+        // Aggregates across (layers x heads x LAST query position only).
+        // Using last-position-only keeps query and baseline comparable
+        // (both aggregate over the same number of values: layers x heads).
+        let aggregate_max = |per_layer: &[Vec<f32>], n_q: usize, attn_max: usize| -> Vec<f32> {
+            let q_last = n_q - 1; // n_q >= 1 (asserted by forward_full_gpu_with_cache_traced)
+            let mut out = vec![f32::NEG_INFINITY; corpus_len];
+            for k in 0..corpus_len {
+                let mut m = f32::NEG_INFINITY;
+                for layer_scores in per_layer {
+                    for h in 0..n_heads {
+                        let idx = q_last * n_heads * attn_max + h * attn_max + k;
                         let v = layer_scores[idx];
-                        if v > max_val { max_val = v; }
+                        if v > m { m = v; }
                     }
                 }
+                if m.is_finite() { out[k] = m; }
             }
-            if max_val.is_finite() {
-                scores[k] = max_val;
+            out
+        };
+
+        // Run TWO forwards: query and a baseline (single BOS token) over the
+        // SAME cached prefix. Subtracting the baseline cancels the
+        // "always-hot" attention positions (masthead, end-of-doc) and
+        // surfaces the differential signal that's actually query-specific.
+        let bos = state.tokenizer.bos_token_id();
+        let baseline_tokens = vec![bos];
+        let baseline_attn_max = shard_entry.cache.seq_len() + baseline_tokens.len();
+
+        let (per_layer_scores, baseline_per_layer) = tokio::task::block_in_place(|| {
+            let q = state.engine.forward_full_gpu_with_cache_traced(
+                &prompt_tokens, &shard_entry.cache, &capture_layers,
+            );
+            let b = state.engine.forward_full_gpu_with_cache_traced(
+                &baseline_tokens, &shard_entry.cache, &capture_layers,
+            );
+            (q, b)
+        });
+
+        let query_max = aggregate_max(&per_layer_scores, n_query, attn_max_seq);
+        let baseline_max = aggregate_max(&baseline_per_layer, baseline_tokens.len(), baseline_attn_max);
+
+        // Differential score: query attention - baseline attention. Positions
+        // that are "always hot" (high in both) drop to zero; positions that
+        // are query-specific stay high.
+        let mut scores = vec![f32::NEG_INFINITY; corpus_len];
+        for k in 0..corpus_len {
+            if query_max[k].is_finite() && baseline_max[k].is_finite() {
+                scores[k] = query_max[k] - baseline_max[k];
             }
         }
         let selected_layers = capture_layers;
