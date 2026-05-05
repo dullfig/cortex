@@ -415,7 +415,7 @@ For the future Claude: you and Daniel work well together because:
   brokered through another instance of Claude. /btw has been right
   about most architectural reframes.
 - **Daniel maintains memory across sessions via the auto-memory system**
-  at `C:\Users\Daniel\.claude\projects\C--src-cortex\memory\`. Read
+  at `C:\Users\danu\.claude\projects\C--src-cortex\memory\`. Read
   `MEMORY.md` first when you start a new session.
 - **Daniel will explicitly stop you when something is wrong.** If he
   doesn't push back, your read is probably correct. If he does, he's

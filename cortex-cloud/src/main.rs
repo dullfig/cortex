@@ -604,29 +604,43 @@ async fn chat_completions(
             shard_map.add(shard_name.clone(), start, corpus_len);
         }
 
-        // Single-shard fast path is straightforward; multi-shard composition
-        // would need to merge per-shard caches into a temporary one (similar
-        // to the chat path) — for now retrieval requires a single shard
-        // matching what cache_load already populated.
-        if shards.len() != 1 {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": {
-                        "type": "unsupported",
-                        "message": "GPU-cached retrieval currently supports a single shard; multi-shard composition is a follow-up.",
-                    }
-                })),
-            ));
+        // Single-shard: borrow the existing cache from the pool (fast path).
+        // Multi-shard: replay all shard tokens into a fresh temporary cache,
+        // mirroring the chat path's composition. Either way, the scoring code
+        // below operates on `cache_ref: &GpuKvCache`.
+        let composed_cache: Option<cortex::layers::gpu_kv_cache::GpuKvCache>;
+        let cache_ref: &cortex::layers::gpu_kv_cache::GpuKvCache;
+        if shards.len() == 1 {
+            cache_ref = &pool.get(&shards[0]).unwrap().cache;
+            composed_cache = None;
+            info!(
+                shard = %shards[0],
+                corpus_tokens = corpus_len,
+                query_tokens = prompt_tokens.len(),
+                "retrieval mode: single-shard cached forward",
+            );
+        } else {
+            let mut all_tokens: Vec<u32> = Vec::new();
+            for shard_name in &shards {
+                let entry = pool.get(shard_name).unwrap();
+                all_tokens.extend_from_slice(&entry.tokens);
+            }
+            let mut tmp = state.engine.create_gpu_kv_cache(state.max_seq_len);
+            tokio::task::block_in_place(|| {
+                if !all_tokens.is_empty() {
+                    let _ = state.engine.forward_full_gpu_with_cache(&all_tokens, &mut tmp);
+                }
+            });
+            composed_cache = Some(tmp);
+            cache_ref = composed_cache.as_ref().unwrap();
+            info!(
+                shards = ?shards,
+                composed_tokens = cache_ref.seq_len(),
+                corpus_tokens = corpus_len,
+                query_tokens = prompt_tokens.len(),
+                "retrieval mode: multi-shard composed cached forward",
+            );
         }
-        let shard_entry = pool.get(&shards[0]).unwrap();
-
-        info!(
-            shard = %shards[0],
-            corpus_tokens = corpus_len,
-            query_tokens = prompt_tokens.len(),
-            "retrieval mode: cached forward_full_gpu_with_cache_traced",
-        );
 
         let retrieve_start = Instant::now();
 
@@ -637,7 +651,7 @@ async fn chat_completions(
         let capture_start = n_layers_total.saturating_sub(4);
         let capture_layers: Vec<usize> = (capture_start..n_layers_total).collect();
 
-        let cache_seq = shard_entry.cache.seq_len();
+        let cache_seq = cache_ref.seq_len();
         let n_query = prompt_tokens.len();
         let attn_max_seq = cache_seq + n_query;
         let query_start = corpus_len;
@@ -670,14 +684,14 @@ async fn chat_completions(
         // surfaces the differential signal that's actually query-specific.
         let bos = state.tokenizer.bos_token_id();
         let baseline_tokens = vec![bos];
-        let baseline_attn_max = shard_entry.cache.seq_len() + baseline_tokens.len();
+        let baseline_attn_max = cache_ref.seq_len() + baseline_tokens.len();
 
         let (per_layer_scores, baseline_per_layer) = tokio::task::block_in_place(|| {
             let q = state.engine.forward_full_gpu_with_cache_traced(
-                &prompt_tokens, &shard_entry.cache, &capture_layers,
+                &prompt_tokens, cache_ref, &capture_layers,
             );
             let b = state.engine.forward_full_gpu_with_cache_traced(
-                &baseline_tokens, &shard_entry.cache, &capture_layers,
+                &baseline_tokens, cache_ref, &capture_layers,
             );
             (q, b)
         });

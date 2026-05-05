@@ -933,7 +933,7 @@ one primitive, multiple callers, different streams.
 
 ### Memory
 
-The auto-memory directory at `C:\Users\Daniel\.claude\projects\C--src-cortex\memory\`
+The auto-memory directory at `C:\Users\danu\.claude\projects\C--src-cortex\memory\`
 holds the persistent memory file `MEMORY.md` and individual memory files
 including:
 - `user_daniel.md` — Daniel's role, preferences, working style

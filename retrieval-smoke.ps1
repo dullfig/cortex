@@ -97,7 +97,7 @@ foreach ($q in $Queries) {
         $clientIdx = $serverOffset - $SinkTokens
 
         if ($clientIdx -lt 0) {
-            Write-Host ("  #{0,-2} offset={1,-4} score={2,-8} [SINK ARTIFACT — ignore]" -f $rank, $serverOffset, $score)
+            Write-Host ("  #{0,-2} offset={1,-4} score={2,-8} [SINK ARTIFACT - ignore]" -f $rank, $serverOffset, $score)
             continue
         }
 

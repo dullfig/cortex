@@ -164,3 +164,96 @@ config (mean | max | baseline-subtract) added to the request schema.
   base-model first-cold-start; not investigated)
 - Retrieve: 250-550ms per query (first query ~550ms warmup, subsequent
   ~250ms each)
+
+## Run 5: Multi-shard retrieval (2026-05-04 evening)
+
+`/v1/chat/completions` (mode=retrieve) now accepts multiple
+`cache_shards`. Smoke harness: `multishard-smoke.ps1` loads two shards
+into the pool and queries across both:
+
+- `harm1941` — `1941-11_rechordings-vol1-no1.md` (2284 tokens, 2288 with
+  4 BOS sinks)
+- `whatis` — `bhs-org/what-is-barbershop.md` (546 tokens, 550 with sinks)
+
+Composition path (mirrors the chat handler): concatenate per-shard
+tokens in the order given, prefill a fresh `GpuKvCache` of the combined
+seq_len, then run query+baseline forwards against that composed cache.
+Hits resolve back to source shard via `shard_map.resolve(offset)`.
+
+Server log:
+```
+multi-shard composed cached forward shards=["harm1941","whatis"]
+  composed_tokens=2838 corpus_tokens=2838 query_tokens=30
+```
+
+### Results (2 of 3 queries before server hang)
+
+**Q1: "Who founded the society?"** (66s, 6 hits)
+| Rank | Shard | Off | Score |
+|---|---|---|---|
+| #1 | harm1941 | 2112 | 5.18 |
+| #2 | harm1941 | 274  | 4.81 |
+| #3 | harm1941 | 205  | 4.22 |
+| #4 | harm1941 | 179  | 3.98 |
+| #5 | whatis   | 506  | 3.88 |
+| #6 | harm1941 | 180  | 3.75 |
+
+Top hits cluster on harm1941 — the shard with O.C. Cash content. ✅
+Reasonable. Note: in single-shard mode this query top-hit was offset
+682 ("O.C. Cash (Founder)"); in multi-shard it shifts to 2112 (the
+"100,000+ titles" meta-section). The shift is plausibly because in
+multi-shard prefill the harm1941 tokens are followed by 554 whatis
+tokens, slightly changing late-position attention saturation.
+
+**Q2: "What is barbershop singing?"** (66s, 6 hits)
+| Rank | Shard | Off | Score |
+|---|---|---|---|
+| #1 | whatis   | 326 | 5.45 |
+| #2 | whatis   | 325 | 5.36 |
+| #3 | harm1941 | 1375 | 4.21 |
+| #4 | harm1941 | 205  | 3.46 |
+| #5 | harm1941 | 1630 | 3.26 |
+| #6 | harm1941 | 758  | 2.93 |
+
+✅ Top-2 correctly land in the whatis shard (the one that is literally
+about what barbershop is). Cross-shard semantic discrimination works.
+
+### Latency cost of composition
+
+Each multi-shard query re-prefills the composed cache (2838 tokens =
+~65s on Qwen 3B/4080). That's the dominant cost — the query+baseline
+forwards are ~250ms combined. A natural follow-up: cache compositions
+keyed on `(sorted_shard_set, version)` so subsequent queries against
+the same shard set hit the cached composition.
+
+### Q3 server hang (latent bug)
+
+After Q1 and Q2 completed cleanly, **Q3 hung the server** ("Where did
+O.C. Cash grow up?"). Symptoms:
+- Server PID alive but `/health` no longer responds
+- Server CPU goes flat (1.5s in 3 min)
+- Q3 was the third request to allocate a fresh ~85 MB composed cache
+  in quick succession (each composed_cache holds 2838 tokens × 36
+  layers × 2 (K+V) × 2 KV-heads × 128 dim × f32 = ~85 MiB GPU)
+
+Most likely a wgpu/Vulkan driver-state issue with rapid alloc-and-drop
+of large per-layer buffer arrays under sustained pressure (the same
+neighborhood as the Qwen-block-26 wgpu bug we hit earlier on this
+model). Single-shard retrieval (which reuses the pool's resident
+cache) does not exhibit this — only multi-shard's per-request
+allocation does.
+
+The composition-cache optimization above would also fix this
+incidentally by removing the alloc loop. So the same follow-up serves
+both performance and stability.
+
+### What changed in cortex (multi-shard)
+
+`/v1/chat/completions` mode=retrieve now accepts multiple
+`cache_shards`. Single-shard fast path borrows from the pool;
+multi-shard creates a temporary composed cache and runs the same
+scoring (MAX with BOS-baseline subtraction) against it. `shard_map`
+in the response correctly identifies which shard each hit came from.
+
+Smoke harness: `multishard-smoke.ps1` at repo root. It assumes the
+server is running and pool is empty.
