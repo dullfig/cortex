@@ -21,6 +21,8 @@ pub mod gpu_engine;
 pub mod gpu_floatlinear;
 #[cfg(feature = "gpu")]
 pub mod gpu_kv_cache;
+#[cfg(feature = "gpu")]
+pub mod gpu_polar;
 pub mod kv_cache;
 pub mod linear;
 pub mod quantized_kv_cache;

@@ -198,6 +198,7 @@ pub struct Pipelines {
     pub add_inplace: wgpu::ComputePipeline,
     pub kv_write: wgpu::ComputePipeline,
     pub attn_score: wgpu::ComputePipeline,
+    pub attn_score_polar: wgpu::ComputePipeline,
     pub softmax: wgpu::ComputePipeline,
     pub attn_value: wgpu::ComputePipeline,
     pub argmax: wgpu::ComputePipeline,
@@ -262,6 +263,7 @@ impl Pipelines {
             add_inplace: make(include_str!("shaders/add_inplace.wgsl"), "add_inplace"),
             kv_write: make(include_str!("shaders/kv_write.wgsl"), "kv_write"),
             attn_score: make(include_str!("shaders/attn_score.wgsl"), "attn_score"),
+            attn_score_polar: make(include_str!("shaders/attn_score_polar.wgsl"), "attn_score_polar"),
             softmax: make(include_str!("shaders/softmax.wgsl"), "softmax"),
             attn_value: make(include_str!("shaders/attn_value.wgsl"), "attn_value"),
             argmax: make(include_str!("shaders/argmax.wgsl"), "argmax"),
@@ -337,7 +339,7 @@ impl GpuDevice {
         .ok()?;
 
         let pipelines = Pipelines::compile(&device);
-        tracing::info!("compiled 24 GPU compute pipelines");
+        tracing::info!("compiled 25 GPU compute pipelines");
 
         Some(Self { device, queue, pipelines })
     }
