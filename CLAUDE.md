@@ -41,7 +41,8 @@ AgentOS integration: add as `LlmClient::Local(CortexLocal)` variant in `agentos-
 
 cortex absorbs and generalizes three projects:
 - **ternary-rs** → ternary kernels, BitLinear, GGUF loader, full transformer stack (DONE)
-- **engram** → compressed KV cache (PolarQuant), tiered memory, retrieval, consolidation (TODO)
+- **engram** → compressed KV cache (PolarQuant + QJL CPU side, DONE);
+  tiered memory + bidirectional-attention retrieval + consolidation (TODO)
 - **neuralkv-core** (GPU path) → WGPU shaders for matmul, attention, FFN (TODO)
 
 ## Architecture (cortex core)
@@ -67,8 +68,17 @@ cortex absorbs and generalizes three projects:
 - **AVX2** (`cortex/src/compute/avx2.rs`) — x86-64 SIMD
 - **WGPU** (`cortex/src/compute/wgpu_backend.rs`) — GPU via Vulkan/DX12/Metal
 
-### Memory (from engram, TODO)
-- **QuantizedKvCache** — PolarQuant 3-bit compressed KV storage (12x reduction)
+### TurboQuant KV compression (from engram)
+- **PolarQuant** (`cortex/src/ops/polar.rs`) — random orthogonal rotation +
+  3-bit polar angle quantization. Stage 1: ~7.5x reduction (u8-per-angle;
+  ~12x with future bit-packing).
+- **QJL** (`cortex/src/ops/qjl.rs`) — 1-bit sign-of-projection residual
+  correction. Stage 2: refines attention dot products.
+- **QuantizedKvCache** (`cortex/src/layers/quantized_kv_cache.rs`) —
+  per-layer compressed cache: append, dot in compressed domain, dequant
+  on demand, lossless tier migration via `CompressedEntry`.
+
+### Memory (further engram ports, TODO)
 - **HierarchicalCache** — L1 working / L2 session / L3 archive
 - **Retrieval** — bidirectional attention (no causal mask), returns ranked spans
 - **Consolidation** — entropy-driven sleep: evict noise, migrate summaries L1→L2→L3
@@ -97,9 +107,14 @@ let response = provider.complete(&request)?;
 
 ## Testing
 
-310 tests covering: ternary packing, matmul kernels, quantization, GGUF parsing,
+369 tests covering: ternary packing, matmul kernels, quantization, GGUF parsing,
 layer forward passes, attention, RoPE, SwiGLU, full model forward, sampler,
-retrieval (forward_traced + attention-score ranking).
+retrieval (forward_traced + attention-score ranking), TurboQuant
+compression (PolarQuant + QJL + QuantizedKvCache).
+
+For GPU-heavy tests, prefer `cargo test --workspace -- --test-threads=1`
+to avoid VRAM contention between concurrently-running GPU tests on a
+shared discrete GPU.
 
 Run all: `cargo test --workspace`
 
@@ -111,7 +126,10 @@ Run all: `cargo test --workspace`
 - [x] TransformerMemory trait definition
 - [x] cortex-cloud: OpenAI-compatible HTTP server
 - [x] cortex-local: in-process provider for AgentOS
-- [ ] Move QuantizedKvCache from engram into cortex
+- [x] Move QuantizedKvCache from engram into cortex (CPU side)
+- [ ] GPU shader for compressed KV (rotate Q + dot against angle/radius)
+- [ ] Bit-pack 3-bit angle representation (u8 → 3-bits, ~12x compression)
+- [ ] Wire QuantizedKvCache into cortex-cloud as the cache_pool backing store
 - [ ] Move retrieval (bidirectional attention) from engram into cortex
 - [ ] Move HierarchicalCache + consolidation from engram
 - [ ] WgpuLinear from neuralkv-core shaders
