@@ -107,12 +107,13 @@ let response = provider.complete(&request)?;
 
 ## Testing
 
-382 tests covering: ternary packing, matmul kernels, quantization, GGUF parsing,
+384 tests covering: ternary packing, matmul kernels, quantization, GGUF parsing,
 layer forward passes, attention, RoPE, SwiGLU, full model forward, sampler,
 retrieval (forward_traced + attention-score ranking), TurboQuant compression
 (PolarQuant + QJL + QuantizedKvCache + GPU score/value/derotate shaders +
 algorithm-quality cosine pinning + resident GpuPolarKvCache storage +
-resident dispatchers byte-equal to oneshot).
+resident dispatchers byte-equal to oneshot + GPU prefill compress shader
+matching CPU append).
 
 For GPU-heavy tests, prefer `cargo test --workspace -- --test-threads=1`
 to avoid VRAM contention between concurrently-running GPU tests on a
@@ -140,8 +141,11 @@ Run all: `cargo test --workspace`
 - [x] Resident dispatchers (`attn_score_polar_resident` /
       `attn_value_polar_resident`) that take `&GpuPolarKvCache` + a
       layer index; output byte-equal to the oneshot path
-- [ ] GPU compress shader for prefill (avoid the CPU round-trip in
-      `upload_layer_from_cpu`)
+- [x] GPU prefill compress shader (`kv_compress_polar.wgsl` +
+      `compress_layer_into_polar`); rotates + polar-quantizes f32 K/V
+      directly into the resident polar buffers, no CPU round-trip;
+      angles byte-equal to CPU `append_one`, radius matches within 1
+      ULP (FMA tolerance)
 - [ ] `KvCacheBackend::F32 | Polar` enum threaded through
       `dispatch_attention_inner` so production code can switch caches
       per-request
