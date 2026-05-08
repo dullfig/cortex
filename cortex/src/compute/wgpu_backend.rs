@@ -201,6 +201,8 @@ pub struct Pipelines {
     pub attn_score_polar: wgpu::ComputePipeline,
     pub softmax: wgpu::ComputePipeline,
     pub attn_value: wgpu::ComputePipeline,
+    pub attn_value_polar: wgpu::ComputePipeline,
+    pub derotate: wgpu::ComputePipeline,
     pub argmax: wgpu::ComputePipeline,
     // Batch (prefill)
     pub matmul: wgpu::ComputePipeline,
@@ -266,6 +268,8 @@ impl Pipelines {
             attn_score_polar: make(include_str!("shaders/attn_score_polar.wgsl"), "attn_score_polar"),
             softmax: make(include_str!("shaders/softmax.wgsl"), "softmax"),
             attn_value: make(include_str!("shaders/attn_value.wgsl"), "attn_value"),
+            attn_value_polar: make(include_str!("shaders/attn_value_polar.wgsl"), "attn_value_polar"),
+            derotate: make(include_str!("shaders/derotate.wgsl"), "derotate"),
             argmax: make(include_str!("shaders/argmax.wgsl"), "argmax"),
             // Batch
             matmul: make(include_str!("shaders/matmul.wgsl"), "matmul"),
@@ -339,7 +343,7 @@ impl GpuDevice {
         .ok()?;
 
         let pipelines = Pipelines::compile(&device);
-        tracing::info!("compiled 25 GPU compute pipelines");
+        tracing::info!("compiled 27 GPU compute pipelines");
 
         Some(Self { device, queue, pipelines })
     }

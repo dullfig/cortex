@@ -107,10 +107,11 @@ let response = provider.complete(&request)?;
 
 ## Testing
 
-373 tests covering: ternary packing, matmul kernels, quantization, GGUF parsing,
+377 tests covering: ternary packing, matmul kernels, quantization, GGUF parsing,
 layer forward passes, attention, RoPE, SwiGLU, full model forward, sampler,
-retrieval (forward_traced + attention-score ranking), TurboQuant
-compression (PolarQuant + QJL + QuantizedKvCache + GPU score shader).
+retrieval (forward_traced + attention-score ranking), TurboQuant compression
+(PolarQuant + QJL + QuantizedKvCache + GPU score shader + GPU value/derotate
+shaders + algorithm-quality cosine pinning).
 
 For GPU-heavy tests, prefer `cargo test --workspace -- --test-threads=1`
 to avoid VRAM contention between concurrently-running GPU tests on a
@@ -128,9 +129,12 @@ Run all: `cargo test --workspace`
 - [x] cortex-local: in-process provider for AgentOS
 - [x] Move QuantizedKvCache from engram into cortex (CPU side)
 - [x] GPU score shader for compressed K (`attn_score_polar.wgsl` +
-      `gpu_polar::attn_score_polar_oneshot`); shader output matches CPU
-      `dot_key` within 1e-4
-- [ ] GPU value shader for compressed V (dequant + de-rotation)
+      `gpu_polar::attn_score_polar_oneshot`); matches CPU `dot_key` within 1e-5
+- [x] GPU value/derotate shaders for compressed V
+      (`attn_value_polar.wgsl` + `derotate.wgsl`); matches CPU dequant+aggregate
+      at seq_len=4096 within 1e-3 (float-order error scales O(seq_len))
+- [ ] QJL correction on V dequant (currently K-only) to close the cosine-
+      similarity gap on attention output (PolarQuant alone hits ~0.84)
 - [ ] Bit-pack 3-bit angle representation (u8 → 3-bits, ~12x compression)
 - [ ] Wire QuantizedKvCache into cortex-cloud as the cache_pool backing store
 - [ ] Move retrieval (bidirectional attention) from engram into cortex
