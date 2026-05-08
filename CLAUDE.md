@@ -107,13 +107,13 @@ let response = provider.complete(&request)?;
 
 ## Testing
 
-384 tests covering: ternary packing, matmul kernels, quantization, GGUF parsing,
+387 tests covering: ternary packing, matmul kernels, quantization, GGUF parsing,
 layer forward passes, attention, RoPE, SwiGLU, full model forward, sampler,
 retrieval (forward_traced + attention-score ranking), TurboQuant compression
 (PolarQuant + QJL + QuantizedKvCache + GPU score/value/derotate shaders +
 algorithm-quality cosine pinning + resident GpuPolarKvCache storage +
-resident dispatchers byte-equal to oneshot + GPU prefill compress shader
-matching CPU append).
+resident dispatchers byte-equal to oneshot + GPU prefill compress shader +
+GPU-only f32→polar conversion).
 
 For GPU-heavy tests, prefer `cargo test --workspace -- --test-threads=1`
 to avoid VRAM contention between concurrently-running GPU tests on a
@@ -146,9 +146,15 @@ Run all: `cargo test --workspace`
       directly into the resident polar buffers, no CPU round-trip;
       angles byte-equal to CPU `append_one`, radius matches within 1
       ULP (FMA tolerance)
-- [ ] `KvCacheBackend::F32 | Polar` enum threaded through
-      `dispatch_attention_inner` so production code can switch caches
-      per-request
+- [x] `GpuPolarKvCache::populate_from_f32_cache_gpu` — convert a
+      populated f32 `GpuKvCache` to a polar cache via the compress
+      shader (per-layer, all-on-GPU). Unblocks the cortex-cloud
+      retrieval path: prefill stays f32, then a one-time conversion
+      hands the polar cache to subsequent retrieve queries
+- [ ] Polar-aware traced forward (`forward_full_gpu_polar_traced`):
+      multi-token causal-masked polar score shader + polar attention
+      chain in each block
+- [ ] cortex-cloud retrieval-cache config flag → polar backend
 - [ ] QJL correction on V dequant (currently K-only) to close the cosine-
       similarity gap on attention output (PolarQuant alone hits ~0.84)
 - [ ] Bit-pack 3-bit angle representation (u8 → 3-bits, ~12x compression)

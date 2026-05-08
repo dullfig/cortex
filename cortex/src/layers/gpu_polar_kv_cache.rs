@@ -217,6 +217,63 @@ impl GpuPolarKvCache {
         );
     }
 
+    /// Populate this polar cache from a fully-populated f32 `GpuKvCache`,
+    /// running the GPU compress shader per layer. No CPU round-trip:
+    /// the f32 K/V buffers stay on GPU and feed straight into the
+    /// rotation+polar-quantize shader, which writes directly into this
+    /// cache's compressed buffers.
+    ///
+    /// Layer count, kv-heads, and head-dim must match. The polar cache's
+    /// `max_seq_len` must be at least the f32 cache's current `seq_len()`
+    /// (we only compress positions actually filled). After conversion
+    /// `self.seq_len()` equals `f32_cache.seq_len()`.
+    ///
+    /// Submits its own command buffer and waits for completion so callers
+    /// can immediately read the polar cache's contents.
+    pub fn populate_from_f32_cache_gpu(
+        &mut self,
+        f32_cache: &crate::layers::gpu_kv_cache::GpuKvCache,
+    ) {
+        assert_eq!(self.n_layers, f32_cache.n_layers(),
+            "polar n_layers ({}) != f32 n_layers ({})",
+            self.n_layers, f32_cache.n_layers());
+        assert_eq!(self.n_kv_heads, f32_cache.n_kv_heads(),
+            "polar n_kv_heads ({}) != f32 n_kv_heads ({})",
+            self.n_kv_heads, f32_cache.n_kv_heads());
+        assert_eq!(self.head_dim, f32_cache.head_dim(),
+            "polar head_dim ({}) != f32 head_dim ({})",
+            self.head_dim, f32_cache.head_dim());
+        let n_tokens = f32_cache.seq_len();
+        assert!(n_tokens <= self.max_seq_len,
+            "f32 seq_len ({}) exceeds polar max_seq_len ({})",
+            n_tokens, self.max_seq_len);
+
+        if n_tokens == 0 {
+            self.len = 0;
+            return;
+        }
+
+        let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("polar_kv.populate_from_f32_cache_gpu"),
+        });
+        for layer in 0..self.n_layers {
+            crate::layers::gpu_polar::compress_layer_into_polar(
+                &self.gpu,
+                &mut encoder,
+                self,
+                layer,
+                f32_cache.k_layer(layer),
+                f32_cache.v_layer(layer),
+                n_tokens,
+                /*start_pos*/ 0,
+            );
+        }
+        self.gpu.queue.submit(Some(encoder.finish()));
+        self.gpu.device.poll(wgpu::Maintain::Wait);
+
+        self.len = n_tokens;
+    }
+
     /// Set the `len` cursor to mark how many positions are filled.
     /// Caller is responsible for keeping per-layer uploads consistent;
     /// like `GpuKvCache`, all layers share one `len`.
@@ -472,6 +529,163 @@ mod tests {
             "compression ratio {ratio:.2}x below 6x floor (Qwen 3B shape)",
         );
         assert!(cache.memory_bytes() < cache.f32_equivalent_bytes());
+    }
+
+    /// Load-bearing phase 2c.4 test: build a populated f32 GpuKvCache and
+    /// convert it to a GpuPolarKvCache via the GPU compress shader (no
+    /// CPU round-trip). Read back the resulting polar buffers and assert
+    /// byte-equal angles + ULP-tolerant radius vs a CPU-side
+    /// QuantizedKvCache built from the same source data.
+    ///
+    /// This pins the path the cortex-cloud retrieve handler will take
+    /// once production wires polar caches: prefill stays f32, then a
+    /// one-time on-GPU conversion produces the polar cache that
+    /// subsequent retrieval queries read from.
+    #[test]
+    fn from_f32_cache_gpu_round_trip() {
+        use crate::layers::gpu_polar::pack_angles_to_u32;
+        use crate::layers::gpu_kv_cache::GpuKvCache;
+
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let n_layers = 2;
+        let n_kv_heads = 2;
+        let head_dim = 8;
+        let max_seq = 6;
+        let n_tokens = 6; // fully populated
+        let seed_base = 42u64;
+
+        // Build CPU caches per layer (ground truth compressed output).
+        let kv_dim = n_kv_heads * head_dim;
+        let mut layer_data: Vec<(Vec<f32>, Vec<f32>, QuantizedKvCache)> = Vec::with_capacity(n_layers);
+        for layer in 0..n_layers {
+            let mut k_data = Vec::with_capacity(n_tokens * kv_dim);
+            let mut v_data = Vec::with_capacity(n_tokens * kv_dim);
+            for t in 0..n_tokens {
+                for i in 0..kv_dim {
+                    k_data.push((((t * 7 + layer * 3 + i) as f32) * 0.05).sin());
+                    v_data.push((((t * 11 + layer * 5 + i) as f32) * 0.04).cos());
+                }
+            }
+            let mut cpu = QuantizedKvCache::new(
+                n_kv_heads, head_dim, max_seq, seed_for_layer(seed_base, layer),
+            );
+            for t in 0..n_tokens {
+                let off = t * kv_dim;
+                cpu.append_one(&k_data[off..off + kv_dim], &v_data[off..off + kv_dim]);
+            }
+            layer_data.push((k_data, v_data, cpu));
+        }
+
+        // Build f32 GpuKvCache and upload f32 K/V into each layer's buffers.
+        let mut f32_cache = GpuKvCache::new(
+            gpu.clone(), n_layers, n_kv_heads, head_dim, max_seq,
+        );
+        for (layer, (k_data, v_data, _)) in layer_data.iter().enumerate() {
+            gpu.queue.write_buffer(
+                f32_cache.k_layer(layer), 0, bytemuck::cast_slice(k_data),
+            );
+            gpu.queue.write_buffer(
+                f32_cache.v_layer(layer), 0, bytemuck::cast_slice(v_data),
+            );
+        }
+        f32_cache.advance(n_tokens);
+
+        // Build empty polar cache with matching seeds, populate via GPU shader.
+        let mut polar_kv = GpuPolarKvCache::new(
+            gpu.clone(), n_layers, n_kv_heads, head_dim, max_seq, seed_base,
+        );
+        polar_kv.populate_from_f32_cache_gpu(&f32_cache);
+        assert_eq!(polar_kv.seq_len(), n_tokens);
+
+        // Verify each layer's compressed bytes against the CPU ground truth.
+        let n_pairs = head_dim / 2;
+        let used_angles = n_tokens * n_kv_heads * n_pairs;
+        let used_radius = n_tokens * n_kv_heads;
+        let used_packed_words = (used_angles + 3) / 4;
+        let packed_bytes = (used_packed_words * std::mem::size_of::<u32>()) as u64;
+        let radius_bytes = (used_radius * std::mem::size_of::<f32>()) as u64;
+
+        for layer in 0..n_layers {
+            let cpu = &layer_data[layer].2;
+
+            // Expected K bytes.
+            let cpu_k_angles_full: Vec<u8> = cpu.k_angles_slice()[..used_angles].to_vec();
+            let expected_k_packed = pack_angles_to_u32(&cpu_k_angles_full);
+            let expected_k_radius: &[f32] = &cpu.k_radius_slice()[..used_radius];
+
+            // Expected V bytes via CompressedEntry.
+            let mut expected_v_angles_full = vec![0u8; used_angles];
+            let mut expected_v_radius = vec![0f32; used_radius];
+            for t in 0..n_tokens {
+                for h in 0..n_kv_heads {
+                    let entry = cpu.read_compressed_k(t, h);
+                    let off = (t * n_kv_heads + h) * n_pairs;
+                    expected_v_angles_full[off..off + n_pairs]
+                        .copy_from_slice(&entry.v_angles);
+                    expected_v_radius[t * n_kv_heads + h] = entry.v_radius;
+                }
+            }
+            let expected_v_packed = pack_angles_to_u32(&expected_v_angles_full);
+
+            // Read back GPU.
+            let got_k_angles = readback_buffer(&gpu, polar_kv.k_angles_layer(layer), packed_bytes);
+            let got_k_packed: &[u32] = bytemuck::cast_slice(&got_k_angles);
+            assert_eq!(got_k_packed, expected_k_packed.as_slice(),
+                "K angles mismatch on layer {layer}");
+
+            let got_v_angles = readback_buffer(&gpu, polar_kv.v_angles_layer(layer), packed_bytes);
+            let got_v_packed: &[u32] = bytemuck::cast_slice(&got_v_angles);
+            assert_eq!(got_v_packed, expected_v_packed.as_slice(),
+                "V angles mismatch on layer {layer}");
+
+            // Radius: 1e-6 abs tolerance (FMA drift, same as gpu_compress test).
+            let got_k_radius_bytes = readback_buffer(&gpu, polar_kv.k_radius_layer(layer), radius_bytes);
+            let got_k_radius: &[f32] = bytemuck::cast_slice(&got_k_radius_bytes);
+            for (i, (&g, &e)) in got_k_radius.iter().zip(expected_k_radius.iter()).enumerate() {
+                assert!(
+                    (g - e).abs() < 1e-6,
+                    "K radius[{i}] layer {layer} differs: gpu={g}, cpu={e}",
+                );
+            }
+            let got_v_radius_bytes = readback_buffer(&gpu, polar_kv.v_radius_layer(layer), radius_bytes);
+            let got_v_radius: &[f32] = bytemuck::cast_slice(&got_v_radius_bytes);
+            for (i, (&g, &e)) in got_v_radius.iter().zip(expected_v_radius.iter()).enumerate() {
+                assert!(
+                    (g - e).abs() < 1e-6,
+                    "V radius[{i}] layer {layer} differs: gpu={g}, cpu={e}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn from_f32_cache_gpu_empty_cache() {
+        use crate::layers::gpu_kv_cache::GpuKvCache;
+
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let f32_cache = GpuKvCache::new(gpu.clone(), 2, 1, 8, 4);
+        let mut polar = GpuPolarKvCache::new(gpu.clone(), 2, 1, 8, 4, 42);
+        polar.populate_from_f32_cache_gpu(&f32_cache);
+        assert_eq!(polar.seq_len(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "polar n_layers")]
+    fn from_f32_cache_gpu_layer_mismatch_panics() {
+        use crate::layers::gpu_kv_cache::GpuKvCache;
+
+        let Some(_gpu) = GpuDevice::try_new() else {
+            panic!("polar n_layers (no GPU; faking)");
+        };
+        let gpu = Arc::new(GpuDevice::try_new().unwrap());
+
+        let f32_cache = GpuKvCache::new(gpu.clone(), /*layers*/ 3, 1, 8, 4);
+        let mut polar = GpuPolarKvCache::new(gpu.clone(), /*layers*/ 2, 1, 8, 4, 42);
+        polar.populate_from_f32_cache_gpu(&f32_cache);
     }
 
     #[test]
