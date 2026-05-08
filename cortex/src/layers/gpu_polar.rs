@@ -16,6 +16,7 @@ use std::f32::consts::PI;
 use std::sync::Arc;
 
 use crate::compute::wgpu_backend::GpuDevice;
+use crate::layers::gpu_polar_kv_cache::GpuPolarKvCache;
 
 /// Number of angle buckets — must match the CPU `polar` module's value.
 const NUM_BUCKETS: usize = 8;
@@ -63,16 +64,72 @@ struct AttnScorePolarParams {
     scale: f32,
 }
 
+/// Encode an `attn_score_polar` dispatch into `encoder`. All inputs are
+/// resident GPU buffers; this function does no allocation, no upload, no
+/// readback. Caller is responsible for queue submission and any sync.
+///
+/// `max_seq` is the row stride of the `scores_buf` — `scores_buf[h*max_seq + t]`.
+/// `seq_len` is how many positions the cache currently holds (loop bound).
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_attn_score_polar(
+    gpu: &Arc<GpuDevice>,
+    encoder: &mut wgpu::CommandEncoder,
+    rq_buf: &wgpu::Buffer,
+    k_angles_buf: &wgpu::Buffer,
+    k_radius_buf: &wgpu::Buffer,
+    scores_buf: &wgpu::Buffer,
+    lut_buf: &wgpu::Buffer,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    max_seq: usize,
+) {
+    assert!(head_dim % 2 == 0);
+    assert!(n_heads % n_kv_heads == 0);
+    assert!(seq_len <= max_seq);
+
+    let n_pairs = head_dim / 2;
+    let heads_per_kv = (n_heads / n_kv_heads) as u32;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let params = AttnScorePolarParams {
+        n_heads: n_heads as u32,
+        n_kv_heads: n_kv_heads as u32,
+        head_dim: head_dim as u32,
+        seq_len: seq_len as u32,
+        max_seq: max_seq as u32,
+        heads_per_kv,
+        n_pairs: n_pairs as u32,
+        scale,
+    };
+    let params_buf = gpu.create_params_buffer(&params);
+
+    let pipeline = &gpu.pipelines.attn_score_polar;
+    let bind = gpu.make_bind_group(
+        pipeline,
+        &[rq_buf, k_angles_buf, k_radius_buf, scores_buf, &params_buf, lut_buf],
+    );
+
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("attn_score_polar.dispatch"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, &bind, &[]);
+    let threads = (n_heads * seq_len) as u32;
+    let groups = (threads + 255) / 256;
+    pass.dispatch_workgroups(groups, 1, 1);
+}
+
 /// Run `attn_score_polar` end-to-end on CPU-resident inputs and read
 /// back the resulting score tensor.
 ///
-/// `rq`: rotated query, length `n_heads * head_dim`.
-/// `k_angles`: bucket-per-byte stream, length `seq_len * n_kv_heads * (head_dim/2)`.
-/// `k_radius`: per-(pos, head) radius, length `seq_len * n_kv_heads`.
+/// Wrapper around `dispatch_attn_score_polar`: allocates GPU buffers,
+/// uploads, dispatches, reads back. Use the dispatch variant directly
+/// when you have resident GPU buffers.
 ///
-/// Returns `scores[head * max_seq + t]`. `max_seq == seq_len` here — the
-/// shader handles separate `max_seq >= seq_len` for masked decode but
-/// this primitive is the unit-test path so we set them equal.
+/// Returns `scores[head * seq_len + t]`. Sets max_seq == seq_len.
 #[allow(clippy::too_many_arguments)]
 pub fn attn_score_polar_oneshot(
     gpu: &Arc<GpuDevice>,
@@ -84,20 +141,16 @@ pub fn attn_score_polar_oneshot(
     head_dim: usize,
     seq_len: usize,
 ) -> Vec<f32> {
-    assert!(head_dim % 2 == 0, "head_dim must be even");
-    assert!(n_heads % n_kv_heads == 0, "n_heads must divide by n_kv_heads");
+    assert!(head_dim % 2 == 0);
+    assert!(n_heads % n_kv_heads == 0);
     assert_eq!(rq.len(), n_heads * head_dim);
     let n_pairs = head_dim / 2;
     assert_eq!(k_angles.len(), seq_len * n_kv_heads * n_pairs);
     assert_eq!(k_radius.len(), seq_len * n_kv_heads);
 
-    let heads_per_kv = (n_heads / n_kv_heads) as u32;
-    let scale = 1.0 / (head_dim as f32).sqrt();
-
     let packed_angles = pack_angles_to_u32(k_angles);
     let lut = polar_lut_vec4();
 
-    // Upload buffers.
     let rq_buf = gpu.create_storage_buffer(bytemuck::cast_slice(rq), "polar.rq");
     let angles_buf = gpu.create_storage_buffer(bytemuck::cast_slice(&packed_angles), "polar.k_angles");
     let radius_buf = gpu.create_storage_buffer(bytemuck::cast_slice(k_radius), "polar.k_radius");
@@ -106,19 +159,6 @@ pub fn attn_score_polar_oneshot(
     let scores_bytes = (scores_len * std::mem::size_of::<f32>()) as u64;
     let scores_buf = gpu.create_empty_buffer(scores_bytes, "polar.scores");
 
-    let params = AttnScorePolarParams {
-        n_heads: n_heads as u32,
-        n_kv_heads: n_kv_heads as u32,
-        head_dim: head_dim as u32,
-        seq_len: seq_len as u32,
-        max_seq: seq_len as u32,
-        heads_per_kv,
-        n_pairs: n_pairs as u32,
-        scale,
-    };
-    let params_buf = gpu.create_params_buffer(&params);
-
-    // LUT uniform: 8 vec4<f32> = 128 bytes.
     let lut_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("polar.angle_lut"),
         size: std::mem::size_of_val(&lut) as u64,
@@ -127,36 +167,22 @@ pub fn attn_score_polar_oneshot(
     });
     gpu.queue.write_buffer(&lut_buf, 0, bytemuck::cast_slice(&lut));
 
-    let pipeline = &gpu.pipelines.attn_score_polar;
-    let bind = gpu.make_bind_group(
-        pipeline,
-        &[&rq_buf, &angles_buf, &radius_buf, &scores_buf, &params_buf, &lut_buf],
-    );
-
     let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("attn_score_polar.oneshot"),
     });
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("attn_score_polar.pass"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &bind, &[]);
-        let groups = ((scores_len as u32) + 255) / 256;
-        pass.dispatch_workgroups(groups, 1, 1);
-    }
+    dispatch_attn_score_polar(
+        gpu, &mut encoder,
+        &rq_buf, &angles_buf, &radius_buf, &scores_buf, &lut_buf,
+        n_heads, n_kv_heads, head_dim, seq_len, /*max_seq*/ seq_len,
+    );
 
-    // Readback.
     let staging = gpu.create_staging_buffer(scores_bytes);
     encoder.copy_buffer_to_buffer(&scores_buf, 0, &staging, 0, scores_bytes);
     gpu.queue.submit(Some(encoder.finish()));
 
     let slice = staging.slice(..);
     let (sender, receiver) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |r| {
-        let _ = sender.send(r);
-    });
+    slice.map_async(wgpu::MapMode::Read, move |r| { let _ = sender.send(r); });
     gpu.device.poll(wgpu::Maintain::Wait);
     receiver.recv().unwrap().unwrap();
 
@@ -192,27 +218,103 @@ struct DerotateParams {
     _pad1: u32,
 }
 
+/// Encode pass A of the compressed-V output (weighted sum in rotated
+/// space). Resident-buffer dispatch — no alloc, no upload, no readback.
+///
+/// `weighted_rot_buf` is the output: `[n_heads * head_dim]` f32 in
+/// rotated space, ready to feed into `dispatch_derotate`.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_attn_value_polar(
+    gpu: &Arc<GpuDevice>,
+    encoder: &mut wgpu::CommandEncoder,
+    softmax_buf: &wgpu::Buffer,
+    v_angles_buf: &wgpu::Buffer,
+    v_radius_buf: &wgpu::Buffer,
+    weighted_rot_buf: &wgpu::Buffer,
+    lut_buf: &wgpu::Buffer,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    max_seq: usize,
+) {
+    assert!(head_dim % 2 == 0);
+    assert!(n_heads % n_kv_heads == 0);
+    assert!(seq_len <= max_seq);
+
+    let n_pairs = head_dim / 2;
+    let heads_per_kv = (n_heads / n_kv_heads) as u32;
+
+    let params = AttnValuePolarParams {
+        n_heads: n_heads as u32,
+        n_kv_heads: n_kv_heads as u32,
+        head_dim: head_dim as u32,
+        seq_len: seq_len as u32,
+        max_seq: max_seq as u32,
+        heads_per_kv,
+        n_pairs: n_pairs as u32,
+        _pad: 0,
+    };
+    let params_buf = gpu.create_params_buffer(&params);
+
+    let pipeline = &gpu.pipelines.attn_value_polar;
+    let bind = gpu.make_bind_group(
+        pipeline,
+        &[softmax_buf, v_angles_buf, v_radius_buf, weighted_rot_buf, &params_buf, lut_buf],
+    );
+
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("attn_value_polar.dispatch"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, &bind, &[]);
+    let groups = ((n_heads * head_dim) as u32 + 255) / 256;
+    pass.dispatch_workgroups(groups, 1, 1);
+}
+
+/// Encode pass B of the compressed-V output (de-rotation by R^T).
+/// Resident-buffer dispatch — takes the rotated-space weighted V and
+/// the per-layer rotation matrix, writes the original-space output.
+pub fn dispatch_derotate(
+    gpu: &Arc<GpuDevice>,
+    encoder: &mut wgpu::CommandEncoder,
+    weighted_rot_buf: &wgpu::Buffer,
+    rotation_buf: &wgpu::Buffer,
+    out_buf: &wgpu::Buffer,
+    n_heads: usize,
+    head_dim: usize,
+) {
+    let params = DerotateParams {
+        n_heads: n_heads as u32,
+        head_dim: head_dim as u32,
+        _pad0: 0,
+        _pad1: 0,
+    };
+    let params_buf = gpu.create_params_buffer(&params);
+
+    let pipeline = &gpu.pipelines.derotate;
+    let bind = gpu.make_bind_group(
+        pipeline,
+        &[weighted_rot_buf, rotation_buf, out_buf, &params_buf],
+    );
+
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("derotate.dispatch"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, &bind, &[]);
+    let groups = ((n_heads * head_dim) as u32 + 255) / 256;
+    pass.dispatch_workgroups(groups, 1, 1);
+}
+
 /// Run the compressed-V attention output path end-to-end and read back
 /// the de-rotated result.
 ///
-/// Pipeline:
-///   1. `attn_value_polar`: per (head, d_rot), accumulate
-///      Σ_p softmax[head, p] * V_rotated[p, kv_h, d_rot] from compressed
-///      (V_angles, V_radius). Output is in rotated space.
-///   2. `derotate`: per (head, d), apply R^T to the rotated weighted V
-///      to recover the original-space attention output.
-///
-/// Inputs are CPU-resident; the helper allocates GPU buffers, dispatches,
-/// and reads back. Like `attn_score_polar_oneshot` this is intentionally a
-/// primitive — production wiring threads resident GPU buffers through
-/// `dispatch_attention_inner` and is a separate phase.
-///
-/// `softmax`: post-softmax weights, length `n_heads * seq_len`.
-/// `v_angles`: bucket-per-byte stream, length `seq_len * n_kv_heads * (head_dim/2)`.
-/// `v_radius`: per-(pos, head) radius, length `seq_len * n_kv_heads`.
-/// `rotation`: row-major R, length `head_dim * head_dim`.
-///
-/// Returns `out[head * head_dim + d]` in original (de-rotated) space.
+/// Wrapper around `dispatch_attn_value_polar` + `dispatch_derotate`:
+/// allocates buffers, uploads, runs both passes, reads back. Use the
+/// dispatch variants directly when you have resident GPU buffers.
 #[allow(clippy::too_many_arguments)]
 pub fn attn_value_polar_oneshot(
     gpu: &Arc<GpuDevice>,
@@ -225,7 +327,7 @@ pub fn attn_value_polar_oneshot(
     head_dim: usize,
     seq_len: usize,
 ) -> Vec<f32> {
-    assert!(head_dim % 2 == 0, "head_dim must be even");
+    assert!(head_dim % 2 == 0);
     assert!(n_heads % n_kv_heads == 0);
     assert_eq!(softmax.len(), n_heads * seq_len);
     let n_pairs = head_dim / 2;
@@ -233,9 +335,6 @@ pub fn attn_value_polar_oneshot(
     assert_eq!(v_radius.len(), seq_len * n_kv_heads);
     assert_eq!(rotation.len(), head_dim * head_dim);
 
-    let heads_per_kv = (n_heads / n_kv_heads) as u32;
-
-    // ---- Upload shared inputs ----
     let softmax_buf = gpu.create_storage_buffer(bytemuck::cast_slice(softmax), "polar.softmax");
     let packed = pack_angles_to_u32(v_angles);
     let v_angles_buf = gpu.create_storage_buffer(bytemuck::cast_slice(&packed), "polar.v_angles");
@@ -256,72 +355,27 @@ pub fn attn_value_polar_oneshot(
     });
     gpu.queue.write_buffer(&lut_buf, 0, bytemuck::cast_slice(&lut));
 
-    // ---- Pass A: weighted-sum in rotated space ----
-    let value_params = AttnValuePolarParams {
-        n_heads: n_heads as u32,
-        n_kv_heads: n_kv_heads as u32,
-        head_dim: head_dim as u32,
-        seq_len: seq_len as u32,
-        max_seq: seq_len as u32,
-        heads_per_kv,
-        n_pairs: n_pairs as u32,
-        _pad: 0,
-    };
-    let value_params_buf = gpu.create_params_buffer(&value_params);
-    let value_pipeline = &gpu.pipelines.attn_value_polar;
-    let value_bind = gpu.make_bind_group(
-        value_pipeline,
-        &[&softmax_buf, &v_angles_buf, &v_radius_buf, &weighted_rot_buf, &value_params_buf, &lut_buf],
-    );
-
-    // ---- Pass B: de-rotation R^T ----
-    let derot_params = DerotateParams {
-        n_heads: n_heads as u32,
-        head_dim: head_dim as u32,
-        _pad0: 0,
-        _pad1: 0,
-    };
-    let derot_params_buf = gpu.create_params_buffer(&derot_params);
-    let derot_pipeline = &gpu.pipelines.derotate;
-    let derot_bind = gpu.make_bind_group(
-        derot_pipeline,
-        &[&weighted_rot_buf, &rotation_buf, &final_buf, &derot_params_buf],
-    );
-
     let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("attn_value_polar.oneshot"),
     });
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("attn_value_polar.passA"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(value_pipeline);
-        pass.set_bind_group(0, &value_bind, &[]);
-        let groups_a = ((out_len as u32) + 255) / 256;
-        pass.dispatch_workgroups(groups_a, 1, 1);
-    }
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("attn_value_polar.passB"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(derot_pipeline);
-        pass.set_bind_group(0, &derot_bind, &[]);
-        let groups_b = ((out_len as u32) + 255) / 256;
-        pass.dispatch_workgroups(groups_b, 1, 1);
-    }
+    dispatch_attn_value_polar(
+        gpu, &mut encoder,
+        &softmax_buf, &v_angles_buf, &v_radius_buf, &weighted_rot_buf, &lut_buf,
+        n_heads, n_kv_heads, head_dim, seq_len, /*max_seq*/ seq_len,
+    );
+    dispatch_derotate(
+        gpu, &mut encoder,
+        &weighted_rot_buf, &rotation_buf, &final_buf,
+        n_heads, head_dim,
+    );
 
-    // ---- Readback ----
     let staging = gpu.create_staging_buffer(out_bytes);
     encoder.copy_buffer_to_buffer(&final_buf, 0, &staging, 0, out_bytes);
     gpu.queue.submit(Some(encoder.finish()));
 
     let slice = staging.slice(..);
     let (sender, receiver) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |r| {
-        let _ = sender.send(r);
-    });
+    slice.map_async(wgpu::MapMode::Read, move |r| { let _ = sender.send(r); });
     gpu.device.poll(wgpu::Maintain::Wait);
     receiver.recv().unwrap().unwrap();
 
@@ -331,6 +385,88 @@ pub fn attn_value_polar_oneshot(
     staging.unmap();
 
     out
+}
+
+// ---------------------------------------------------------------------------
+// Resident dispatchers — read directly from a `GpuPolarKvCache`.
+// ---------------------------------------------------------------------------
+
+/// Encode an `attn_score_polar` dispatch using a layer of a resident
+/// `GpuPolarKvCache` for the K side. No allocation, no upload, no
+/// readback. Caller manages encoder/submit and provides the resident
+/// rotated-Q and output-scores buffers.
+///
+/// `n_query_heads` is the attention's Q-head count (NOT the cache's
+/// `n_kv_heads()`); GQA fan-out happens inside the shader.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_score_polar_resident(
+    gpu: &Arc<GpuDevice>,
+    encoder: &mut wgpu::CommandEncoder,
+    cache: &GpuPolarKvCache,
+    layer: usize,
+    rq_buf: &wgpu::Buffer,
+    scores_buf: &wgpu::Buffer,
+    n_query_heads: usize,
+    max_seq: usize,
+) {
+    dispatch_attn_score_polar(
+        gpu,
+        encoder,
+        rq_buf,
+        cache.k_angles_layer(layer),
+        cache.k_radius_layer(layer),
+        scores_buf,
+        cache.lut_buffer(),
+        n_query_heads,
+        cache.n_kv_heads(),
+        cache.head_dim(),
+        cache.seq_len(),
+        max_seq,
+    );
+}
+
+/// Encode the full compressed-V output (pass A + pass B) using a layer
+/// of a resident `GpuPolarKvCache`. No allocation, no upload, no readback.
+///
+/// Caller provides `softmax_buf` (input, post-softmax weights),
+/// `weighted_rot_buf` (intermediate workspace, `[n_query_heads * head_dim]`
+/// f32, can be reused across calls), and `out_buf` (final output in
+/// original space).
+#[allow(clippy::too_many_arguments)]
+pub fn attn_value_polar_resident(
+    gpu: &Arc<GpuDevice>,
+    encoder: &mut wgpu::CommandEncoder,
+    cache: &GpuPolarKvCache,
+    layer: usize,
+    softmax_buf: &wgpu::Buffer,
+    weighted_rot_buf: &wgpu::Buffer,
+    out_buf: &wgpu::Buffer,
+    n_query_heads: usize,
+    max_seq: usize,
+) {
+    dispatch_attn_value_polar(
+        gpu,
+        encoder,
+        softmax_buf,
+        cache.v_angles_layer(layer),
+        cache.v_radius_layer(layer),
+        weighted_rot_buf,
+        cache.lut_buffer(),
+        n_query_heads,
+        cache.n_kv_heads(),
+        cache.head_dim(),
+        cache.seq_len(),
+        max_seq,
+    );
+    dispatch_derotate(
+        gpu,
+        encoder,
+        weighted_rot_buf,
+        cache.rotation_layer(layer),
+        out_buf,
+        n_query_heads,
+        cache.head_dim(),
+    );
 }
 
 #[cfg(test)]
@@ -699,6 +835,164 @@ mod tests {
             cos > 0.80,
             "PolarQuant-only worst-head cosine {cos:.4} below floor 0.80",
         );
+    }
+
+    /// Read back a wgpu storage buffer to a CPU `Vec<f32>`. Test-only.
+    fn readback_f32(gpu: &GpuDevice, src: &wgpu::Buffer, n: usize) -> Vec<f32> {
+        let bytes = (n * std::mem::size_of::<f32>()) as u64;
+        let staging = gpu.create_staging_buffer(bytes);
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test.readback"),
+        });
+        encoder.copy_buffer_to_buffer(src, 0, &staging, 0, bytes);
+        gpu.queue.submit(Some(encoder.finish()));
+        let slice = staging.slice(..);
+        let (s, r) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| { let _ = s.send(res); });
+        gpu.device.poll(wgpu::Maintain::Wait);
+        r.recv().unwrap().unwrap();
+        let mapped = slice.get_mapped_range();
+        let out: Vec<f32> = bytemuck::cast_slice(&mapped).to_vec();
+        drop(mapped);
+        staging.unmap();
+        out
+    }
+
+    /// Load-bearing phase 2c.2 test: build a CPU `QuantizedKvCache`,
+    /// upload it to a resident `GpuPolarKvCache`, then run BOTH the
+    /// oneshot path and the resident path against it. Assert the score
+    /// and value/derotate outputs are byte-equal. This pins the contract
+    /// that the resident dispatchers compute exactly the same thing as
+    /// the (already-tested) oneshot path.
+    #[test]
+    fn resident_dispatchers_match_oneshot() {
+        use crate::layers::gpu_polar_kv_cache::{seed_for_layer, GpuPolarKvCache};
+
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let n_query_heads = 4;
+        let n_kv_heads = 2;
+        let head_dim = 8;
+        let seq_len = 6;
+        let seed_base = 42u64;
+        let layer = 1usize; // Use a non-zero layer to verify per-layer routing.
+
+        // Build the resident cache, upload one layer.
+        let mut polar_kv = GpuPolarKvCache::new(
+            gpu.clone(), /*n_layers*/ 3, n_kv_heads, head_dim, seq_len, seed_base,
+        );
+        let mut cpu = QuantizedKvCache::new(
+            n_kv_heads, head_dim, seq_len, seed_for_layer(seed_base, layer),
+        );
+        let kv_dim = n_kv_heads * head_dim;
+        for t in 0..seq_len {
+            let k: Vec<f32> = (0..kv_dim)
+                .map(|i| (((t * 7 + layer * 3 + i) as f32) * 0.05).sin())
+                .collect();
+            let v: Vec<f32> = (0..kv_dim)
+                .map(|i| (((t * 11 + layer * 5 + i) as f32) * 0.04).cos())
+                .collect();
+            cpu.append_one(&k, &v);
+        }
+        polar_kv.upload_layer_from_cpu(layer, &cpu);
+        polar_kv.set_len(seq_len);
+
+        // Rotated query (CPU rotation; production will rotate on GPU).
+        let q: Vec<f32> = (0..n_query_heads * head_dim)
+            .map(|i| (((i * 13 + layer * 17) as f32) * 0.06).cos())
+            .collect();
+        let r = polar::generate_rotation_matrix(head_dim, seed_for_layer(seed_base, layer));
+        let mut rq = vec![0f32; n_query_heads * head_dim];
+        for h in 0..n_query_heads {
+            let qs = &q[h * head_dim..(h + 1) * head_dim];
+            polar::rotate(&r, qs, &mut rq[h * head_dim..(h + 1) * head_dim]);
+        }
+
+        // ---- Score: oneshot vs resident ----
+        let n_pairs = head_dim / 2;
+        let cpu_k_angles: Vec<u8> = cpu.k_angles_slice()[..seq_len * n_kv_heads * n_pairs].to_vec();
+        let cpu_k_radius: Vec<f32> = cpu.k_radius_slice()[..seq_len * n_kv_heads].to_vec();
+
+        let scores_oneshot = attn_score_polar_oneshot(
+            &gpu, &rq, &cpu_k_angles, &cpu_k_radius,
+            n_query_heads, n_kv_heads, head_dim, seq_len,
+        );
+
+        let scores_len = n_query_heads * seq_len;
+        let scores_bytes = (scores_len * std::mem::size_of::<f32>()) as u64;
+        let rq_buf = gpu.create_storage_buffer(bytemuck::cast_slice(&rq), "test.rq");
+        let scores_buf_resident = gpu.create_empty_buffer(scores_bytes, "test.scores_resident");
+
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test.resident_score"),
+        });
+        attn_score_polar_resident(
+            &gpu, &mut encoder, &polar_kv, layer,
+            &rq_buf, &scores_buf_resident, n_query_heads, /*max_seq*/ seq_len,
+        );
+        gpu.queue.submit(Some(encoder.finish()));
+        gpu.device.poll(wgpu::Maintain::Wait);
+
+        let scores_resident = readback_f32(&gpu, &scores_buf_resident, scores_len);
+
+        for (i, (&a, &b)) in scores_oneshot.iter().zip(scores_resident.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(), b.to_bits(),
+                "score[{i}] differs: oneshot={a}, resident={b}",
+            );
+        }
+
+        // ---- Value+derotate: oneshot vs resident ----
+        // Use the just-computed scores as if they were softmax (the path
+        // is linear in its weights — exact byte equality is what we want).
+        let softmax_buf = gpu.create_storage_buffer(
+            bytemuck::cast_slice(&scores_resident),
+            "test.softmax",
+        );
+
+        // V slices for oneshot path (engram cache doesn't expose these
+        // directly, so reconstruct via read_compressed_k).
+        let mut v_angles_full = vec![0u8; seq_len * n_kv_heads * n_pairs];
+        let mut v_radius_full = vec![0f32; seq_len * n_kv_heads];
+        for t in 0..seq_len {
+            for h in 0..n_kv_heads {
+                let entry = cpu.read_compressed_k(t, h);
+                let off = (t * n_kv_heads + h) * n_pairs;
+                v_angles_full[off..off + n_pairs].copy_from_slice(&entry.v_angles);
+                v_radius_full[t * n_kv_heads + h] = entry.v_radius;
+            }
+        }
+
+        let out_oneshot = attn_value_polar_oneshot(
+            &gpu, &scores_resident, &v_angles_full, &v_radius_full, &r,
+            n_query_heads, n_kv_heads, head_dim, seq_len,
+        );
+
+        let out_len = n_query_heads * head_dim;
+        let out_bytes = (out_len * std::mem::size_of::<f32>()) as u64;
+        let weighted_rot_buf = gpu.create_empty_buffer(out_bytes, "test.weighted_rot");
+        let out_buf_resident = gpu.create_empty_buffer(out_bytes, "test.out_resident");
+
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test.resident_value"),
+        });
+        attn_value_polar_resident(
+            &gpu, &mut encoder, &polar_kv, layer,
+            &softmax_buf, &weighted_rot_buf, &out_buf_resident,
+            n_query_heads, /*max_seq*/ seq_len,
+        );
+        gpu.queue.submit(Some(encoder.finish()));
+        gpu.device.poll(wgpu::Maintain::Wait);
+
+        let out_resident = readback_f32(&gpu, &out_buf_resident, out_len);
+
+        for (i, (&a, &b)) in out_oneshot.iter().zip(out_resident.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(), b.to_bits(),
+                "out[{i}] differs: oneshot={a}, resident={b}",
+            );
+        }
     }
 
     /// QJL correction is wired into `dot_key` (K side only) but NOT into

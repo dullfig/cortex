@@ -45,10 +45,12 @@ pub struct GpuPolarKvCache {
     v_angles_buffers: Vec<wgpu::Buffer>,
     v_radius_buffers: Vec<wgpu::Buffer>,
 
-    /// Per-layer rotation matrices, packed into one buffer with row stride
-    /// `head_dim * head_dim`. Layer i lives at offset `i * head_dim^2`.
-    /// Resident as f32 so the de-rotation shader can index directly.
-    rotation_buffer: wgpu::Buffer,
+    /// Per-layer rotation matrices: one f32 storage buffer per layer of
+    /// size `head_dim * head_dim * 4` bytes. Storing per-layer (vs one
+    /// packed buffer) keeps the resident dispatchers from needing
+    /// sub-region bindings and avoids `min_storage_buffer_offset_alignment`
+    /// constraints when head_dim is small (test fixtures).
+    rotation_buffers: Vec<wgpu::Buffer>,
 
     /// Shared angle LUT uniform: vec4<f32>[8] (cos, sin, _, _) per bucket.
     lut_buffer: wgpu::Buffer,
@@ -115,18 +117,17 @@ impl GpuPolarKvCache {
             v_radius_buffers.push(mk_radius(&format!("polar_kv.v_radius.layer{i}")));
         }
 
-        // Per-layer rotation matrices, packed into one f32 buffer of size
-        // n_layers * head_dim^2. Build on CPU (deterministic from seed),
-        // upload once.
-        let mut rotation_data = Vec::with_capacity(n_layers * head_dim * head_dim);
+        // Per-layer rotation matrices: one buffer each, deterministic from
+        // (rotation_seed_base + layer_idx) — matches engram's per-layer
+        // R seeding convention.
+        let mut rotation_buffers = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
             let r = polar::generate_rotation_matrix(head_dim, rotation_seed_base + i as u64);
-            rotation_data.extend_from_slice(&r);
+            rotation_buffers.push(gpu.create_storage_buffer(
+                bytemuck::cast_slice(&r),
+                &format!("polar_kv.rotation.layer{i}"),
+            ));
         }
-        let rotation_buffer = gpu.create_storage_buffer(
-            bytemuck::cast_slice(&rotation_data),
-            "polar_kv.rotation_per_layer",
-        );
 
         // Shared angle LUT uniform.
         let lut = polar_lut_vec4();
@@ -144,7 +145,7 @@ impl GpuPolarKvCache {
             k_radius_buffers,
             v_angles_buffers,
             v_radius_buffers,
-            rotation_buffer,
+            rotation_buffers,
             lut_buffer,
             n_layers,
             n_kv_heads,
@@ -240,7 +241,7 @@ impl GpuPolarKvCache {
     pub fn k_radius_layer(&self, idx: usize) -> &wgpu::Buffer { &self.k_radius_buffers[idx] }
     pub fn v_angles_layer(&self, idx: usize) -> &wgpu::Buffer { &self.v_angles_buffers[idx] }
     pub fn v_radius_layer(&self, idx: usize) -> &wgpu::Buffer { &self.v_radius_buffers[idx] }
-    pub fn rotation_buffer(&self) -> &wgpu::Buffer { &self.rotation_buffer }
+    pub fn rotation_layer(&self, idx: usize) -> &wgpu::Buffer { &self.rotation_buffers[idx] }
     pub fn lut_buffer(&self) -> &wgpu::Buffer { &self.lut_buffer }
 
     /// VRAM bytes used (compressed K+V + rotation; LUT excluded).
@@ -421,8 +422,8 @@ mod tests {
         assert_eq!(polar_kv.seq_len(), seq_len);
     }
 
-    /// Per-layer rotation buffer: the layout must be one R per layer at
-    /// stride `head_dim^2`, deterministic from `(seed_base + layer)`.
+    /// Per-layer rotation buffer: each layer's buffer must hold the R
+    /// produced by `generate_rotation_matrix(seed_base + layer)`.
     /// Anything else would silently break attention quality across layers
     /// because the CPU and GPU paths would disagree on R.
     #[test]
@@ -437,17 +438,14 @@ mod tests {
             gpu.clone(), n_layers, /*kv_heads*/ 2, head_dim, /*max_seq*/ 4, seed_base,
         );
 
-        let total_bytes = (n_layers * head_dim * head_dim * 4) as u64;
-        let bytes = readback_buffer(&gpu, polar_kv.rotation_buffer(), total_bytes);
-        let got: &[f32] = bytemuck::cast_slice(&bytes);
-
+        let bytes_per_layer = (head_dim * head_dim * 4) as u64;
         for layer in 0..n_layers {
+            let bytes = readback_buffer(&gpu, polar_kv.rotation_layer(layer), bytes_per_layer);
+            let got: &[f32] = bytemuck::cast_slice(&bytes);
             let expected = polar::generate_rotation_matrix(
                 head_dim, seed_for_layer(seed_base, layer),
             );
-            let off = layer * head_dim * head_dim;
-            let slice = &got[off..off + head_dim * head_dim];
-            for (a, b) in slice.iter().zip(expected.iter()) {
+            for (a, b) in got.iter().zip(expected.iter()) {
                 assert!(
                     (a - b).abs() < 1e-7,
                     "rotation mismatch on layer {layer}",
