@@ -76,6 +76,14 @@ struct Cli {
     /// realistic head_dim) for ~7x KV VRAM reduction.
     #[arg(long)]
     enable_polar_cache: bool,
+
+    /// Enable shim registry endpoints (PUT/GET/DELETE /v1/shims/{id},
+    /// GET /v1/shims/, POST /v1/shims/infer). Shims are small ONNX
+    /// modules used as classifiers / gates / steers per the v1 shim API
+    /// (project_cortex_v1_shim_api.md). When disabled, the routes are
+    /// not mounted (404).
+    #[arg(long)]
+    enable_shims: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -125,6 +133,43 @@ struct ComposedEntry {
     cache: GpuKvCache,
 }
 
+/// Shim manifest as defined in `project_cortex_v1_shim_api.md`. Wire-
+/// compatible with what AgentOS's shim-management control plane pushes
+/// via PUT /v1/shims/{id}.
+///
+/// `input_shape` and `output_shape` are kept as `serde_json::Value` so
+/// the schema can grow without breaking older clients — the v1 shapes
+/// (`{"hidden_dim": N}` for input, `{"kind": "scalar"|"category:N"|"hidden_delta"}`
+/// for output) are recognized at infer time, not at registration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ShimManifest {
+    id: String,
+    version: String,
+    /// "injection" | "gate" | "steer"
+    phase: String,
+    attachment: ShimAttachment,
+    input_shape: serde_json::Value,
+    output_shape: serde_json::Value,
+    #[serde(default)]
+    description: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ShimAttachment {
+    /// "final" | "entrance:N" | "entrance:all"
+    layer: String,
+    /// "last_token" | "mean" | "attention" | "none"
+    pooling: String,
+}
+
+/// One registered shim. Holds the manifest plus the loaded ort Session.
+/// Wrapped in `Arc` so handlers can take a clone (cheap) without
+/// holding the registry lock through inference.
+struct RegisteredShim {
+    manifest: ShimManifest,
+    session: Mutex<ort::session::Session>,
+}
+
 struct ServerState {
     /// GPU-resident inference engine. Owns the underlying TransformerModel
     /// and the GPU device. CPU-side calls go through `engine.cpu()`; the
@@ -159,6 +204,12 @@ struct ServerState {
     /// seeding scheme — required for cross-cache compatibility (e.g.
     /// multi-shard polar composition, future).
     polar_rotation_seed: u64,
+    /// Shim registry: hot-resident ONNX shims keyed by id. Empty unless
+    /// `shims_enabled` is true. `Arc` so handlers can clone-into-handler
+    /// without holding the registry lock through inference.
+    shims: Mutex<HashMap<String, Arc<RegisteredShim>>>,
+    /// Whether shim endpoints are enabled.
+    shims_enabled: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1448,6 +1499,164 @@ async fn cache_delete(
 }
 
 // ---------------------------------------------------------------------------
+// Shim registry endpoints (5a)
+// ---------------------------------------------------------------------------
+
+/// PUT body shape: JSON envelope with the manifest and the ONNX bytes
+/// as base64. Multipart-free so AgentOS's HTTP client can use the same
+/// JSON pipeline as every other endpoint.
+#[derive(Deserialize)]
+struct ShimPutRequest {
+    manifest: ShimManifest,
+    /// Base64-encoded ONNX model bytes.
+    onnx_base64: String,
+}
+
+#[derive(Serialize)]
+struct ShimRegistryEntry {
+    manifest: ShimManifest,
+}
+
+#[derive(Serialize)]
+struct ShimsListResponse {
+    shims: Vec<ShimManifest>,
+}
+
+/// PUT /v1/shims/{id} — register a shim. Body decodes the ONNX bytes,
+/// loads them via ort, and stores the (manifest, session) pair in the
+/// registry. If `id` already exists, replaces it.
+///
+/// 400 on base64 decode failure or ONNX load failure (the bytes were
+/// junk or not a well-formed ONNX model). 400 on id mismatch between
+/// URL path and manifest body — refuse to register an ambiguous shim.
+async fn shim_put(
+    State(state): State<Arc<ServerState>>,
+    Path(id): Path<String>,
+    Json(req): Json<ShimPutRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    if req.manifest.id != id {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "invalid_request",
+                    "message": format!("manifest id '{}' does not match URL path id '{}'",
+                                       req.manifest.id, id),
+                }
+            })),
+        ));
+    }
+
+    use base64::Engine;
+    let onnx_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&req.onnx_base64)
+        .map_err(|e| (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "invalid_request",
+                    "message": format!("onnx_base64 decode failed: {e}"),
+                }
+            })),
+        ))?;
+
+    // Build the ort session from in-memory bytes. Runs synchronously
+    // (ORT init is fast) — wrapping in spawn_blocking would be
+    // overkill for typical shim sizes (~28k params, < 100 KB ONNX).
+    let session = ort::session::Session::builder()
+        .and_then(|mut b| b.commit_from_memory(&onnx_bytes))
+        .map_err(|e| (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "invalid_request",
+                    "message": format!("ort session load failed: {e}"),
+                }
+            })),
+        ))?;
+
+    let registered = Arc::new(RegisteredShim {
+        manifest: req.manifest.clone(),
+        session: Mutex::new(session),
+    });
+
+    let mut shims = state.shims.lock().await;
+    let existed = shims.insert(id.clone(), registered).is_some();
+    let count = shims.len();
+    drop(shims);
+
+    info!(
+        shim_id = %id,
+        version = %req.manifest.version,
+        phase = %req.manifest.phase,
+        replaced = existed,
+        registered_count = count,
+        "shim registered",
+    );
+
+    Ok((
+        if existed { StatusCode::OK } else { StatusCode::CREATED },
+        Json(ShimRegistryEntry { manifest: req.manifest }),
+    ))
+}
+
+/// GET /v1/shims/{id} — return one shim's manifest.
+async fn shim_get(
+    State(state): State<Arc<ServerState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let shims = state.shims.lock().await;
+    let entry = shims.get(&id).ok_or_else(|| (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": {
+                "type": "shim_not_found",
+                "message": format!("shim '{id}' not registered"),
+                "shim_id": id,
+            }
+        })),
+    ))?;
+    Ok(Json(ShimRegistryEntry { manifest: entry.manifest.clone() }))
+}
+
+/// GET /v1/shims/ — list all registered shim manifests.
+async fn shims_list(
+    State(state): State<Arc<ServerState>>,
+) -> impl IntoResponse {
+    let shims = state.shims.lock().await;
+    let manifests: Vec<ShimManifest> = shims.values()
+        .map(|s| s.manifest.clone())
+        .collect();
+    Json(ShimsListResponse { shims: manifests })
+}
+
+/// DELETE /v1/shims/{id} — unregister a shim.
+async fn shim_delete(
+    State(state): State<Arc<ServerState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let mut shims = state.shims.lock().await;
+    let removed = shims.remove(&id).is_some();
+    let count = shims.len();
+    drop(shims);
+    if removed {
+        info!(shim_id = %id, registered_count = count, "shim unregistered");
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "shim_not_found",
+                    "message": format!("shim '{id}' not registered"),
+                    "shim_id": id,
+                }
+            })),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tokenize endpoint
 // ---------------------------------------------------------------------------
 
@@ -1609,6 +1818,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         retrieve_enabled,
         polar_cache_enabled,
         polar_rotation_seed,
+        shims: Mutex::new(HashMap::new()),
+        shims_enabled: cli.enable_shims,
     });
 
     // Build router: always include completions, models, health.
@@ -1627,6 +1838,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .route("/v1/cache/{id}", get(cache_get).delete(cache_delete));
     }
 
+    if cli.enable_shims {
+        app = app
+            .route("/v1/shims/", get(shims_list))
+            .route("/v1/shims/{id}", get(shim_get).put(shim_put).delete(shim_delete));
+    }
+
     let app = app.with_state(state);
 
     let addr = format!("{}:{}", cli.bind, cli.port);
@@ -1636,6 +1853,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cache = cache_enabled,
         retrieve = retrieve_enabled,
         polar = polar_cache_enabled,
+        shims = cli.enable_shims,
         "cortex-server ready",
     );
 

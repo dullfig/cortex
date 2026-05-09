@@ -30,3 +30,7 @@ clap = { version = "4", features = ["derive"] }
 # runtime native lib is fetched at build time without requiring a
 # system-installed ORT.
 ort = { version = "=2.0.0-rc.12", features = ["download-binaries"] }
+# base64 for the PUT /v1/shims/{id} JSON envelope
+# (`{"manifest":{...},"onnx_base64":"..."}`). Avoids axum-multipart
+# dep churn and matches AgentOS's preferred upload shape.
+base64 = "0.22"
