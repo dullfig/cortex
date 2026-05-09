@@ -1630,6 +1630,238 @@ async fn shims_list(
     Json(ShimsListResponse { shims: manifests })
 }
 
+/// POST /v1/shims/infer — standalone classification.
+///
+/// Pipeline (v1, attachment.layer = "final" only):
+///   1. Tokenize `context` with the model tokenizer
+///   2. Forward through the model, capture final post-norm hidden state
+///      ([n_tokens, embed_dim] f32)
+///   3. Pool per manifest.attachment.pooling
+///      ("last_token" | "mean"; "attention" / "none" return 400 for v1)
+///   4. Validate pooled length == manifest.input_shape.hidden_dim
+///   5. Run the registered ort Session over the pooled vector
+///   6. Format the output per manifest.output_shape.kind
+///      ("scalar" → first f32; "category" → argmax + probs;
+///       "hidden_delta" → raw vector; others 400)
+///
+/// "entrance:N" attachments + "attention" pooling are explicit v2.
+#[derive(Deserialize)]
+struct ShimInferRequest {
+    shim_id: String,
+    context: String,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn shim_infer(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<ShimInferRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let shim = {
+        let shims = state.shims.lock().await;
+        shims.get(&req.shim_id).cloned().ok_or_else(|| (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "shim_not_found",
+                    "message": format!("shim '{}' not registered", req.shim_id),
+                    "shim_id": req.shim_id,
+                }
+            })),
+        ))?
+    };
+    let manifest = &shim.manifest;
+
+    // v1 supports only attachment.layer = "final".
+    if manifest.attachment.layer != "final" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "unsupported",
+                    "message": format!(
+                        "v1 supports only attachment.layer='final'; got '{}'",
+                        manifest.attachment.layer),
+                }
+            })),
+        ));
+    }
+
+    // 1. Tokenize.
+    let tokens = state.tokenizer.encode(&req.context, /*add_bos*/ true);
+    if tokens.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": { "type": "invalid_request", "message": "empty context after tokenization" }
+            })),
+        ));
+    }
+
+    // 2. Forward through cortex; capture final post-norm hidden only.
+    let infer_start = Instant::now();
+    let hc = tokio::task::block_in_place(|| {
+        state.engine.forward_full_gpu_with_hidden_capture(&tokens, &[])
+    });
+    let cortex_ms = infer_start.elapsed().as_millis() as u64;
+
+    // 3. Pool.
+    let pooled: Vec<f32> = match manifest.attachment.pooling.as_str() {
+        "last_token" => hc.final_last_token().to_vec(),
+        "mean" => {
+            let mut sum = vec![0.0f32; hc.embed_dim];
+            for t in 0..hc.n_tokens {
+                let off = t * hc.embed_dim;
+                for d in 0..hc.embed_dim {
+                    sum[d] += hc.final_post_norm_hidden[off + d];
+                }
+            }
+            let n = hc.n_tokens as f32;
+            for v in sum.iter_mut() { *v /= n; }
+            sum
+        }
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "type": "unsupported",
+                        "message": format!("v1 pooling supports last_token | mean; got '{other}'"),
+                    }
+                })),
+            ));
+        }
+    };
+
+    // 4. Validate hidden_dim against manifest.
+    let expected_dim = manifest.input_shape.get("hidden_dim")
+        .and_then(|v| v.as_u64()).map(|n| n as usize)
+        .ok_or_else(|| (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "invalid_manifest",
+                    "message": "manifest.input_shape must include integer 'hidden_dim'",
+                }
+            })),
+        ))?;
+    if pooled.len() != expected_dim {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "shape_mismatch",
+                    "message": format!(
+                        "model embed_dim={} != manifest input_shape.hidden_dim={}",
+                        pooled.len(), expected_dim),
+                }
+            })),
+        ));
+    }
+
+    // 5. Run the ort session. Lock the per-shim session mutex (ort
+    //    Sessions aren't Sync); v1 serializes inference per shim, fine
+    //    for a server that's not yet fronting many concurrent users.
+    //    Scoped so all borrows of `session` end (outputs / extracted
+    //    tensor refs) before the function continues with owned data.
+    let ort_start = Instant::now();
+    let (out_vec, out_shape_vec) = {
+        let mut session = shim.session.lock().await;
+        let input_name = session.inputs().first()
+            .map(|i| i.name().to_string())
+            .unwrap_or_else(|| "x".to_string());
+        let tensor = ort::value::TensorRef::from_array_view((
+            vec![1_i64, pooled.len() as i64],
+            pooled.as_slice(),
+        )).map_err(|e| (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "ort_error",
+                    "message": format!("input tensor construction failed: {e}"),
+                }
+            })),
+        ))?;
+        let outputs = session.run(ort::inputs![input_name.as_str() => tensor]).map_err(|e| (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "ort_error",
+                    "message": format!("session run failed: {e}"),
+                }
+            })),
+        ))?;
+        let first_out = outputs.iter().next().ok_or_else(|| (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "ort_error",
+                    "message": "session produced no outputs",
+                }
+            })),
+        ))?.1;
+        let (out_shape, out_data) = first_out.try_extract_tensor::<f32>().map_err(|e| (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "ort_error",
+                    "message": format!("output extraction failed: {e}"),
+                }
+            })),
+        ))?;
+        (out_data.to_vec(), out_shape.iter().copied().collect::<Vec<i64>>())
+    };
+    let ort_ms = ort_start.elapsed().as_millis() as u64;
+
+    // 6. Format per output_shape.kind. v1 accepted: "scalar",
+    //    "category:N" (N read from the shape if needed), "hidden_delta".
+    let kind = manifest.output_shape.get("kind").and_then(|v| v.as_str()).unwrap_or("scalar");
+    let decision: serde_json::Value = if kind == "scalar" {
+        if out_vec.is_empty() {
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": { "type": "ort_error", "message": "scalar output empty" }
+            }))));
+        }
+        serde_json::json!(out_vec[0])
+    } else if kind.starts_with("category") {
+        let argmax = out_vec.iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) })
+            .0;
+        serde_json::json!(argmax)
+    } else if kind == "hidden_delta" {
+        serde_json::json!(out_vec)
+    } else {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": { "type": "unsupported", "message": format!("output_shape.kind '{kind}' not supported") }
+        }))));
+    };
+
+    let response = serde_json::json!({
+        "decision": decision,
+        "metadata": {
+            "shim_id": req.shim_id,
+            "shim_version": manifest.version,
+            "kind": kind,
+            "output_shape": out_shape_vec,
+            "context_tokens": tokens.len(),
+            "cortex_ms": cortex_ms,
+            "ort_ms": ort_ms,
+            "raw_output": out_vec,
+        }
+    });
+
+    info!(
+        shim_id = %req.shim_id,
+        kind = %kind,
+        context_tokens = tokens.len(),
+        cortex_ms,
+        ort_ms,
+        "shim infer",
+    );
+
+    Ok(Json(response))
+}
+
 /// DELETE /v1/shims/{id} — unregister a shim.
 async fn shim_delete(
     State(state): State<Arc<ServerState>>,
@@ -1841,6 +2073,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cli.enable_shims {
         app = app
             .route("/v1/shims/", get(shims_list))
+            .route("/v1/shims/infer", post(shim_infer))
             .route("/v1/shims/{id}", get(shim_get).put(shim_put).delete(shim_delete));
     }
 
