@@ -1134,6 +1134,28 @@ impl GpuEngine {
         cache: &mut crate::layers::gpu_kv_cache::GpuKvCache,
     ) -> Vec<f32> {
         let n_tokens = tokens.len();
+        let normed = self.forward_full_gpu_with_cache_returning_hidden(tokens, cache);
+        self.cpu.finalize_logits(&normed, n_tokens)
+    }
+
+    /// Same forward as `forward_full_gpu_with_cache` but returns the final
+    /// post-norm hidden state ([n_tokens * embed_dim] row-major f32) WITHOUT
+    /// running the LM-head projection. The hidden buffer is what
+    /// `attachment.layer = "final"` shims read; steer-phase shims (#6b)
+    /// mutate this slice and the caller re-projects via
+    /// `cpu().finalize_logits(modified, n_tokens)` to get steered logits.
+    ///
+    /// Skipping the projection here matters when the caller is going to
+    /// re-project anyway — for Qwen 3B the projection is the largest CPU
+    /// cost in the per-token loop (~50–200ms), so doing it twice would
+    /// halve decode throughput. On success the cache's write cursor is
+    /// advanced by `n_tokens`.
+    pub fn forward_full_gpu_with_cache_returning_hidden(
+        &self,
+        tokens: &[u32],
+        cache: &mut crate::layers::gpu_kv_cache::GpuKvCache,
+    ) -> Vec<f32> {
+        let n_tokens = tokens.len();
         assert!(n_tokens > 0, "must have at least one token");
 
         let n_layers = self.cpu.n_layers();
@@ -1207,11 +1229,13 @@ impl GpuEngine {
         self.gpu.queue.submit(Some(encoder.finish()));
 
         let normed = read_back_buffer(&self.gpu, &staging, bytes as usize);
-        let logits = self.cpu.finalize_logits(&normed, n_tokens);
 
-        // Successful forward — bump the cache's write cursor.
+        // Successful forward — bump the cache's write cursor. The caller
+        // either runs `cpu().finalize_logits(&normed, n_tokens)` for plain
+        // decode, or applies steer hidden_delta to the last token's slice
+        // first and then re-projects.
         cache.advance(n_tokens);
-        logits
+        normed
     }
 
     /// **Phase 1 close — full forward on GPU.** Embedding lookup runs CPU

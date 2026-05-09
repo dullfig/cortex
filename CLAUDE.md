@@ -186,9 +186,21 @@ Run all: `cargo test --workspace`
       (`pinky/tools/gate_smoke_shim.onnx`): silent + proceed paths
       pass for both streaming and non-streaming wires
 - [ ] cortex-cloud retrieval-cache config flag → polar backend
-- [ ] Shim phase dispatch — steer (#6b): per-token hidden modification
-      via `forward_full_gpu_with_cache_returning_hidden`; sequential
-      composition in declared order
+- [x] Shim phase dispatch — steer (#6b): per-token `hidden_delta`
+      composition in declared order. Engine gains
+      `forward_full_gpu_with_cache_returning_hidden` (skips the
+      LM-head projection so the steer path doesn't pay it twice).
+      `apply_steers_inplace` runs each steer's ort session on the
+      last-token hidden, adds the delta, then `cpu().finalize_logits`
+      re-projects on CPU. `steer_shims` is the request default; a
+      matched rule's `activate` overrides. Both streaming
+      (`spawn_blocking` + `blocking_lock` on the per-shim mutex) and
+      non-streaming (`generate_stateless_with_steers`) carry steers
+      through the per-token loop. v1 limit: steers + cache_shards
+      reject (cached returning_hidden is a follow-up). Validated
+      end-to-end on Qwen 2.5-3B: identity steer (zero delta)
+      produces baseline output byte-for-byte; +5 across all dims
+      shifts generation completely (`pinky/tools/steer_smoke_test.sh`)
 - [ ] Shim phase dispatch — injection (#6c): residual-add at
       `entrance:N` via `pre_block_hidden_inject` parameter on
       `forward_block_gpu_inner`; sum composition (commutative)

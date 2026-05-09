@@ -241,21 +241,25 @@ struct RuleAction {
 /// Evaluate the shim_rules table top-to-bottom against the gate
 /// decisions. First matching rule wins; an `else` rule (no `if`)
 /// fires unconditionally when reached, so it should appear last.
-/// Empty rules → default action (run normally, no silence, no signals).
+/// Returns `None` when no rule matched (or rules is empty) — the
+/// caller distinguishes "no rule routed" from "rule explicitly chose
+/// the default action" so it can fall back to `req.steer_shims` in
+/// the former case (per the v1 spec: steer_shims is the default,
+/// rules override).
 fn evaluate_shim_rules(
     rules: &[ShimRule],
     decisions: &HashMap<String, serde_json::Value>,
-) -> RuleAction {
+) -> Option<RuleAction> {
     for rule in rules {
         let fires = match &rule.cond {
             Some(c) => decisions.get(&c.gate).map(|d| c.matches(d)).unwrap_or(false),
             None => true,
         };
         if fires {
-            return rule.then.clone();
+            return Some(rule.then.clone());
         }
     }
-    RuleAction::default()
+    None
 }
 
 /// Outcome of running gate shims and evaluating shim_rules. Both the
@@ -269,20 +273,35 @@ struct GateOutcome {
     gate_prefill_ms: u64,
     /// shim_id → ort run time in ms (per-shim variable cost).
     ort_ms_per_shim: HashMap<String, u64>,
-    /// First matching rule's action (or default if no rules / no match).
-    action: RuleAction,
+    /// `Some(action)` when a rule matched and dictates dispatch;
+    /// `None` when no rule matched (rules empty, or no condition fired).
+    /// In the `None` case, callers fall back to `req.steer_shims` for
+    /// the active-steer set and treat silent as false / signal as None.
+    matched: Option<RuleAction>,
 }
 
 impl GateOutcome {
-    /// Build the response-metadata JSON value emitted on `done`. Includes
-    /// gate_decisions, active_steers, signals, and the per-shim timing
-    /// breakdown — everything the client needs to introspect what
-    /// happened during gate dispatch.
-    fn to_metadata(&self) -> serde_json::Value {
-        let signals: Vec<&String> = self.action.signal.iter().collect();
+    /// True if a matched rule routed to silent. Default-action when no
+    /// rule matched is "proceed normally" — silent must be explicit.
+    fn is_silent(&self) -> bool {
+        self.matched.as_ref().map(|a| a.silent).unwrap_or(false)
+    }
+
+    /// Signal string from the matched rule, if any.
+    fn signal(&self) -> Option<&String> {
+        self.matched.as_ref().and_then(|a| a.signal.as_ref())
+    }
+
+    /// Build the response-metadata JSON value emitted on `done`.
+    /// `active_steers` is filled by the caller (after rule overrides
+    /// are reconciled with the request's `steer_shims` default), so
+    /// metadata reflects what *actually* shaped generation, not just
+    /// what the rule asked for.
+    fn to_metadata(&self, active_steers: &[String]) -> serde_json::Value {
+        let signals: Vec<&String> = self.signal().into_iter().collect();
         serde_json::json!({
             "gate_decisions": self.decisions,
-            "active_steers": self.action.activate,
+            "active_steers": active_steers,
             "signals": signals,
             "gate_prefill_ms": self.gate_prefill_ms,
             "ort_ms_per_shim": self.ort_ms_per_shim,
@@ -309,7 +328,7 @@ async fn run_gate_shims_and_rules(
             decisions: HashMap::new(),
             gate_prefill_ms: 0,
             ort_ms_per_shim: HashMap::new(),
-            action: RuleAction::default(),
+            matched: None,
         });
     }
 
@@ -365,14 +384,178 @@ async fn run_gate_shims_and_rules(
         decisions.insert(id.clone(), result.decision);
     }
 
-    let action = evaluate_shim_rules(shim_rules, &decisions);
+    let matched = evaluate_shim_rules(shim_rules, &decisions);
 
     Ok(GateOutcome {
         decisions,
         gate_prefill_ms,
         ort_ms_per_shim,
-        action,
+        matched,
     })
+}
+
+/// Resolve a list of steer shim IDs against the registry and validate
+/// each is shaped for v1 steer dispatch. Errors map to HTTP responses
+/// (404 / 400) suitable for the chat handler.
+///
+/// v1 constraints (rejected with 400 if violated):
+/// - phase must be "steer"
+/// - attachment.layer must be "final" (entrance:N is #6c)
+/// - attachment.pooling must be "last_token" (per-token steer reads
+///   exactly one hidden vector; mean / attention don't make sense
+///   in the decode loop)
+/// - input_shape.hidden_dim must equal embed_dim
+/// - output_shape.kind must be "hidden_delta" with the same dim
+async fn resolve_steer_shims(
+    state: &Arc<ServerState>,
+    steer_ids: &[String],
+) -> Result<Vec<Arc<RegisteredShim>>, (StatusCode, Json<serde_json::Value>)> {
+    if steer_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let embed_dim = state.engine.embed_dim();
+    let shims = state.shims.lock().await;
+    let mut out = Vec::with_capacity(steer_ids.len());
+    for id in steer_ids {
+        let shim = shims.get(id).cloned().ok_or_else(|| (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "shim_not_found",
+                    "message": format!("steer shim '{id}' not registered"),
+                    "shim_id": id,
+                }
+            })),
+        ))?;
+        let m = &shim.manifest;
+        if m.phase != "steer" {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "type": "wrong_phase",
+                        "message": format!(
+                            "shim '{id}' has phase='{}', not 'steer'", m.phase),
+                        "shim_id": id,
+                    }
+                })),
+            ));
+        }
+        if m.attachment.layer != "final" {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "type": "unsupported",
+                        "message": format!(
+                            "v1 steer requires attachment.layer='final'; shim '{id}' has '{}'",
+                            m.attachment.layer),
+                        "shim_id": id,
+                    }
+                })),
+            ));
+        }
+        if m.attachment.pooling != "last_token" {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "type": "unsupported",
+                        "message": format!(
+                            "v1 steer requires attachment.pooling='last_token'; shim '{id}' has '{}'",
+                            m.attachment.pooling),
+                        "shim_id": id,
+                    }
+                })),
+            ));
+        }
+        let in_dim = m.input_shape.get("hidden_dim")
+            .and_then(|v| v.as_u64()).map(|n| n as usize)
+            .ok_or_else(|| (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "type": "invalid_manifest",
+                        "message": format!("steer shim '{id}': input_shape.hidden_dim missing"),
+                        "shim_id": id,
+                    }
+                })),
+            ))?;
+        if in_dim != embed_dim {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "type": "shape_mismatch",
+                        "message": format!(
+                            "steer shim '{id}': input_shape.hidden_dim={in_dim} != model embed_dim={embed_dim}"),
+                        "shim_id": id,
+                    }
+                })),
+            ));
+        }
+        let kind = m.output_shape.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        if kind != "hidden_delta" {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "type": "unsupported",
+                        "message": format!(
+                            "v1 steer requires output_shape.kind='hidden_delta'; shim '{id}' has '{kind}'"),
+                        "shim_id": id,
+                    }
+                })),
+            ));
+        }
+        out.push(shim);
+    }
+    Ok(out)
+}
+
+/// Apply a sequence of steer shims to a single token's hidden state in
+/// place. Each steer's ort session is run on the current hidden, and
+/// its `hidden_delta` output is added back into hidden — the spec's
+/// sequential-chain composition (instruct-then-voice ≠ voice-then-
+/// instruct, so order matters and is preserved as declared).
+///
+/// Called from `tokio::task::block_in_place` and `spawn_blocking`
+/// contexts — uses `blocking_lock()` on the per-shim mutex (works
+/// because we're synchronous at the call site). All-at-once
+/// validation in `resolve_steer_shims` means runtime failures here
+/// would be transient (e.g. an ort internal allocation hiccup);
+/// panics are acceptable in v1 because they bubble up to the
+/// spawn_blocking JoinError or block_in_place caller cleanly.
+fn apply_steers_inplace(
+    steers: &[Arc<RegisteredShim>],
+    hidden: &mut [f32],
+) {
+    if steers.is_empty() { return; }
+    let embed_dim = hidden.len();
+    for shim in steers {
+        let mut session = shim.session.blocking_lock();
+        let input_name = session.inputs().first()
+            .map(|i| i.name().to_string())
+            .unwrap_or_else(|| "x".to_string());
+        // Snapshot hidden so the input borrow ends before we mutate it
+        // via the output. Avoids any aliasing surprise inside ort's
+        // tensor view machinery.
+        let input_snapshot: Vec<f32> = hidden.to_vec();
+        let tensor = ort::value::TensorRef::from_array_view((
+            vec![1_i64, embed_dim as i64],
+            input_snapshot.as_slice(),
+        )).expect("steer input tensor construction");
+        let outputs = session.run(ort::inputs![input_name.as_str() => tensor])
+            .expect("steer ort run failed");
+        let first_out = outputs.iter().next().expect("steer produced no outputs").1;
+        let (_shape, out_data) = first_out.try_extract_tensor::<f32>()
+            .expect("steer output extraction failed");
+        assert_eq!(out_data.len(), embed_dim,
+            "steer output length {} != embed_dim {}", out_data.len(), embed_dim);
+        for (h, &d) in hidden.iter_mut().zip(out_data.iter()) {
+            *h += d;
+        }
+    }
 }
 
 /// One registered shim. Holds the manifest plus the loaded ort Session.
@@ -860,6 +1043,60 @@ fn generate_with_cache(
     out
 }
 
+/// Stateless steer-aware generation. Each forward returns hidden state
+/// (no LM-head projection on GPU), then steers add `hidden_delta` to
+/// the last token's slice in declared order, then the LM head runs on
+/// the modified hidden via `cpu().finalize_logits(slice, 1)`. Sample,
+/// emit, repeat. Used only when active_steers is non-empty —
+/// no-steer paths still go through the cheaper `engine.generate()`.
+fn generate_stateless_with_steers(
+    engine: &GpuEngine,
+    prompt_tokens: &[u32],
+    sampler_config: SamplerConfig,
+    seed: u64,
+    eos: u32,
+    max_tokens: usize,
+    max_seq_len: usize,
+    steers: &[Arc<RegisteredShim>],
+) -> Vec<u32> {
+    let mut cache = engine.create_gpu_kv_cache(max_seq_len);
+    let mut sampler = Sampler::new(sampler_config, seed);
+    let embed_dim = engine.embed_dim();
+
+    // Prefill: get [n_prompt * embed_dim] hidden, take the last token's
+    // slice, apply steers, project to logits, sample.
+    let mut prefill_hidden = engine.forward_full_gpu_with_cache_returning_hidden(
+        prompt_tokens, &mut cache,
+    );
+    let last_off = (prompt_tokens.len() - 1) * embed_dim;
+    let last_slice = &mut prefill_hidden[last_off..last_off + embed_dim];
+    apply_steers_inplace(steers, last_slice);
+    let last_logits = engine.cpu().finalize_logits(last_slice, 1);
+    let mut next_token = sampler.sample(&last_logits);
+
+    let mut out: Vec<u32> = Vec::new();
+    if next_token == eos {
+        return out;
+    }
+    out.push(next_token);
+
+    // Decode loop: each forward returns [embed_dim] for the single new
+    // token; steers mutate it; logits re-projected; sample.
+    for _ in 1..max_tokens {
+        let mut hidden = engine.forward_full_gpu_with_cache_returning_hidden(
+            &[next_token], &mut cache,
+        );
+        apply_steers_inplace(steers, &mut hidden);
+        let logits = engine.cpu().finalize_logits(&hidden, 1);
+        next_token = sampler.sample(&logits);
+        if next_token == eos {
+            break;
+        }
+        out.push(next_token);
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -925,15 +1162,24 @@ async fn chat_completions(
         &state, &prompt_tokens, &req.gate_shims, &req.shim_rules,
     ).await?;
 
+    // Compute the active steer set: a matched rule's `activate` overrides
+    // the request's `steer_shims` baseline; if no rule matched we fall
+    // back to the baseline. This is the v1 spec's "steer_shims is the
+    // default; rules may override" semantics.
+    let active_steer_ids: Vec<String> = match &gate_outcome.matched {
+        Some(action) => action.activate.clone(),
+        None => req.steer_shims.clone(),
+    };
+
     // Silent short-circuit. Skip generation entirely and emit either a
     // silent SSE stream (if streaming was requested) or a silent
     // ChatResponse. Either way the metadata captures what the gate saw.
-    if gate_outcome.action.silent {
-        let metadata = gate_outcome.to_metadata();
+    if gate_outcome.is_silent() {
+        let metadata = gate_outcome.to_metadata(&[]);
         info!(
             gate_shims = ?req.gate_shims,
             silent = true,
-            signal = ?gate_outcome.action.signal,
+            signal = ?gate_outcome.signal(),
             gate_prefill_ms = gate_outcome.gate_prefill_ms,
             "gate dispatch: silent",
         );
@@ -959,8 +1205,43 @@ async fn chat_completions(
             metadata: Some(metadata),
         }).unwrap()).into_response());
     }
-    let gate_metadata: Option<serde_json::Value> = if !req.gate_shims.is_empty() {
-        Some(gate_outcome.to_metadata())
+
+    // Resolve and validate active steers up front. v1 limit: steers are
+    // not yet supported with cache_shards (the steer apply path needs a
+    // returning_hidden cached forward variant — straightforward but a
+    // follow-up). Reject early so the user gets a clear 400.
+    let steers_with_cache = !active_steer_ids.is_empty()
+        && (req.cache_shards.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
+            || req.cache_id.is_some());
+    if steers_with_cache {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "unsupported",
+                    "message": "active steers with cache_shards / cache_id is a planned follow-up; \
+                                v1 only steers in stateless generation.",
+                }
+            })),
+        ));
+    }
+    if !active_steer_ids.is_empty() && !state.shims_enabled {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "feature_disabled",
+                    "message": "steer_shims requires --enable-shims",
+                }
+            })),
+        ));
+    }
+    let active_steers = resolve_steer_shims(&state, &active_steer_ids).await?;
+
+    let gate_metadata: Option<serde_json::Value> = if !req.gate_shims.is_empty()
+        || !active_steer_ids.is_empty()
+    {
+        Some(gate_outcome.to_metadata(&active_steer_ids))
     } else {
         None
     };
@@ -968,8 +1249,8 @@ async fn chat_completions(
         info!(
             gate_shims = ?req.gate_shims,
             silent = false,
-            active_steers = ?gate_outcome.action.activate,
-            signal = ?gate_outcome.action.signal,
+            active_steers = ?active_steer_ids,
+            signal = ?gate_outcome.signal(),
             gate_prefill_ms = gate_outcome.gate_prefill_ms,
             "gate dispatch: proceed",
         );
@@ -994,7 +1275,7 @@ async fn chat_completions(
                 })),
             ));
         }
-        return chat_completions_stream(state, req, prompt_tokens, gate_metadata).await;
+        return chat_completions_stream(state, req, prompt_tokens, gate_metadata, active_steers).await;
     }
 
     let prompt_len = prompt_tokens.len() as u32;
@@ -1408,8 +1689,20 @@ async fn chat_completions(
             let len = generated.len() as u32;
             (generated, len)
         }
+    } else if !active_steers.is_empty() {
+        // Stateless with active steers: GPU forward returning hidden,
+        // apply each steer's hidden_delta in declared order, re-project
+        // logits via the LM head, sample. One token at a time.
+        let generated = tokio::task::block_in_place(|| {
+            generate_stateless_with_steers(
+                &state.engine, &prompt_tokens, sampler_config, seed, eos,
+                max_tokens, state.max_seq_len, &active_steers,
+            )
+        });
+        let len = generated.len() as u32;
+        (generated, len)
     } else {
-        // Stateless: create a temporary cache, generate, discard.
+        // Stateless, no steers: existing CPU full-forward generate path.
         let output_tokens = tokio::task::block_in_place(|| {
             state.engine.generate(&prompt_tokens, max_tokens, sampler_config, seed, Some(eos))
         });
@@ -1492,6 +1785,7 @@ async fn chat_completions_stream(
     req: ChatRequest,
     prompt_tokens: Vec<u32>,
     gate_metadata: Option<serde_json::Value>,
+    active_steers: Vec<Arc<RegisteredShim>>,
 ) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
     let sampler_config = if req.temperature <= 0.0 {
         SamplerConfig::greedy()
@@ -1524,15 +1818,35 @@ async fn chat_completions_stream(
     // spawn_blocking, so we keep this in a blocking thread and use the
     // channel's blocking send path.
     let state_for_gen = state.clone();
+    let steers_for_gen = active_steers;
     tokio::task::spawn_blocking(move || {
         let mut cache = state_for_gen.engine.create_gpu_kv_cache(state_for_gen.max_seq_len);
         let mut sampler = Sampler::new(sampler_config, seed);
+        let embed_dim = state_for_gen.engine.embed_dim();
+        let has_steers = !steers_for_gen.is_empty();
 
-        // Prefill + first token.
-        let prefill_logits = state_for_gen.engine.forward_full_gpu_with_cache(&prompt_tokens, &mut cache);
-        let vocab = state_for_gen.engine.vocab_size();
-        let last_off = (prompt_tokens.len() - 1) * vocab;
-        let mut next_token = sampler.sample(&prefill_logits[last_off..last_off + vocab]);
+        // Prefill + first token. With steers active we read hidden state
+        // from the GPU forward, mutate the last token's slice via each
+        // steer's hidden_delta, and re-project on CPU. Without steers we
+        // skip the second projection by going through the existing
+        // forward_full_gpu_with_cache (one projection inside).
+        let mut next_token = if has_steers {
+            let mut hidden = state_for_gen.engine.forward_full_gpu_with_cache_returning_hidden(
+                &prompt_tokens, &mut cache,
+            );
+            let last_off = (prompt_tokens.len() - 1) * embed_dim;
+            let last_slice = &mut hidden[last_off..last_off + embed_dim];
+            apply_steers_inplace(&steers_for_gen, last_slice);
+            let logits = state_for_gen.engine.cpu().finalize_logits(last_slice, 1);
+            sampler.sample(&logits)
+        } else {
+            let prefill_logits = state_for_gen.engine.forward_full_gpu_with_cache(
+                &prompt_tokens, &mut cache,
+            );
+            let vocab = state_for_gen.engine.vocab_size();
+            let last_off = (prompt_tokens.len() - 1) * vocab;
+            sampler.sample(&prefill_logits[last_off..last_off + vocab])
+        };
 
         let mut generated: Vec<u32> = Vec::new();
         let mut emitted_text = String::new();
@@ -1560,7 +1874,15 @@ async fn chat_completions_stream(
             }
 
             for _ in 1..max_tokens {
-                let logits = state_for_gen.engine.forward_full_gpu_with_cache(&[next_token], &mut cache);
+                let logits = if has_steers {
+                    let mut hidden = state_for_gen.engine.forward_full_gpu_with_cache_returning_hidden(
+                        &[next_token], &mut cache,
+                    );
+                    apply_steers_inplace(&steers_for_gen, &mut hidden);
+                    state_for_gen.engine.cpu().finalize_logits(&hidden, 1)
+                } else {
+                    state_for_gen.engine.forward_full_gpu_with_cache(&[next_token], &mut cache)
+                };
                 next_token = sampler.sample(&logits);
                 if next_token == eos {
                     break;
