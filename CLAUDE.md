@@ -107,13 +107,13 @@ let response = provider.complete(&request)?;
 
 ## Testing
 
-387 tests covering: ternary packing, matmul kernels, quantization, GGUF parsing,
+389 tests covering: ternary packing, matmul kernels, quantization, GGUF parsing,
 layer forward passes, attention, RoPE, SwiGLU, full model forward, sampler,
 retrieval (forward_traced + attention-score ranking), TurboQuant compression
 (PolarQuant + QJL + QuantizedKvCache + GPU score/value/derotate shaders +
 algorithm-quality cosine pinning + resident GpuPolarKvCache storage +
 resident dispatchers byte-equal to oneshot + GPU prefill compress shader +
-GPU-only f32→polar conversion).
+GPU-only f32→polar conversion + multi-token causal-masked batch shaders).
 
 For GPU-heavy tests, prefer `cargo test --workspace -- --test-threads=1`
 to avoid VRAM contention between concurrently-running GPU tests on a
@@ -151,9 +151,14 @@ Run all: `cargo test --workspace`
       shader (per-layer, all-on-GPU). Unblocks the cortex-cloud
       retrieval path: prefill stays f32, then a one-time conversion
       hands the polar cache to subsequent retrieve queries
-- [ ] Polar-aware traced forward (`forward_full_gpu_polar_traced`):
-      multi-token causal-masked polar score shader + polar attention
-      chain in each block
+- [x] Multi-token causal-masked batch shaders: `rotate_q.wgsl` +
+      `attn_score_polar_batch.wgsl` + `attn_value_polar_batch.wgsl`
+      (derotate.wgsl reused for the multi-token output by treating
+      `n_tokens * n_query_heads` as effective head count). Full
+      5-stage GPU pipeline matches CPU reference within 1e-5
+- [ ] Wire batch shaders into a `forward_full_gpu_polar_traced`
+      function — replaces dispatch_attention_inner for the polar path
+      block-by-block
 - [ ] cortex-cloud retrieval-cache config flag → polar backend
 - [ ] QJL correction on V dequant (currently K-only) to close the cosine-
       similarity gap on attention output (PolarQuant alone hits ~0.84)

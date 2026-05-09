@@ -388,6 +388,211 @@ pub fn attn_value_polar_oneshot(
 }
 
 // ---------------------------------------------------------------------------
+// Batch + rotate-Q dispatchers — multi-token attention against polar cache.
+// ---------------------------------------------------------------------------
+
+/// Params for `rotate_q.wgsl`. 16 bytes std140-friendly.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct RotateQParams {
+    n_tokens: u32,
+    n_heads: u32,
+    head_dim: u32,
+    _pad: u32,
+}
+
+/// Encode a `rotate_q` dispatch: rq[tok, head, row] = R @ q[tok, head, :].
+/// Resident-buffer dispatch, no alloc/upload/readback.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_rotate_q(
+    gpu: &Arc<GpuDevice>,
+    encoder: &mut wgpu::CommandEncoder,
+    q_buf: &wgpu::Buffer,
+    rotation_buf: &wgpu::Buffer,
+    rq_buf: &wgpu::Buffer,
+    n_tokens: usize,
+    n_heads: usize,
+    head_dim: usize,
+) {
+    let params = RotateQParams {
+        n_tokens: n_tokens as u32,
+        n_heads: n_heads as u32,
+        head_dim: head_dim as u32,
+        _pad: 0,
+    };
+    let params_buf = gpu.create_params_buffer(&params);
+
+    let pipeline = &gpu.pipelines.rotate_q;
+    let bind = gpu.make_bind_group(
+        pipeline,
+        &[q_buf, rotation_buf, rq_buf, &params_buf],
+    );
+
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("rotate_q.dispatch"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, &bind, &[]);
+    let threads = (n_tokens * n_heads * head_dim) as u32;
+    let groups = (threads + 255) / 256;
+    pass.dispatch_workgroups(groups, 1, 1);
+}
+
+/// Params for `attn_score_polar_batch.wgsl`. 48 bytes std140-friendly.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct AttnScorePolarBatchParams {
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    start_pos: u32,
+    max_seq: u32,
+    heads_per_kv: u32,
+    n_pairs: u32,
+    scale: f32,
+    n_tokens: u32,
+    _p1: u32,
+    _p2: u32,
+    _p3: u32,
+}
+
+/// Encode an `attn_score_polar_batch` dispatch (multi-token, causal-masked
+/// polar K). Mirror of the f32 attn_score_batch dispatch shape so the
+/// existing softmax_batch can run on the same scores buffer.
+///
+/// `max_seq` is the row stride of `scores_buf` and bounds the t loop;
+/// callers commonly set it to `start_pos + n_tokens`.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_attn_score_polar_batch(
+    gpu: &Arc<GpuDevice>,
+    encoder: &mut wgpu::CommandEncoder,
+    rq_buf: &wgpu::Buffer,
+    k_angles_buf: &wgpu::Buffer,
+    k_radius_buf: &wgpu::Buffer,
+    scores_buf: &wgpu::Buffer,
+    lut_buf: &wgpu::Buffer,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    start_pos: usize,
+    n_tokens: usize,
+    max_seq: usize,
+) {
+    assert!(head_dim % 2 == 0);
+    assert!(n_heads % n_kv_heads == 0);
+    assert!(start_pos + n_tokens <= max_seq);
+
+    let n_pairs = head_dim / 2;
+    let heads_per_kv = (n_heads / n_kv_heads) as u32;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let params = AttnScorePolarBatchParams {
+        n_heads: n_heads as u32,
+        n_kv_heads: n_kv_heads as u32,
+        head_dim: head_dim as u32,
+        start_pos: start_pos as u32,
+        max_seq: max_seq as u32,
+        heads_per_kv,
+        n_pairs: n_pairs as u32,
+        scale,
+        n_tokens: n_tokens as u32,
+        _p1: 0, _p2: 0, _p3: 0,
+    };
+    let params_buf = gpu.create_params_buffer(&params);
+
+    let pipeline = &gpu.pipelines.attn_score_polar_batch;
+    let bind = gpu.make_bind_group(
+        pipeline,
+        &[rq_buf, k_angles_buf, k_radius_buf, scores_buf, &params_buf, lut_buf],
+    );
+
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("attn_score_polar_batch.dispatch"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, &bind, &[]);
+    // 2D dispatch matching attn_score_batch: x = (head, t), y = tok.
+    let inner_threads = (n_heads * max_seq) as u32;
+    let groups_x = (inner_threads + 255) / 256;
+    let groups_y = n_tokens as u32;
+    pass.dispatch_workgroups(groups_x, groups_y, 1);
+}
+
+/// Params for `attn_value_polar_batch.wgsl`. 32 bytes std140-friendly.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct AttnValuePolarBatchParams {
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    start_pos: u32,
+    max_seq: u32,
+    heads_per_kv: u32,
+    n_pairs: u32,
+    n_tokens: u32,
+}
+
+/// Encode an `attn_value_polar_batch` dispatch (multi-token weighted-sum
+/// in rotated space). Output shape: `[n_tokens, n_heads, head_dim]` flat,
+/// in the polar/rotated domain. Apply `dispatch_derotate` over the same
+/// buffer with `n_heads = n_tokens * n_heads_real` to recover original
+/// space — the existing derotate shader handles the multi-token case
+/// because R is the same across all (tok, head).
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_attn_value_polar_batch(
+    gpu: &Arc<GpuDevice>,
+    encoder: &mut wgpu::CommandEncoder,
+    softmax_buf: &wgpu::Buffer,
+    v_angles_buf: &wgpu::Buffer,
+    v_radius_buf: &wgpu::Buffer,
+    output_buf: &wgpu::Buffer,
+    lut_buf: &wgpu::Buffer,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    start_pos: usize,
+    n_tokens: usize,
+    max_seq: usize,
+) {
+    assert!(head_dim % 2 == 0);
+    assert!(n_heads % n_kv_heads == 0);
+    assert!(start_pos + n_tokens <= max_seq);
+
+    let n_pairs = head_dim / 2;
+    let heads_per_kv = (n_heads / n_kv_heads) as u32;
+
+    let params = AttnValuePolarBatchParams {
+        n_heads: n_heads as u32,
+        n_kv_heads: n_kv_heads as u32,
+        head_dim: head_dim as u32,
+        start_pos: start_pos as u32,
+        max_seq: max_seq as u32,
+        heads_per_kv,
+        n_pairs: n_pairs as u32,
+        n_tokens: n_tokens as u32,
+    };
+    let params_buf = gpu.create_params_buffer(&params);
+
+    let pipeline = &gpu.pipelines.attn_value_polar_batch;
+    let bind = gpu.make_bind_group(
+        pipeline,
+        &[softmax_buf, v_angles_buf, v_radius_buf, output_buf, &params_buf, lut_buf],
+    );
+
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("attn_value_polar_batch.dispatch"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, &bind, &[]);
+    let threads = (n_tokens * n_heads * head_dim) as u32;
+    let groups = (threads + 255) / 256;
+    pass.dispatch_workgroups(groups, 1, 1);
+}
+
+// ---------------------------------------------------------------------------
 // Compress shader dispatch — f32 K/V → polar cache buffers (no CPU round-trip).
 // ---------------------------------------------------------------------------
 
@@ -1320,6 +1525,344 @@ mod tests {
                 a.to_bits(), b.to_bits(),
                 "out[{i}] differs: oneshot={a}, resident={b}",
             );
+        }
+    }
+
+    /// Load-bearing phase 2c.5a test: the multi-token causal-masked
+    /// polar batch shaders. Build a `QuantizedKvCache` populated with
+    /// N+n_tokens positions, generate per-token queries, run the GPU
+    /// batch chain (rotate_q → attn_score_polar_batch → softmax_batch
+    /// → attn_value_polar_batch → derotate), and compare against a CPU
+    /// implementation that uses `dot_key` + manual causal mask.
+    ///
+    /// This is what production prefill against a polar cache will run
+    /// (the inner forward block's attention chain), so getting it
+    /// shape-correct + numerically matching the CPU primitive locks
+    /// the contract for the next phase that wires it into
+    /// `forward_full_gpu_polar_traced`.
+    #[test]
+    fn polar_batch_shaders_match_cpu() {
+        use crate::layers::gpu_polar_kv_cache::{seed_for_layer, GpuPolarKvCache};
+
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let n_query_heads = 4;
+        let n_kv_heads = 2;
+        let head_dim = 8;
+        let context_len = 6;       // positions in cache before the query
+        let n_tokens = 3;          // query tokens
+        let total = context_len + n_tokens;
+        let start_pos = context_len;
+        let max_seq = total;
+        let seed_base = 42u64;
+        let layer = 0usize;
+
+        // CPU cache holds context K/V at [0, context_len) AND the query
+        // tokens' own K/V at [context_len, total). The latter lets the
+        // queries self-attend (causal) like real prefill does.
+        let mut cpu = QuantizedKvCache::new(
+            n_kv_heads, head_dim, max_seq, seed_for_layer(seed_base, layer),
+        );
+        let kv_dim = n_kv_heads * head_dim;
+        let mut all_k = Vec::with_capacity(total * kv_dim);
+        let mut all_v = Vec::with_capacity(total * kv_dim);
+        for t in 0..total {
+            let k: Vec<f32> = (0..kv_dim)
+                .map(|i| (((t * 7 + i) as f32) * 0.05).sin())
+                .collect();
+            let v: Vec<f32> = (0..kv_dim)
+                .map(|i| (((t * 11 + i) as f32) * 0.04).cos())
+                .collect();
+            cpu.append_one(&k, &v);
+            all_k.extend_from_slice(&k);
+            all_v.extend_from_slice(&v);
+        }
+
+        // Build resident polar cache and populate via the GPU compress
+        // shader from the CPU-known f32 K/V (skips the upload-by-CPU path
+        // — this fixture needs all positions on GPU).
+        let mut polar_kv = GpuPolarKvCache::new(
+            gpu.clone(), /*n_layers*/ 1, n_kv_heads, head_dim, max_seq, seed_base,
+        );
+        let k_in_buf = gpu.create_storage_buffer(bytemuck::cast_slice(&all_k), "test.k_in_full");
+        let v_in_buf = gpu.create_storage_buffer(bytemuck::cast_slice(&all_v), "test.v_in_full");
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test.batch.compress_full"),
+        });
+        compress_layer_into_polar(
+            &gpu, &mut encoder, &polar_kv, layer,
+            &k_in_buf, &v_in_buf, total, /*start_pos*/ 0,
+        );
+        gpu.queue.submit(Some(encoder.finish()));
+        gpu.device.poll(wgpu::Maintain::Wait);
+        polar_kv.set_len(total);
+
+        // Per-query-token Q in original space. n_tokens queries, n_heads each.
+        let q_data: Vec<f32> = (0..n_tokens * n_query_heads * head_dim)
+            .map(|i| (((i * 13) as f32) * 0.06).cos())
+            .collect();
+
+        // ---- CPU expected: scores then softmax then weighted V then derotate ----
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let heads_per_kv = n_query_heads / n_kv_heads;
+
+        let mut cpu_scores = vec![-1e30f32; n_tokens * n_query_heads * max_seq];
+        for tok in 0..n_tokens {
+            for head in 0..n_query_heads {
+                let kv_h = head / heads_per_kv;
+                let q_off = (tok * n_query_heads + head) * head_dim;
+                let qs = &q_data[q_off..q_off + head_dim];
+                let row_off = tok * n_query_heads * max_seq + head * max_seq;
+                let seq_len = start_pos + tok + 1;
+                for t in 0..seq_len {
+                    cpu_scores[row_off + t] = cpu.dot_key(t, kv_h, qs) * scale;
+                }
+                // [seq_len, max_seq) stays -1e30 (mask).
+            }
+        }
+
+        // CPU softmax over each (tok, head) row. Match the shader's
+        // row-of-max_seq layout; positions beyond seq_len at -1e30 won't
+        // contribute (their exp ≈ 0).
+        let mut cpu_softmax = cpu_scores.clone();
+        for tok in 0..n_tokens {
+            for head in 0..n_query_heads {
+                let row = &mut cpu_softmax[(tok * n_query_heads + head) * max_seq
+                                          ..(tok * n_query_heads + head + 1) * max_seq];
+                let m = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for v in row.iter_mut() {
+                    *v = (*v - m).exp();
+                    sum += *v;
+                }
+                for v in row.iter_mut() {
+                    *v /= sum;
+                }
+            }
+        }
+
+        // CPU output = sum_t softmax * value_at_dequant(t).
+        let mut cpu_out = vec![0.0f32; n_tokens * n_query_heads * head_dim];
+        for tok in 0..n_tokens {
+            for head in 0..n_query_heads {
+                let kv_h = head / heads_per_kv;
+                let row_off = (tok * n_query_heads + head) * max_seq;
+                let out_off = (tok * n_query_heads + head) * head_dim;
+                let seq_len = start_pos + tok + 1;
+                for t in 0..seq_len {
+                    let w = cpu_softmax[row_off + t];
+                    let vp = cpu.value_at_dequant(t, kv_h);
+                    for d in 0..head_dim {
+                        cpu_out[out_off + d] += w * vp[d];
+                    }
+                }
+            }
+        }
+
+        // ---- GPU pipeline: rotate_q → score_polar_batch → softmax_batch
+        //      → value_polar_batch → derotate ----
+        let q_buf = gpu.create_storage_buffer(bytemuck::cast_slice(&q_data), "test.q");
+        let rq_bytes = (n_tokens * n_query_heads * head_dim * 4) as u64;
+        let rq_buf = gpu.create_empty_buffer(rq_bytes, "test.rq");
+
+        let scores_len = n_tokens * n_query_heads * max_seq;
+        let scores_bytes = (scores_len * 4) as u64;
+        let scores_buf = gpu.create_empty_buffer(scores_bytes, "test.batch.scores");
+
+        let out_bytes = rq_bytes;
+        let weighted_rot_buf = gpu.create_empty_buffer(out_bytes, "test.batch.weighted_rot");
+        let final_buf = gpu.create_empty_buffer(out_bytes, "test.batch.out");
+
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test.batch.encoder"),
+        });
+
+        dispatch_rotate_q(
+            &gpu, &mut encoder, &q_buf, polar_kv.rotation_layer(layer), &rq_buf,
+            n_tokens, n_query_heads, head_dim,
+        );
+        dispatch_attn_score_polar_batch(
+            &gpu, &mut encoder, &rq_buf,
+            polar_kv.k_angles_layer(layer), polar_kv.k_radius_layer(layer),
+            &scores_buf, polar_kv.lut_buffer(),
+            n_query_heads, n_kv_heads, head_dim, start_pos, n_tokens, max_seq,
+        );
+        // Softmax: reuse the existing softmax_batch shader (same layout).
+        // We use the same dispatch shape as gpu_engine.dispatch_attention_inner.
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct SoftmaxBatchParams {
+            n_heads: u32,
+            max_seq: u32,
+            start_pos: u32,
+            n_tokens: u32,
+        }
+        let sm_params = SoftmaxBatchParams {
+            n_heads: n_query_heads as u32,
+            max_seq: max_seq as u32,
+            start_pos: start_pos as u32,
+            n_tokens: n_tokens as u32,
+        };
+        let sm_params_buf = gpu.create_params_buffer(&sm_params);
+        let sm_pipeline = &gpu.pipelines.softmax_batch;
+        let sm_bind = gpu.make_bind_group(sm_pipeline, &[&scores_buf, &sm_params_buf]);
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("test.batch.softmax"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(sm_pipeline);
+            pass.set_bind_group(0, &sm_bind, &[]);
+            pass.dispatch_workgroups((n_tokens * n_query_heads) as u32, 1, 1);
+        }
+        dispatch_attn_value_polar_batch(
+            &gpu, &mut encoder, &scores_buf,
+            polar_kv.v_angles_layer(layer), polar_kv.v_radius_layer(layer),
+            &weighted_rot_buf, polar_kv.lut_buffer(),
+            n_query_heads, n_kv_heads, head_dim, start_pos, n_tokens, max_seq,
+        );
+        // Derotate: treat (n_tokens * n_query_heads) as "n_heads" — the
+        // existing single-token shader applies R^T per-(effective)head and
+        // the f32 layout is [tok, head, head_dim] flat = same.
+        dispatch_derotate(
+            &gpu, &mut encoder, &weighted_rot_buf,
+            polar_kv.rotation_layer(layer), &final_buf,
+            n_tokens * n_query_heads, head_dim,
+        );
+
+        gpu.queue.submit(Some(encoder.finish()));
+        gpu.device.poll(wgpu::Maintain::Wait);
+
+        let gpu_out = readback_f32(&gpu, &final_buf, n_tokens * n_query_heads * head_dim);
+
+        // Per-element comparison. Float-order error scales with the inner
+        // sum of seq_len terms; at total=9 that's well below 1e-5.
+        for (i, (&g, &e)) in gpu_out.iter().zip(cpu_out.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-5,
+                "out[{i}] differs: gpu={g}, cpu={e}, |Δ|={}", (g - e).abs(),
+            );
+        }
+    }
+
+    /// Sanity: with n_tokens=1, the batch chain should produce the same
+    /// scores as the existing single-token oneshot path. Same layer of
+    /// the same polar cache, same Q.
+    #[test]
+    fn polar_batch_score_n_tokens_1_matches_oneshot() {
+        use crate::layers::gpu_polar_kv_cache::{seed_for_layer, GpuPolarKvCache};
+
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let n_query_heads = 4;
+        let n_kv_heads = 2;
+        let head_dim = 8;
+        let cache_len = 6;
+        let n_tokens = 1;
+        let max_seq = cache_len + n_tokens;
+        let start_pos = cache_len;
+        let seed_base = 42u64;
+        let layer = 0usize;
+
+        // Populate cache (cache_len + 1 positions; the +1 is the query slot).
+        let mut cpu = QuantizedKvCache::new(
+            n_kv_heads, head_dim, max_seq, seed_for_layer(seed_base, layer),
+        );
+        let kv_dim = n_kv_heads * head_dim;
+        let mut all_k = Vec::with_capacity(max_seq * kv_dim);
+        let mut all_v = Vec::with_capacity(max_seq * kv_dim);
+        for t in 0..max_seq {
+            let k: Vec<f32> = (0..kv_dim).map(|i| (((t * 7 + i) as f32) * 0.05).sin()).collect();
+            let v: Vec<f32> = (0..kv_dim).map(|i| (((t * 11 + i) as f32) * 0.04).cos()).collect();
+            cpu.append_one(&k, &v);
+            all_k.extend_from_slice(&k);
+            all_v.extend_from_slice(&v);
+        }
+        let mut polar_kv = GpuPolarKvCache::new(
+            gpu.clone(), 1, n_kv_heads, head_dim, max_seq, seed_base,
+        );
+        let k_in = gpu.create_storage_buffer(bytemuck::cast_slice(&all_k), "test.k1");
+        let v_in = gpu.create_storage_buffer(bytemuck::cast_slice(&all_v), "test.v1");
+        let mut e = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test.compress.full"),
+        });
+        compress_layer_into_polar(&gpu, &mut e, &polar_kv, layer, &k_in, &v_in, max_seq, 0);
+        gpu.queue.submit(Some(e.finish()));
+        gpu.device.poll(wgpu::Maintain::Wait);
+        polar_kv.set_len(max_seq);
+
+        // Q for the single query token.
+        let q_data: Vec<f32> = (0..n_query_heads * head_dim)
+            .map(|i| (((i * 13) as f32) * 0.06).cos())
+            .collect();
+
+        // Reference: oneshot path against the cache's first start_pos+1 positions.
+        // The oneshot's seq_len param is the number of cache positions it dots
+        // against; with n_tokens=1, the only valid t for the query is
+        // [0, start_pos+1). We can pass seq_len = start_pos+1 and read
+        // scores from the first row of output.
+        let r = polar::generate_rotation_matrix(head_dim, seed_for_layer(seed_base, layer));
+        let mut rq_cpu = vec![0f32; n_query_heads * head_dim];
+        for h in 0..n_query_heads {
+            let qs = &q_data[h * head_dim..(h + 1) * head_dim];
+            polar::rotate(&r, qs, &mut rq_cpu[h * head_dim..(h + 1) * head_dim]);
+        }
+        let n_pairs = head_dim / 2;
+        let oneshot_seq = start_pos + n_tokens;
+        let cpu_k_angles_full: Vec<u8> =
+            cpu.k_angles_slice()[..oneshot_seq * n_kv_heads * n_pairs].to_vec();
+        let cpu_k_radius: Vec<f32> =
+            cpu.k_radius_slice()[..oneshot_seq * n_kv_heads].to_vec();
+        let oneshot_scores = attn_score_polar_oneshot(
+            &gpu, &rq_cpu, &cpu_k_angles_full, &cpu_k_radius,
+            n_query_heads, n_kv_heads, head_dim, oneshot_seq,
+        );
+
+        // Batch path: rotate_q on GPU + dispatch_attn_score_polar_batch.
+        let q_buf = gpu.create_storage_buffer(bytemuck::cast_slice(&q_data), "test.q1");
+        let rq_buf = gpu.create_empty_buffer(
+            (n_query_heads * head_dim * 4) as u64, "test.rq1",
+        );
+        let scores_buf = gpu.create_empty_buffer(
+            (n_query_heads * max_seq * 4) as u64, "test.scores1",
+        );
+        let mut e = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test.batch1"),
+        });
+        dispatch_rotate_q(
+            &gpu, &mut e, &q_buf, polar_kv.rotation_layer(layer), &rq_buf,
+            n_tokens, n_query_heads, head_dim,
+        );
+        dispatch_attn_score_polar_batch(
+            &gpu, &mut e, &rq_buf,
+            polar_kv.k_angles_layer(layer), polar_kv.k_radius_layer(layer),
+            &scores_buf, polar_kv.lut_buffer(),
+            n_query_heads, n_kv_heads, head_dim, start_pos, n_tokens, max_seq,
+        );
+        gpu.queue.submit(Some(e.finish()));
+        gpu.device.poll(wgpu::Maintain::Wait);
+
+        let batch_scores = readback_f32(&gpu, &scores_buf, n_query_heads * max_seq);
+
+        // For each head, compare oneshot[head, t] (t in 0..oneshot_seq)
+        // against batch_scores[0, head, t].
+        for head in 0..n_query_heads {
+            for t in 0..oneshot_seq {
+                let one = oneshot_scores[head * oneshot_seq + t];
+                let bat = batch_scores[head * max_seq + t];
+                assert!(
+                    (one - bat).abs() < 1e-5,
+                    "head {head}, t {t}: oneshot={one}, batch={bat}",
+                );
+            }
+            // Beyond start_pos+tok (= start_pos for tok=0), batch should mask to -inf.
+            // Since oneshot covers [0, start_pos+1), batch[start_pos+1..max_seq]
+            // should be -1e30 (only one position beyond, just t=cache_len, but
+            // that's t==start_pos which is allowed for tok=0).
+            // For n_tokens=1, max_seq = start_pos+1, so no masked positions
+            // exist. Skip mask check in this fixture.
         }
     }
 

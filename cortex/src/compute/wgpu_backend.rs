@@ -204,6 +204,9 @@ pub struct Pipelines {
     pub attn_value_polar: wgpu::ComputePipeline,
     pub derotate: wgpu::ComputePipeline,
     pub kv_compress_polar: wgpu::ComputePipeline,
+    pub rotate_q: wgpu::ComputePipeline,
+    pub attn_score_polar_batch: wgpu::ComputePipeline,
+    pub attn_value_polar_batch: wgpu::ComputePipeline,
     pub argmax: wgpu::ComputePipeline,
     // Batch (prefill)
     pub matmul: wgpu::ComputePipeline,
@@ -272,6 +275,9 @@ impl Pipelines {
             attn_value_polar: make(include_str!("shaders/attn_value_polar.wgsl"), "attn_value_polar"),
             derotate: make(include_str!("shaders/derotate.wgsl"), "derotate"),
             kv_compress_polar: make(include_str!("shaders/kv_compress_polar.wgsl"), "kv_compress_polar"),
+            rotate_q: make(include_str!("shaders/rotate_q.wgsl"), "rotate_q"),
+            attn_score_polar_batch: make(include_str!("shaders/attn_score_polar_batch.wgsl"), "attn_score_polar_batch"),
+            attn_value_polar_batch: make(include_str!("shaders/attn_value_polar_batch.wgsl"), "attn_value_polar_batch"),
             argmax: make(include_str!("shaders/argmax.wgsl"), "argmax"),
             // Batch
             matmul: make(include_str!("shaders/matmul.wgsl"), "matmul"),
@@ -345,7 +351,7 @@ impl GpuDevice {
         .ok()?;
 
         let pipelines = Pipelines::compile(&device);
-        tracing::info!("compiled 28 GPU compute pipelines");
+        tracing::info!("compiled 31 GPU compute pipelines");
 
         Some(Self { device, queue, pipelines })
     }
