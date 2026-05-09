@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::info;
 
-use cortex::layers::gpu_engine::GpuEngine;
+use cortex::layers::gpu_engine::{GpuEngine, HiddenCaptures};
 use cortex::layers::gpu_kv_cache::GpuKvCache;
 use cortex::layers::sampler::{Sampler, SamplerConfig};
 use cortex::{ForwardTrace, ModelConfig, Tokenizer};
@@ -162,6 +162,219 @@ struct ShimAttachment {
     pooling: String,
 }
 
+/// One declarative gate-rule. Per `project_cortex_v1_shim_api.md`, the
+/// rule table is intentionally bounded — match-and-dispatch only, no
+/// scripting. Wire shape:
+///
+/// ```json
+/// {"if": {"gate": "is_crisis", "gt": 0.8}, "then": {"silent": true, "signal": "escalate"}}
+/// {"if": {"gate": "should_respond", "gt": 0.7}, "then": {"activate": ["voice_bob"]}}
+/// {"else": {"silent": true}}
+/// ```
+///
+/// We accept `else: <action>` as an alias for `then: <action>` — both
+/// produce the same Rust field. An absent `if` means "always fires
+/// when reached" (the conventional fallthrough).
+#[derive(Debug, Deserialize, Clone)]
+struct ShimRule {
+    #[serde(rename = "if", default)]
+    cond: Option<RuleCondition>,
+    #[serde(alias = "else", default)]
+    then: RuleAction,
+}
+
+/// One gate's value tested against a single comparison op. Exactly one
+/// of `gt` / `lt` / `eq` should be set; if multiple are set, the
+/// condition matches only when ALL set ops are satisfied (AND). If
+/// none are set, the condition never matches — that's a request bug,
+/// not a fallthrough.
+#[derive(Debug, Deserialize, Clone)]
+struct RuleCondition {
+    /// shim_id whose decision is being tested
+    gate: String,
+    #[serde(default)]
+    gt: Option<f64>,
+    #[serde(default)]
+    lt: Option<f64>,
+    #[serde(default)]
+    eq: Option<f64>,
+}
+
+impl RuleCondition {
+    /// Match the gate's decision JSON against this condition. Decisions
+    /// must be coercible to f64 (scalar shims emit numbers; category
+    /// shims emit integer argmax). Anything else (hidden_delta arrays,
+    /// nulls) never matches.
+    fn matches(&self, decision: &serde_json::Value) -> bool {
+        let val = match decision.as_f64() {
+            Some(v) => v,
+            None => return false,
+        };
+        let mut any_op = false;
+        if let Some(t) = self.gt { any_op = true; if !(val > t) { return false; } }
+        if let Some(t) = self.lt { any_op = true; if !(val < t) { return false; } }
+        if let Some(t) = self.eq { any_op = true; if (val - t).abs() > 1e-9 { return false; } }
+        any_op
+    }
+}
+
+/// Action taken when a rule fires. Composed of three independent
+/// vocabulary slots — silent, activate (steers), signal — per the v1
+/// spec. The first matching rule wins (no multi-rule composition in
+/// v1; complex logic stays in AgentOS via multi-call orchestration).
+#[derive(Debug, Deserialize, Clone, Default)]
+struct RuleAction {
+    /// Mark this completion as silent — emit a `done` event with
+    /// `finish_reason: "silent"` and zero generated content.
+    #[serde(default)]
+    silent: bool,
+    /// Steers to activate for the decode path. v1 records these in
+    /// response metadata; actual per-token application lands in 6b.
+    #[serde(default)]
+    activate: Vec<String>,
+    /// Free-form signal string surfaced in `done.metadata.signals`.
+    /// AgentOS uses this for downstream routing (e.g., "escalate").
+    #[serde(default)]
+    signal: Option<String>,
+}
+
+/// Evaluate the shim_rules table top-to-bottom against the gate
+/// decisions. First matching rule wins; an `else` rule (no `if`)
+/// fires unconditionally when reached, so it should appear last.
+/// Empty rules → default action (run normally, no silence, no signals).
+fn evaluate_shim_rules(
+    rules: &[ShimRule],
+    decisions: &HashMap<String, serde_json::Value>,
+) -> RuleAction {
+    for rule in rules {
+        let fires = match &rule.cond {
+            Some(c) => decisions.get(&c.gate).map(|d| c.matches(d)).unwrap_or(false),
+            None => true,
+        };
+        if fires {
+            return rule.then.clone();
+        }
+    }
+    RuleAction::default()
+}
+
+/// Outcome of running gate shims and evaluating shim_rules. Both the
+/// streaming and non-streaming chat paths consume this to decide
+/// whether to short-circuit silent or proceed to generation.
+struct GateOutcome {
+    /// shim_id → JSON decision. Surfaced in response metadata under
+    /// `gate_decisions` for observability.
+    decisions: HashMap<String, serde_json::Value>,
+    /// One shared cortex prefill cost across all gate shims.
+    gate_prefill_ms: u64,
+    /// shim_id → ort run time in ms (per-shim variable cost).
+    ort_ms_per_shim: HashMap<String, u64>,
+    /// First matching rule's action (or default if no rules / no match).
+    action: RuleAction,
+}
+
+impl GateOutcome {
+    /// Build the response-metadata JSON value emitted on `done`. Includes
+    /// gate_decisions, active_steers, signals, and the per-shim timing
+    /// breakdown — everything the client needs to introspect what
+    /// happened during gate dispatch.
+    fn to_metadata(&self) -> serde_json::Value {
+        let signals: Vec<&String> = self.action.signal.iter().collect();
+        serde_json::json!({
+            "gate_decisions": self.decisions,
+            "active_steers": self.action.activate,
+            "signals": signals,
+            "gate_prefill_ms": self.gate_prefill_ms,
+            "ort_ms_per_shim": self.ort_ms_per_shim,
+        })
+    }
+}
+
+/// Run all gate shims against a single shared prefill capture, then
+/// evaluate shim_rules to produce the dispatch action. Errors map to
+/// HTTP responses suitable for both streaming and non-streaming paths.
+///
+/// Constraints (rejected with 400 / 404 if violated):
+/// - Each gate shim must be registered (404 shim_not_found).
+/// - Each gate shim must have manifest.phase == "gate" (400 wrong_phase).
+/// - Returns Ok with default action when gate_shims is empty.
+async fn run_gate_shims_and_rules(
+    state: &Arc<ServerState>,
+    prompt_tokens: &[u32],
+    gate_shims: &[String],
+    shim_rules: &[ShimRule],
+) -> Result<GateOutcome, (StatusCode, Json<serde_json::Value>)> {
+    if gate_shims.is_empty() {
+        return Ok(GateOutcome {
+            decisions: HashMap::new(),
+            gate_prefill_ms: 0,
+            ort_ms_per_shim: HashMap::new(),
+            action: RuleAction::default(),
+        });
+    }
+
+    // Resolve every gate shim against the registry up front so a 404
+    // returns *before* we burn a prefill on a typo'd shim_id.
+    let resolved: Vec<(String, Arc<RegisteredShim>)> = {
+        let shims = state.shims.lock().await;
+        let mut out = Vec::with_capacity(gate_shims.len());
+        for id in gate_shims {
+            let shim = shims.get(id).cloned().ok_or_else(|| (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": {
+                        "type": "shim_not_found",
+                        "message": format!("gate shim '{id}' not registered"),
+                        "shim_id": id,
+                    }
+                })),
+            ))?;
+            if shim.manifest.phase != "gate" {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": {
+                            "type": "wrong_phase",
+                            "message": format!(
+                                "shim '{}' has phase='{}', not 'gate' (gate_shims requires gate-phase shims)",
+                                id, shim.manifest.phase),
+                            "shim_id": id,
+                        }
+                    })),
+                ));
+            }
+            out.push((id.clone(), shim));
+        }
+        out
+    };
+
+    // One shared forward → all gate shims read the same final hidden.
+    // This is the "fused gate" property from the v1 spec: the prefill
+    // *is* the work that computes the gate's input.
+    let prefill_start = Instant::now();
+    let hc = tokio::task::block_in_place(|| {
+        state.engine.forward_full_gpu_with_hidden_capture(prompt_tokens, &[])
+    });
+    let gate_prefill_ms = prefill_start.elapsed().as_millis() as u64;
+
+    let mut decisions = HashMap::new();
+    let mut ort_ms_per_shim = HashMap::new();
+    for (id, shim) in &resolved {
+        let result = run_shim_against_hidden(shim, &hc).await?;
+        ort_ms_per_shim.insert(id.clone(), result.ort_ms);
+        decisions.insert(id.clone(), result.decision);
+    }
+
+    let action = evaluate_shim_rules(shim_rules, &decisions);
+
+    Ok(GateOutcome {
+        decisions,
+        gate_prefill_ms,
+        ort_ms_per_shim,
+        action,
+    })
+}
+
 /// One registered shim. Holds the manifest plus the loaded ort Session.
 /// Wrapped in `Arc` so handlers can take a clone (cheap) without
 /// holding the registry lock through inference.
@@ -265,6 +478,43 @@ struct ChatRequest {
     /// the entire generation, which serializes all other requests.
     #[serde(default)]
     stream: bool,
+
+    /// Gate shims to evaluate on the prefilled prompt's final hidden
+    /// state. Each shim must be registered and its phase must be
+    /// "gate" (otherwise the request is rejected before generation).
+    /// Decisions are evaluated against `shim_rules`; if a rule routes
+    /// to silent, generation is skipped and a `done{silent:true}`
+    /// response is emitted. Per `project_cortex_v1_shim_api.md`, the
+    /// gate fires once after prefill — the single prefill is what made
+    /// the decision possible. Empty / absent = no gate dispatch.
+    #[serde(default)]
+    gate_shims: Vec<String>,
+
+    /// Steer shims to apply during decode (per-token hidden
+    /// modification). v1 records the active set in response metadata
+    /// but does not yet apply it — the steer-phase forward path is
+    /// scheduled for #6b. Listed here so callers (AgentOS) can pin
+    /// the wire shape now and v1 servers accept the field without
+    /// erroring.
+    #[serde(default)]
+    #[allow(dead_code)]
+    steer_shims: Vec<String>,
+
+    /// Injection shims attached to layer entrances (residual add to
+    /// hidden state during forward). v1 records the requested set in
+    /// response metadata but does not yet apply it — the injection
+    /// hook lands in #6c. Field present for forward-compat.
+    #[serde(default)]
+    #[allow(dead_code)]
+    inject_shims: Vec<String>,
+
+    /// Declarative dispatch rules evaluated against gate decisions.
+    /// First matching rule wins; an `else` arm (rule with no `if`)
+    /// is the conventional fallthrough. See `ShimRule` for the wire
+    /// shape. Empty / absent = run all gates for observability but
+    /// take no action (generation proceeds normally).
+    #[serde(default)]
+    shim_rules: Vec<ShimRule>,
 }
 
 fn default_top_k() -> usize { 10 }
@@ -317,6 +567,12 @@ struct ChatResponse {
     model: String,
     choices: Vec<Choice>,
     usage: Usage,
+    /// Shim phase-dispatch metadata. Present only when gate_shims fired
+    /// for this request: includes per-shim decisions, active steers, and
+    /// any signals emitted by matched rules. Omitted (not `null`) when
+    /// no shim work happened for this completion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -618,6 +874,107 @@ async fn chat_completions(
         &state.tokenizer,
     );
 
+    // Gate-phase dispatch (#6a). Per `project_cortex_v1_shim_api.md`, the
+    // gate fires once after a prefill that *is* the work computing its
+    // input. v1 constraints (rejected before any GPU work):
+    //  - gate_shims requires --enable-shims
+    //  - gate_shims is incompatible with cache_shards/cache_id and with
+    //    mode=retrieve. Cached gating + retrieve gating are follow-ups
+    //    that need a cached forward variant of the hidden-capture path.
+    //  - inject_shims and steer_shims are accepted as wire fields but
+    //    not applied in v1 (recorded in metadata for forward-compat).
+    if !req.gate_shims.is_empty() && !state.shims_enabled {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "feature_disabled",
+                    "message": "gate_shims requires --enable-shims",
+                }
+            })),
+        ));
+    }
+    let gate_with_cache = !req.gate_shims.is_empty()
+        && (req.cache_shards.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
+            || req.cache_id.is_some());
+    if gate_with_cache {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "unsupported",
+                    "message": "gate_shims with cache_shards / cache_id is a planned follow-up; \
+                                v1 only gates against the prompt itself (stateless prefill).",
+                }
+            })),
+        ));
+    }
+    if !req.gate_shims.is_empty() && req.mode.as_deref() == Some("retrieve") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "unsupported",
+                    "message": "gate_shims is not supported with mode='retrieve'.",
+                }
+            })),
+        ));
+    }
+
+    let gate_outcome = run_gate_shims_and_rules(
+        &state, &prompt_tokens, &req.gate_shims, &req.shim_rules,
+    ).await?;
+
+    // Silent short-circuit. Skip generation entirely and emit either a
+    // silent SSE stream (if streaming was requested) or a silent
+    // ChatResponse. Either way the metadata captures what the gate saw.
+    if gate_outcome.action.silent {
+        let metadata = gate_outcome.to_metadata();
+        info!(
+            gate_shims = ?req.gate_shims,
+            silent = true,
+            signal = ?gate_outcome.action.signal,
+            gate_prefill_ms = gate_outcome.gate_prefill_ms,
+            "gate dispatch: silent",
+        );
+        if req.stream {
+            return Ok(silent_stream_response(&state.model_name, metadata));
+        }
+        return Ok(Json(serde_json::to_value(ChatResponse {
+            id: format!("cortex-{}", &uuid::Uuid::new_v4().to_string()[..12]),
+            model: state.model_name.clone(),
+            choices: vec![Choice {
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some(String::new()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: "silent".to_string(),
+            }],
+            usage: Usage {
+                prompt_tokens: prompt_tokens.len() as u32,
+                completion_tokens: 0,
+            },
+            metadata: Some(metadata),
+        }).unwrap()).into_response());
+    }
+    let gate_metadata: Option<serde_json::Value> = if !req.gate_shims.is_empty() {
+        Some(gate_outcome.to_metadata())
+    } else {
+        None
+    };
+    if !req.gate_shims.is_empty() {
+        info!(
+            gate_shims = ?req.gate_shims,
+            silent = false,
+            active_steers = ?gate_outcome.action.activate,
+            signal = ?gate_outcome.action.signal,
+            gate_prefill_ms = gate_outcome.gate_prefill_ms,
+            "gate dispatch: proceed",
+        );
+    }
+
     // Streaming dispatch. Stateless (no cache_shards / cache_id), no tools,
     // not in retrieve mode — those combinations are explicit follow-ups.
     if req.stream {
@@ -637,7 +994,7 @@ async fn chat_completions(
                 })),
             ));
         }
-        return chat_completions_stream(state, req, prompt_tokens).await;
+        return chat_completions_stream(state, req, prompt_tokens, gate_metadata).await;
     }
 
     let prompt_len = prompt_tokens.len() as u32;
@@ -1104,6 +1461,7 @@ async fn chat_completions(
             prompt_tokens: prompt_len,
             completion_tokens: completion_len,
         },
+        metadata: gate_metadata,
     };
 
     Ok(Json(serde_json::to_value(response).unwrap()).into_response())
@@ -1133,6 +1491,7 @@ async fn chat_completions_stream(
     state: Arc<ServerState>,
     req: ChatRequest,
     prompt_tokens: Vec<u32>,
+    gate_metadata: Option<serde_json::Value>,
 ) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
     let sampler_config = if req.temperature <= 0.0 {
         SamplerConfig::greedy()
@@ -1231,7 +1590,9 @@ async fn chat_completions_stream(
         None,
     );
 
-    // Subsequent chunks come from the generation task.
+    // Subsequent chunks come from the generation task. The Finish chunk
+    // carries the gate metadata (if any) at the chunk root so callers
+    // see `gate_decisions` / `signals` alongside the OpenAI fields.
     let body_stream = ReceiverStream::new(rx).map(move |msg| {
         Ok::<_, std::convert::Infallible>(match msg {
             StreamMessage::Delta(text) => stream_chunk_event(
@@ -1239,10 +1600,9 @@ async fn chat_completions_stream(
                 Some(serde_json::json!({"content": text})),
                 None,
             ),
-            StreamMessage::Finish(reason) => stream_chunk_event(
+            StreamMessage::Finish(reason) => stream_finish_event(
                 &chunk_id_for_stream, created, &model_for_stream,
-                Some(serde_json::json!({})),
-                Some(reason),
+                reason, gate_metadata.clone(),
             ),
         })
     });
@@ -1293,6 +1653,71 @@ fn stream_chunk_event(
         }],
     });
     Event::default().data(payload.to_string())
+}
+
+/// Build the terminal `chat.completion.chunk` SSE event with an optional
+/// metadata object at the chunk root. Used for both the silent-gate
+/// short-circuit (`finish_reason: "silent"`) and the normal end-of-
+/// generation path when gate_shims fired (so callers see the gate
+/// decisions alongside the finish reason).
+fn stream_finish_event(
+    id: &str,
+    created: u64,
+    model: &str,
+    finish_reason: String,
+    metadata: Option<serde_json::Value>,
+) -> Event {
+    let mut payload = serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": finish_reason,
+        }],
+    });
+    if let Some(meta) = metadata {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("metadata".to_string(), meta);
+        }
+    }
+    Event::default().data(payload.to_string())
+}
+
+/// Silent-gate short-circuit SSE response. Emits the role chunk for
+/// OpenAI client compatibility, then a terminal chunk with
+/// `finish_reason: "silent"` and the gate metadata, then the [DONE]
+/// sentinel. Zero content events — silence is first-class
+/// (`project_silence_as_first_class.md`).
+fn silent_stream_response(
+    model_name: &str,
+    metadata: serde_json::Value,
+) -> axum::response::Response {
+    let chunk_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let role_event = stream_chunk_event(
+        &chunk_id, created, model_name,
+        Some(serde_json::json!({"role": "assistant"})),
+        None,
+    );
+    let finish_event = stream_finish_event(
+        &chunk_id, created, model_name,
+        "silent".to_string(), Some(metadata),
+    );
+    let done_event = Event::default().data("[DONE]");
+    let stream = futures::stream::iter(vec![
+        Ok::<_, std::convert::Infallible>(role_event),
+        Ok::<_, std::convert::Infallible>(finish_event),
+        Ok::<_, std::convert::Infallible>(done_event),
+    ]);
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 // Suppress unused-import warning for Stream when only used via concrete types.
@@ -1651,27 +2076,40 @@ struct ShimInferRequest {
     context: String,
 }
 
-#[allow(clippy::too_many_lines)]
-async fn shim_infer(
-    State(state): State<Arc<ServerState>>,
-    Json(req): Json<ShimInferRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    let shim = {
-        let shims = state.shims.lock().await;
-        shims.get(&req.shim_id).cloned().ok_or_else(|| (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": {
-                    "type": "shim_not_found",
-                    "message": format!("shim '{}' not registered", req.shim_id),
-                    "shim_id": req.shim_id,
-                }
-            })),
-        ))?
-    };
+/// Output of one shim run against an already-captured hidden state.
+/// Shared by `/v1/shims/infer` (standalone) and the chat-handler gate
+/// dispatch (6a) — both pool the same way, hit ort the same way, and
+/// produce the same `decision` payload from the same `output_shape.kind`
+/// vocabulary.
+struct ShimRunResult {
+    decision: serde_json::Value,
+    raw_output: Vec<f32>,
+    output_shape: Vec<i64>,
+    ort_ms: u64,
+    /// Manifest's `output_shape.kind` ("scalar" | "category:N" | "hidden_delta").
+    kind: String,
+}
+
+/// Pool the captured hidden state per the shim's manifest, run the
+/// shim's ort session, and format the output per `output_shape.kind`.
+///
+/// v1 constraints (rejected with 400 if violated):
+/// - `attachment.layer` must be `"final"` — only the final post-norm
+///   hidden is wired in v1. `entrance:N` is part of #6c (injection).
+/// - `attachment.pooling` must be `"last_token"` or `"mean"` —
+///   `attention` and `none` need extra plumbing beyond v1.
+/// - `input_shape.hidden_dim` must equal `hc.embed_dim`.
+///
+/// Errors map cleanly to HTTP responses for the standalone endpoint;
+/// the chat-handler gate path translates them into per-shim error
+/// entries in the response metadata so one bad shim doesn't 500 the
+/// whole completion.
+async fn run_shim_against_hidden(
+    shim: &Arc<RegisteredShim>,
+    hc: &HiddenCaptures,
+) -> Result<ShimRunResult, (StatusCode, Json<serde_json::Value>)> {
     let manifest = &shim.manifest;
 
-    // v1 supports only attachment.layer = "final".
     if manifest.attachment.layer != "final" {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1686,25 +2124,6 @@ async fn shim_infer(
         ));
     }
 
-    // 1. Tokenize.
-    let tokens = state.tokenizer.encode(&req.context, /*add_bos*/ true);
-    if tokens.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": { "type": "invalid_request", "message": "empty context after tokenization" }
-            })),
-        ));
-    }
-
-    // 2. Forward through cortex; capture final post-norm hidden only.
-    let infer_start = Instant::now();
-    let hc = tokio::task::block_in_place(|| {
-        state.engine.forward_full_gpu_with_hidden_capture(&tokens, &[])
-    });
-    let cortex_ms = infer_start.elapsed().as_millis() as u64;
-
-    // 3. Pool.
     let pooled: Vec<f32> = match manifest.attachment.pooling.as_str() {
         "last_token" => hc.final_last_token().to_vec(),
         "mean" => {
@@ -1732,7 +2151,6 @@ async fn shim_infer(
         }
     };
 
-    // 4. Validate hidden_dim against manifest.
     let expected_dim = manifest.input_shape.get("hidden_dim")
         .and_then(|v| v.as_u64()).map(|n| n as usize)
         .ok_or_else(|| (
@@ -1758,11 +2176,9 @@ async fn shim_infer(
         ));
     }
 
-    // 5. Run the ort session. Lock the per-shim session mutex (ort
-    //    Sessions aren't Sync); v1 serializes inference per shim, fine
-    //    for a server that's not yet fronting many concurrent users.
-    //    Scoped so all borrows of `session` end (outputs / extracted
-    //    tensor refs) before the function continues with owned data.
+    // Lock the per-shim session mutex (ort Sessions aren't Sync); v1
+    // serializes inference per shim. Scoped so all borrows of `session`
+    // (outputs + extracted tensor refs) end before we move out of it.
     let ort_start = Instant::now();
     let (out_vec, out_shape_vec) = {
         let mut session = shim.session.lock().await;
@@ -1812,9 +2228,8 @@ async fn shim_infer(
     };
     let ort_ms = ort_start.elapsed().as_millis() as u64;
 
-    // 6. Format per output_shape.kind. v1 accepted: "scalar",
-    //    "category:N" (N read from the shape if needed), "hidden_delta".
-    let kind = manifest.output_shape.get("kind").and_then(|v| v.as_str()).unwrap_or("scalar");
+    let kind = manifest.output_shape.get("kind")
+        .and_then(|v| v.as_str()).unwrap_or("scalar").to_string();
     let decision: serde_json::Value = if kind == "scalar" {
         if out_vec.is_empty() {
             return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
@@ -1836,26 +2251,71 @@ async fn shim_infer(
         }))));
     };
 
+    Ok(ShimRunResult {
+        decision,
+        raw_output: out_vec,
+        output_shape: out_shape_vec,
+        ort_ms,
+        kind,
+    })
+}
+
+async fn shim_infer(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<ShimInferRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let shim = {
+        let shims = state.shims.lock().await;
+        shims.get(&req.shim_id).cloned().ok_or_else(|| (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "shim_not_found",
+                    "message": format!("shim '{}' not registered", req.shim_id),
+                    "shim_id": req.shim_id,
+                }
+            })),
+        ))?
+    };
+
+    let tokens = state.tokenizer.encode(&req.context, /*add_bos*/ true);
+    if tokens.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": { "type": "invalid_request", "message": "empty context after tokenization" }
+            })),
+        ));
+    }
+
+    let infer_start = Instant::now();
+    let hc = tokio::task::block_in_place(|| {
+        state.engine.forward_full_gpu_with_hidden_capture(&tokens, &[])
+    });
+    let cortex_ms = infer_start.elapsed().as_millis() as u64;
+
+    let result = run_shim_against_hidden(&shim, &hc).await?;
+
     let response = serde_json::json!({
-        "decision": decision,
+        "decision": result.decision,
         "metadata": {
             "shim_id": req.shim_id,
-            "shim_version": manifest.version,
-            "kind": kind,
-            "output_shape": out_shape_vec,
+            "shim_version": shim.manifest.version,
+            "kind": result.kind,
+            "output_shape": result.output_shape,
             "context_tokens": tokens.len(),
             "cortex_ms": cortex_ms,
-            "ort_ms": ort_ms,
-            "raw_output": out_vec,
+            "ort_ms": result.ort_ms,
+            "raw_output": result.raw_output,
         }
     });
 
     info!(
         shim_id = %req.shim_id,
-        kind = %kind,
+        kind = %result.kind,
         context_tokens = tokens.len(),
         cortex_ms,
-        ort_ms,
+        ort_ms = result.ort_ms,
         "shim infer",
     );
 

@@ -172,7 +172,26 @@ Run all: `cargo test --workspace`
       `forward_full_gpu_polar_traced`. Validated end-to-end against
       Qwen 3B + 1941 Harmonizer corpus: polar trace returns
       semantically-correct hits including offset 324 = "Bluejacket")
+- [x] Shim phase dispatch — gate (#6a): `gate_shims` /
+      `steer_shims` / `inject_shims` / `shim_rules` on
+      `/v1/chat/completions`. Gate fires once after a shared prefill;
+      `shim_rules` (declarative match-and-dispatch, no scripting)
+      route to `silent` (short-circuit, `finish_reason: "silent"`,
+      zero content) or `activate` (proceeds to generation). Streaming
+      and non-streaming both supported; metadata (`gate_decisions`,
+      `active_steers`, `signals`, timings) lands on the final chunk /
+      response. Steers (#6b) and injection (#6c) record the requested
+      sets in metadata for forward-compat but are not yet applied.
+      Validated end-to-end on Qwen 2.5-3B + a squared-norm gate shim
+      (`pinky/tools/gate_smoke_shim.onnx`): silent + proceed paths
+      pass for both streaming and non-streaming wires
 - [ ] cortex-cloud retrieval-cache config flag → polar backend
+- [ ] Shim phase dispatch — steer (#6b): per-token hidden modification
+      via `forward_full_gpu_with_cache_returning_hidden`; sequential
+      composition in declared order
+- [ ] Shim phase dispatch — injection (#6c): residual-add at
+      `entrance:N` via `pre_block_hidden_inject` parameter on
+      `forward_block_gpu_inner`; sum composition (commutative)
 - [ ] QJL correction on V dequant (currently K-only) to close the cosine-
       similarity gap on attention output (PolarQuant alone hits ~0.84)
 - [ ] Bit-pack 3-bit angle representation (u8 → 3-bits, ~12x compression)
