@@ -164,7 +164,13 @@ Run all: `cargo test --workspace`
       (rotate_q → score_polar_batch → softmax_batch → value_polar_batch
       → derotate). Pre-softmax score capture via the same Option<&Buffer>
       hook as the f32 path
-- [ ] cortex-cloud retrieve cache_load → polar backend wiring
+- [x] cortex-cloud retrieve cache_load → polar backend wiring
+      (`--enable-polar-cache` flag; `cache_load` builds a parallel
+      polar cache via `populate_from_f32_cache_gpu`; single-shard
+      `/v1/retrieve` dispatches on `entry.polar.is_some()` to use
+      `forward_full_gpu_polar_traced`. Validated end-to-end against
+      Qwen 3B + 1941 Harmonizer corpus: polar trace returns
+      semantically-correct hits including offset 324 = "Bluejacket")
 - [ ] cortex-cloud retrieval-cache config flag → polar backend
 - [ ] QJL correction on V dequant (currently K-only) to close the cosine-
       similarity gap on attention output (PolarQuant alone hits ~0.84)

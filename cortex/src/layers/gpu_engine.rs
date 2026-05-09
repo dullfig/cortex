@@ -2002,6 +2002,26 @@ impl GpuEngine {
         )
     }
 
+    /// Allocate a fresh `GpuPolarKvCache` shaped to this engine's model.
+    /// `rotation_seed_base` selects the per-layer rotation matrices —
+    /// must be consistent across caches that participate in the same
+    /// composition / shared retrieval session.
+    pub fn create_gpu_polar_kv_cache(
+        &self,
+        max_seq_len: usize,
+        rotation_seed_base: u64,
+    ) -> crate::layers::gpu_polar_kv_cache::GpuPolarKvCache {
+        let attn0 = self.cpu.blocks()[0].attention();
+        crate::layers::gpu_polar_kv_cache::GpuPolarKvCache::new(
+            self.gpu.clone(),
+            self.cpu.n_layers(),
+            attn0.n_kv_heads(),
+            attn0.head_dim(),
+            max_seq_len,
+            rotation_seed_base,
+        )
+    }
+
     pub fn forward(&self, tokens: &[u32], start_pos: usize) -> Vec<f32> {
         self.cpu.forward(tokens, start_pos)
     }

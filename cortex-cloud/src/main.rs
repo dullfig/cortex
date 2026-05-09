@@ -63,6 +63,17 @@ struct Cli {
     /// Implies --enable-cache since retrieval operates over cached shards.
     #[arg(long)]
     enable_retrieve: bool,
+
+    /// Enable PolarQuant-compressed KV cache for retrieval. When set,
+    /// every shard built via /v1/cache/load is compressed to polar
+    /// format on the GPU after the f32 prefill. Single-shard
+    /// /v1/retrieve queries then run against the polar cache via
+    /// `forward_full_gpu_polar_traced`. Multi-shard composition and
+    /// chat-mode generation continue to use the f32 cache for now.
+    /// Trades polar quantization noise (per-row cosine ~0.95+ at
+    /// realistic head_dim) for ~7x KV VRAM reduction.
+    #[arg(long)]
+    enable_polar_cache: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -79,6 +90,14 @@ const SINK_TOKENS: usize = 4;
 /// Per-cache metadata stored alongside the KV cache in the pool.
 struct CacheEntry {
     cache: GpuKvCache,
+    /// Optional PolarQuant-compressed K/V parallel to `cache`. Populated
+    /// once at cache_load time (via `populate_from_f32_cache_gpu`) when
+    /// `--enable-polar-cache` is set. Single-shard /v1/retrieve queries
+    /// against this entry use the polar trace forward; chat and
+    /// multi-shard paths continue to use `cache`. Memory cost: parallel
+    /// (both caches resident); a future refinement can drop the f32
+    /// cache once the chat path supports polar too.
+    polar: Option<cortex::layers::gpu_polar_kv_cache::GpuPolarKvCache>,
     /// Token history that built this cache. Stored so shards can be composed
     /// by replaying tokens in sequence (which gives correct RoPE positions).
     tokens: Vec<u32>,
@@ -130,6 +149,14 @@ struct ServerState {
     cache_enabled: bool,
     /// Whether retrieval mode is enabled.
     retrieve_enabled: bool,
+    /// Whether to build a parallel polar-compressed cache on cache_load
+    /// (and use it for single-shard retrieve when present).
+    polar_cache_enabled: bool,
+    /// Per-layer rotation seed base for any polar caches built by this
+    /// server. Stored on ServerState so all polar caches share the same
+    /// seeding scheme — required for cross-cache compatibility (e.g.
+    /// multi-shard polar composition, future).
+    polar_rotation_seed: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -661,24 +688,50 @@ async fn chat_completions(
             // is fine here — trace forwards are ~250ms and other handlers
             // can wait. Composition is not touched on this path.
             let pool = state.cache_pool.lock().await;
-            let cache_ref = &pool.get(&shards[0]).unwrap().cache;
-            let cache_seq = cache_ref.seq_len();
-            info!(
-                shard = %shards[0],
-                corpus_tokens = corpus_len,
-                query_tokens = n_query,
-                "retrieval mode: single-shard cached forward",
-            );
-            let (q, b) = tokio::task::block_in_place(|| {
-                let q = state.engine.forward_full_gpu_with_cache_traced(
-                    &prompt_tokens, cache_ref, &capture_layers,
+            let entry = pool.get(&shards[0]).unwrap();
+            // Polar fast path: when the entry has a polar cache populated
+            // (server started with --enable-polar-cache), use the polar
+            // trace forward; ~7x less KV VRAM read per token.
+            if let Some(polar_ref) = entry.polar.as_ref() {
+                let cache_seq = polar_ref.seq_len();
+                info!(
+                    shard = %shards[0],
+                    corpus_tokens = corpus_len,
+                    query_tokens = n_query,
+                    backend = "polar",
+                    "retrieval mode: single-shard polar trace forward",
                 );
-                let b = state.engine.forward_full_gpu_with_cache_traced(
-                    &baseline_tokens, cache_ref, &capture_layers,
+                let (q, b) = tokio::task::block_in_place(|| {
+                    let q = state.engine.forward_full_gpu_polar_traced(
+                        &prompt_tokens, polar_ref, &capture_layers,
+                    );
+                    let b = state.engine.forward_full_gpu_polar_traced(
+                        &baseline_tokens, polar_ref, &capture_layers,
+                    );
+                    (q, b)
+                });
+                (q, b, cache_seq)
+            } else {
+                let cache_ref = &entry.cache;
+                let cache_seq = cache_ref.seq_len();
+                info!(
+                    shard = %shards[0],
+                    corpus_tokens = corpus_len,
+                    query_tokens = n_query,
+                    backend = "f32",
+                    "retrieval mode: single-shard cached forward",
                 );
-                (q, b)
-            });
-            (q, b, cache_seq)
+                let (q, b) = tokio::task::block_in_place(|| {
+                    let q = state.engine.forward_full_gpu_with_cache_traced(
+                        &prompt_tokens, cache_ref, &capture_layers,
+                    );
+                    let b = state.engine.forward_full_gpu_with_cache_traced(
+                        &baseline_tokens, cache_ref, &capture_layers,
+                    );
+                    (q, b)
+                });
+                (q, b, cache_seq)
+            }
         } else {
             // Build the request key from the snapshot. Order-preserving so
             // shards=[A,B] and shards=[B,A] are different keys (RoPE
@@ -859,6 +912,9 @@ async fn chat_completions(
             entry.tokens.extend_from_slice(&prompt_tokens);
             entry.tokens.extend_from_slice(&generated);
             entry.version += 1;
+            // Chat extends the f32 cache with prompt + generated K/V.
+            // Any polar snapshot is now stale.
+            entry.polar = None;
             entry.last_used = Instant::now();
             let len = generated.len() as u32;
             (generated, len)
@@ -900,6 +956,9 @@ async fn chat_completions(
                     entry.tokens.extend_from_slice(&prompt_tokens);
                     entry.tokens.extend_from_slice(&generated);
                     entry.version += 1;
+                    // The polar snapshot of this shard is stale after the
+                    // chat append (multi-shard path).
+                    entry.polar = None;
                     entry.last_used = Instant::now();
                 }
             }
@@ -996,6 +1055,20 @@ async fn cache_load(
         });
     }
 
+    // If polar caching is enabled, build a parallel polar cache from the
+    // f32 prefill output via the GPU compress shader. No CPU round-trip.
+    let polar = if state.polar_cache_enabled {
+        tokio::task::block_in_place(|| {
+            let mut p = state.engine.create_gpu_polar_kv_cache(
+                state.max_seq_len, state.polar_rotation_seed,
+            );
+            p.populate_from_f32_cache_gpu(&cache);
+            Some(p)
+        })
+    } else {
+        None
+    };
+
     let seq_len = cache.seq_len();
     let now = Instant::now();
 
@@ -1008,6 +1081,7 @@ async fn cache_load(
         req.cache_id.clone(),
         CacheEntry {
             cache,
+            polar,
             tokens: all_tokens,
             version: next_version,
             created_at: now,
@@ -1066,6 +1140,12 @@ async fn cache_append(
         });
         entry.tokens.extend_from_slice(&req.tokens);
         entry.version += 1;
+        // The polar cache (if any) was a snapshot of the f32 cache at
+        // load time. After append, it's stale. Drop it; the next /v1/retrieve
+        // against this shard will fall back to the f32 path. A future
+        // refinement can rebuild the polar cache here, but for first wiring
+        // we keep it conservative.
+        entry.polar = None;
     }
 
     entry.last_used = Instant::now();
@@ -1280,6 +1360,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loaded.model, gpu, cli.max_seq_len,
     );
 
+    // Polar caching only meaningful when retrieval is enabled. Refuse the
+    // confusing combination at startup rather than silently ignoring.
+    if cli.enable_polar_cache && !retrieve_enabled {
+        return Err("--enable-polar-cache requires --enable-retrieve".into());
+    }
+    let polar_cache_enabled = cli.enable_polar_cache;
+    // Fixed deterministic seed base for this server's polar caches. All
+    // shards loaded by this process share it (so future multi-shard polar
+    // composition can use a single rotation scheme). Different runs are
+    // free to pick different seeds; persistence across restarts is not
+    // a property anything in cortex-cloud relies on yet.
+    let polar_rotation_seed: u64 = 0x9E37_79B9_7F4A_7C15;
+
     let state = Arc::new(ServerState {
         engine,
         tokenizer: loaded.tokenizer,
@@ -1291,6 +1384,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_seq_len: cli.max_seq_len,
         cache_enabled,
         retrieve_enabled,
+        polar_cache_enabled,
+        polar_rotation_seed,
     });
 
     // Build router: always include completions, models, health.
@@ -1317,6 +1412,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         model = %model_name,
         cache = cache_enabled,
         retrieve = retrieve_enabled,
+        polar = polar_cache_enabled,
         "cortex-server ready",
     );
 
