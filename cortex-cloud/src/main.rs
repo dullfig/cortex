@@ -16,9 +16,11 @@ use std::time::Instant;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures::stream::Stream;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -203,6 +205,15 @@ struct ChatRequest {
     #[serde(default = "default_top_k")]
     #[allow(dead_code)]
     top_k: usize,
+
+    /// OpenAI-compatible streaming flag. When true, the response is an
+    /// SSE stream of `chat.completion.chunk` events terminated by a
+    /// `data: [DONE]` event. First wire supports stateless mode only
+    /// (no cache_shards, mode=generate); cached + streaming is a
+    /// follow-up because it requires holding the cache pool lock across
+    /// the entire generation, which serializes all other requests.
+    #[serde(default)]
+    stream: bool,
 }
 
 fn default_top_k() -> usize { 10 }
@@ -549,12 +560,34 @@ fn generate_with_cache(
 async fn chat_completions(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<ChatRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
     let prompt_tokens = apply_chat_template(
         &req.messages,
         req.tools.as_deref(),
         &state.tokenizer,
     );
+
+    // Streaming dispatch. Stateless (no cache_shards / cache_id), no tools,
+    // not in retrieve mode — those combinations are explicit follow-ups.
+    if req.stream {
+        let stream_uses_cache = req.cache_shards.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
+            || req.cache_id.is_some();
+        let mode_is_retrieve = req.mode.as_deref() == Some("retrieve");
+        if stream_uses_cache || mode_is_retrieve || req.tools.is_some() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "type": "unsupported",
+                        "message": "stream=true currently supports stateless generate only \
+                                    (no cache_shards / cache_id, no tools, not retrieve mode). \
+                                    Cached + streaming is a planned follow-up.",
+                    }
+                })),
+            ));
+        }
+        return chat_completions_stream(state, req, prompt_tokens).await;
+    }
 
     let prompt_len = prompt_tokens.len() as u32;
 
@@ -869,7 +902,7 @@ async fn chat_completions(
                 corpus_tokens: corpus_len as u32,
                 layers_used: selected_layers,
             },
-        }).unwrap()));
+        }).unwrap()).into_response());
     }
 
     // ---------------------------------------------------------------
@@ -1022,8 +1055,198 @@ async fn chat_completions(
         },
     };
 
-    Ok(Json(serde_json::to_value(response).unwrap()))
+    Ok(Json(serde_json::to_value(response).unwrap()).into_response())
 }
+
+/// Streaming variant of `chat_completions`. Stateless mode only.
+///
+/// Generation runs in a `spawn_blocking` task so the GPU calls don't
+/// block the tokio reactor. Each new sampled token gets detokenized
+/// incrementally (delta = decode(all) - decode(all_minus_last)) and
+/// pushed through an mpsc channel; the SSE stream emits one
+/// `chat.completion.chunk` event per delta. The OpenAI shape is:
+///
+/// ```text
+/// data: {"id":"...","object":"chat.completion.chunk","choices":[
+///   {"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+/// data: {"choices":[{"index":0,"delta":{"content":"Hello"},...}]}
+/// ...
+/// data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+/// data: [DONE]
+/// ```
+///
+/// On client disconnect (channel send fails), generation aborts on the
+/// next token boundary and the spawned task exits cleanly. The temporary
+/// cache is dropped on task exit.
+async fn chat_completions_stream(
+    state: Arc<ServerState>,
+    req: ChatRequest,
+    prompt_tokens: Vec<u32>,
+) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
+    let sampler_config = if req.temperature <= 0.0 {
+        SamplerConfig::greedy()
+    } else {
+        SamplerConfig {
+            temperature: req.temperature,
+            top_k: 40,
+            top_p: 0.95,
+            ..Default::default()
+        }
+    };
+    let eos = state.tokenizer.eos_token_id();
+    let seed = rand_seed();
+    let max_tokens = req.max_tokens as usize;
+
+    let chunk_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+    let model_name = state.model_name.clone();
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Bounded channel: small buffer so a slow client back-pressures the
+    // GPU rather than letting tokens pile up unboundedly. Each item is
+    // an Option<String>: Some(delta) for content, None for "we're done,
+    // emit the final finish_reason chunk".
+    let (tx, rx) = tokio::sync::mpsc::channel::<StreamMessage>(8);
+
+    // Spawn the generation. block_in_place isn't an option from inside a
+    // spawn_blocking, so we keep this in a blocking thread and use the
+    // channel's blocking send path.
+    let state_for_gen = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut cache = state_for_gen.engine.create_gpu_kv_cache(state_for_gen.max_seq_len);
+        let mut sampler = Sampler::new(sampler_config, seed);
+
+        // Prefill + first token.
+        let prefill_logits = state_for_gen.engine.forward_full_gpu_with_cache(&prompt_tokens, &mut cache);
+        let vocab = state_for_gen.engine.vocab_size();
+        let last_off = (prompt_tokens.len() - 1) * vocab;
+        let mut next_token = sampler.sample(&prefill_logits[last_off..last_off + vocab]);
+
+        let mut generated: Vec<u32> = Vec::new();
+        let mut emitted_text = String::new();
+
+        let push_delta = |generated: &Vec<u32>, emitted_text: &mut String,
+                          tx: &tokio::sync::mpsc::Sender<StreamMessage>| -> bool {
+            let full = state_for_gen.tokenizer.decode(generated);
+            if full.len() > emitted_text.len() && full.starts_with(emitted_text.as_str()) {
+                let delta = full[emitted_text.len()..].to_string();
+                *emitted_text = full;
+                tx.blocking_send(StreamMessage::Delta(delta)).is_ok()
+            } else {
+                // Decode shrank or diverged (rare; happens with some BPE
+                // edge cases when a new token reshapes earlier output).
+                // Reset baseline; don't emit a delta this round.
+                *emitted_text = full;
+                true
+            }
+        };
+
+        if next_token != eos {
+            generated.push(next_token);
+            if !push_delta(&generated, &mut emitted_text, &tx) {
+                return; // client gone
+            }
+
+            for _ in 1..max_tokens {
+                let logits = state_for_gen.engine.forward_full_gpu_with_cache(&[next_token], &mut cache);
+                next_token = sampler.sample(&logits);
+                if next_token == eos {
+                    break;
+                }
+                generated.push(next_token);
+                if !push_delta(&generated, &mut emitted_text, &tx) {
+                    return; // client gone
+                }
+            }
+        }
+
+        let finish = if generated.len() >= max_tokens { "length" } else { "stop" };
+        let _ = tx.blocking_send(StreamMessage::Finish(finish.to_string()));
+        // Cache dropped on scope exit.
+    });
+
+    use tokio_stream::wrappers::ReceiverStream;
+    use tokio_stream::StreamExt;
+
+    let chunk_id_for_stream = chunk_id.clone();
+    let model_for_stream = model_name.clone();
+
+    // Initial chunk: role only, no content. OpenAI clients expect this.
+    let role_event = stream_chunk_event(
+        &chunk_id, created, &model_name,
+        Some(serde_json::json!({"role": "assistant"})),
+        None,
+    );
+
+    // Subsequent chunks come from the generation task.
+    let body_stream = ReceiverStream::new(rx).map(move |msg| {
+        Ok::<_, std::convert::Infallible>(match msg {
+            StreamMessage::Delta(text) => stream_chunk_event(
+                &chunk_id_for_stream, created, &model_for_stream,
+                Some(serde_json::json!({"content": text})),
+                None,
+            ),
+            StreamMessage::Finish(reason) => stream_chunk_event(
+                &chunk_id_for_stream, created, &model_for_stream,
+                Some(serde_json::json!({})),
+                Some(reason),
+            ),
+        })
+    });
+
+    // Final [DONE] sentinel per OpenAI SSE spec.
+    let done_event = futures::stream::once(async {
+        Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]"))
+    });
+
+    let initial = futures::stream::once(async move {
+        Ok::<_, std::convert::Infallible>(role_event)
+    });
+
+    let combined = initial.chain(body_stream).chain(done_event);
+
+    Ok(Sse::new(combined)
+        .keep_alive(KeepAlive::default())
+        .into_response())
+}
+
+/// One unit of work crossing the gen-thread → SSE-stream boundary.
+enum StreamMessage {
+    /// Newly-detokenized text since the last chunk.
+    Delta(String),
+    /// Generation finished; emit the final chunk with this finish_reason
+    /// ("stop" or "length"). Always the last message before the channel closes.
+    Finish(String),
+}
+
+/// Build one `chat.completion.chunk` SSE event with the given delta and
+/// optional finish_reason. Mirrors OpenAI's wire shape exactly.
+fn stream_chunk_event(
+    id: &str,
+    created: u64,
+    model: &str,
+    delta: Option<serde_json::Value>,
+    finish_reason: Option<String>,
+) -> Event {
+    let payload = serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": delta.unwrap_or(serde_json::json!({})),
+            "finish_reason": finish_reason,
+        }],
+    });
+    Event::default().data(payload.to_string())
+}
+
+// Suppress unused-import warning for Stream when only used via concrete types.
+#[allow(dead_code)]
+fn _stream_marker(_: impl Stream) {}
 
 // ---------------------------------------------------------------------------
 // Cache endpoints
