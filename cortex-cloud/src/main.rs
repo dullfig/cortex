@@ -1644,3 +1644,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// ort smoke
+// ---------------------------------------------------------------------------
+
+/// The `ort` crate is wired in for the v1 shim runtime
+/// (see `project_cortex_v1_shim_api.md`). #5 lands the registry +
+/// `/v1/shims/infer`; this file is the link surface.
+#[cfg(test)]
+mod ort_smoke {
+    /// Construct an ort `SessionBuilder` to confirm the crate is linked
+    /// and the ONNX runtime native library loads. We don't load a model
+    /// — that's #5. If this test fails to even start (DLL missing),
+    /// that's a build-environment problem, not a code problem.
+    #[test]
+    fn ort_session_builder_constructs() {
+        // Result<SessionBuilder, ort::Error>; either branch is fine for
+        // a link smoke. The point is symbols resolve and the ORT
+        // initializer runs.
+        let _ = ort::session::Session::builder();
+    }
+}

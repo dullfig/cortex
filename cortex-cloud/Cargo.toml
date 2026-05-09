@@ -25,3 +25,8 @@ uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
+# ONNX Runtime binding for the v1 shim runtime
+# (project_cortex_v1_shim_api.md). `download-binaries` so the ONNX
+# runtime native lib is fetched at build time without requiring a
+# system-installed ORT.
+ort = { version = "=2.0.0-rc.12", features = ["download-binaries"] }

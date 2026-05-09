@@ -107,14 +107,15 @@ let response = provider.complete(&request)?;
 
 ## Testing
 
-390 tests covering: ternary packing, matmul kernels, quantization, GGUF parsing,
+393 tests covering: ternary packing, matmul kernels, quantization, GGUF parsing,
 layer forward passes, attention, RoPE, SwiGLU, full model forward, sampler,
 retrieval (forward_traced + attention-score ranking), TurboQuant compression
 (PolarQuant + QJL + QuantizedKvCache + GPU score/value/derotate shaders +
 algorithm-quality cosine pinning + resident GpuPolarKvCache storage +
 resident dispatchers byte-equal to oneshot + GPU prefill compress shader +
 GPU-only f32→polar conversion + multi-token causal-masked batch shaders +
-polar trace forward through full model).
+polar trace forward through full model), hidden-state extraction hooks
+(per-block + final post-norm) for shim runtime, ort link smoke.
 
 For GPU-heavy tests, prefer `cargo test --workspace -- --test-threads=1`
 to avoid VRAM contention between concurrently-running GPU tests on a

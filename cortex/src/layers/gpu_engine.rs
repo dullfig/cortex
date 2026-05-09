@@ -164,6 +164,39 @@ struct GpuBlock {
 /// Per-block scratch buffers reused across all dispatches inside a single
 /// `forward_block_gpu` call. Caller allocates once per forward pass and
 /// reuses across blocks (since dimensions are constant).
+/// Output of `forward_full_gpu_with_hidden_capture`. Read-side hook
+/// surface for cortex shims (`project_cortex_v1_shim_api.md`):
+///
+/// - `per_layer_hidden[i]` corresponds to `attachment.layer = "entrance:N+1"`
+///   for the i-th element of `capture_layers` — the hidden state at the
+///   END of block N (= start of block N+1). Layout: `[n_tokens, embed_dim]`
+///   row-major f32.
+/// - `final_post_norm_hidden` is what `attachment.layer = "final"` shims
+///   read — the LM head's input. Same `[n_tokens, embed_dim]` shape.
+///   Pool downstream per the manifest's `pooling` field.
+pub struct HiddenCaptures {
+    pub per_layer_hidden: Vec<Vec<f32>>,
+    pub final_post_norm_hidden: Vec<f32>,
+    pub n_tokens: usize,
+    pub embed_dim: usize,
+}
+
+impl HiddenCaptures {
+    /// Pull the last token's slice from the final post-norm hidden state —
+    /// the most common pooling for gate / steer shims.
+    pub fn final_last_token(&self) -> &[f32] {
+        let off = (self.n_tokens - 1) * self.embed_dim;
+        &self.final_post_norm_hidden[off..off + self.embed_dim]
+    }
+
+    /// Pull the last token's slice from the i-th captured layer's
+    /// post-block hidden state.
+    pub fn layer_last_token(&self, capture_index: usize) -> &[f32] {
+        let off = (self.n_tokens - 1) * self.embed_dim;
+        &self.per_layer_hidden[capture_index][off..off + self.embed_dim]
+    }
+}
+
 pub struct BlockScratch {
     pub normed: wgpu::Buffer,    // [n_tokens, embed_dim] post-rmsnorm scratch
     pub q: wgpu::Buffer,         // [n_tokens, n_heads * head_dim]
@@ -592,7 +625,7 @@ impl GpuEngine {
         });
         for i in 0..n_layers {
             let capture = capture_lookup.get(&i).copied();
-            self.forward_block_gpu_inner(&mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch, capture, None);
+            self.forward_block_gpu_inner(&mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch, capture, None, None);
         }
         self.dispatch_rmsnorm_into(
             &mut encoder, &hidden_buf, &self.final_norm_weight_buf, &normed_buf,
@@ -657,6 +690,151 @@ impl GpuEngine {
         };
 
         (logits, per_layer_scores)
+    }
+
+    /// Hidden-state capture forward pass — non-cached. Runs the model
+    /// forward over `tokens` and returns:
+    /// - `per_layer_hidden[i]` — the post-FFN-residual hidden state at
+    ///   the END of block `capture_layers[i]`. Shape:
+    ///   `n_tokens * embed_dim` f32. Same layout as `entrance:(N+1)`
+    ///   inputs in shim manifests.
+    /// - `final_post_norm_hidden` — the final RMSNorm output (input to
+    ///   the LM head). Shape `n_tokens * embed_dim` f32. This is what
+    ///   `attachment.layer = "final"` gate / steer shims read; pool
+    ///   downstream (last_token / mean / etc.) per the manifest.
+    ///
+    /// Read-side hook only — no injection / steering. Those are #5/#6.
+    pub fn forward_full_gpu_with_hidden_capture(
+        &self,
+        tokens: &[u32],
+        capture_layers: &[usize],
+    ) -> HiddenCaptures {
+        let n_tokens = tokens.len();
+        assert!(n_tokens > 0);
+        let n_layers = self.cpu.n_layers();
+        for &l in capture_layers {
+            assert!(l < n_layers, "capture layer {l} out of range (n_layers={n_layers})");
+        }
+
+        // Embedding lookup (CPU).
+        let embed_data = self.cpu.embedding_data();
+        let vocab_size = self.cpu.vocab_size();
+        let mut hidden_init: Vec<f32> = Vec::with_capacity(n_tokens * self.embed_dim);
+        for &tok in tokens {
+            assert!((tok as usize) < vocab_size, "token {tok} out of vocab");
+            let off = tok as usize * self.embed_dim;
+            hidden_init.extend_from_slice(&embed_data[off..off + self.embed_dim]);
+        }
+
+        let hidden_bytes = (hidden_init.len() * std::mem::size_of::<f32>()) as u64;
+        let hidden_buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("forward_hidden_capture.hidden"),
+            contents: bytemuck::cast_slice(&hidden_init),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let normed_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("forward_hidden_capture.normed"),
+            size: hidden_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let normed_staging = self.gpu.create_staging_buffer(hidden_bytes);
+
+        let attn0 = self.cpu.blocks()[0].attention();
+        let intermediate = self.cpu.blocks()[0].ffn().as_any()
+            .downcast_ref::<crate::layers::swiglu::SwiGLU>()
+            .unwrap_or_else(|| panic!("forward_full_gpu_with_hidden_capture requires SwiGLU FFN"))
+            .intermediate_size();
+        let n_heads = attn0.n_heads();
+        let scratch = BlockScratch::allocate(
+            &self.gpu, n_tokens, self.embed_dim,
+            n_heads, attn0.n_kv_heads(), attn0.head_dim(),
+            intermediate, n_tokens,
+        );
+
+        // Per-captured-layer hidden buffers (post-FFN-residual). Same shape
+        // as hidden_buf: [n_tokens, embed_dim] f32 flat.
+        let capture_bufs: Vec<wgpu::Buffer> = capture_layers.iter().map(|&l| {
+            self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("forward_hidden_capture.layer{l}")),
+                size: hidden_bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        }).collect();
+        let capture_stagings: Vec<wgpu::Buffer> = (0..capture_layers.len())
+            .map(|_| self.gpu.create_staging_buffer(hidden_bytes))
+            .collect();
+        let capture_lookup: std::collections::HashMap<usize, &wgpu::Buffer> =
+            capture_layers.iter().zip(capture_bufs.iter())
+                .map(|(&l, buf)| (l, buf))
+                .collect();
+
+        let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("forward_hidden_capture.encoder"),
+        });
+        for i in 0..n_layers {
+            let post_capture = capture_lookup.get(&i).copied();
+            self.forward_block_gpu_inner(
+                &mut encoder, i, &hidden_buf, n_tokens, /*start_pos*/ 0, &scratch,
+                /*pre_softmax_capture*/ None, /*kv_cache_target*/ None, post_capture,
+            );
+        }
+        // Final RMSNorm — gives the final post-norm hidden state shims read.
+        self.dispatch_rmsnorm_into(
+            &mut encoder, &hidden_buf, &self.final_norm_weight_buf, &normed_buf,
+            self.embed_dim, n_tokens, self.final_norm_eps,
+        );
+        encoder.copy_buffer_to_buffer(&normed_buf, 0, &normed_staging, 0, hidden_bytes);
+        for (cap_buf, stg_buf) in capture_bufs.iter().zip(capture_stagings.iter()) {
+            encoder.copy_buffer_to_buffer(cap_buf, 0, stg_buf, 0, hidden_bytes);
+        }
+        self.gpu.queue.submit(Some(encoder.finish()));
+
+        // Batched readback (single poll for all stagings).
+        use std::sync::mpsc;
+        let mut receivers: Vec<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>> =
+            Vec::with_capacity(1 + capture_stagings.len());
+        let normed_slice = normed_staging.slice(..);
+        let (tx, rx) = mpsc::channel();
+        normed_slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+        receivers.push(rx);
+        let capture_slices: Vec<wgpu::BufferSlice> = capture_stagings.iter().map(|stg| {
+            let slice = stg.slice(..);
+            let (tx, rx) = mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+            receivers.push(rx);
+            slice
+        }).collect();
+
+        self.gpu.device.poll(wgpu::Maintain::Wait);
+        for rx in &receivers {
+            rx.recv().expect("readback channel closed").expect("buffer map failed");
+        }
+
+        let final_post_norm_hidden: Vec<f32> = {
+            let data = normed_slice.get_mapped_range();
+            let v: Vec<f32> = data[..hidden_bytes as usize].chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            drop(data);
+            normed_staging.unmap();
+            v
+        };
+        let per_layer_hidden: Vec<Vec<f32>> = capture_slices.iter().zip(capture_stagings.iter()).map(|(slice, stg)| {
+            let data = slice.get_mapped_range();
+            let v: Vec<f32> = data[..hidden_bytes as usize].chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            drop(data);
+            stg.unmap();
+            v
+        }).collect();
+
+        HiddenCaptures {
+            per_layer_hidden,
+            final_post_norm_hidden,
+            n_tokens,
+            embed_dim: self.embed_dim,
+        }
     }
 
     /// Cached + traced forward: process new `query_tokens` against a
@@ -760,7 +938,7 @@ impl GpuEngine {
             let target = (cache.k_layer(i), cache.v_layer(i));
             self.forward_block_gpu_inner(
                 &mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch,
-                capture, Some(target),
+                capture, Some(target), None,
             );
         }
         // Skip final_norm + output projection — retrieval doesn't need
@@ -903,7 +1081,7 @@ impl GpuEngine {
             let capture = capture_lookup.get(&i).copied();
             self.forward_block_gpu_polar_inner(
                 &mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch,
-                &rotated_buf, polar_cache, capture,
+                &rotated_buf, polar_cache, capture, None,
             );
         }
         // Skip final_norm + output projection — retrieval doesn't need logits.
@@ -1018,7 +1196,7 @@ impl GpuEngine {
             let target = (cache.k_layer(i), cache.v_layer(i));
             self.forward_block_gpu_inner(
                 &mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch,
-                None, Some(target),
+                None, Some(target), None,
             );
         }
         self.dispatch_rmsnorm_into(
@@ -1142,12 +1320,13 @@ impl GpuEngine {
         start_pos: usize,
         scratch: &BlockScratch,
     ) {
-        self.forward_block_gpu_inner(encoder, block_idx, hidden_buf, n_tokens, start_pos, scratch, None, None);
+        self.forward_block_gpu_inner(encoder, block_idx, hidden_buf, n_tokens, start_pos, scratch, None, None, None);
     }
 
     /// Same as `forward_block_gpu` but with optional pre-softmax score
     /// capture for retrieval / traced forward use, plus optional KV cache
-    /// targeting for cached forward (decode + cached prefill).
+    /// targeting for cached forward (decode + cached prefill), plus
+    /// optional post-block hidden state capture for shim hooks.
     ///
     /// When `kv_cache_target` is Some, this block's projected K/V get
     /// written into the supplied cache buffers at offset `start_pos`, and
@@ -1155,6 +1334,14 @@ impl GpuEngine {
     /// max_seq = start_pos + n_tokens) so the new tokens attend over the
     /// full prefix. When None, K/V live only in scratch and attention reads
     /// scratch (the prefill-only path).
+    ///
+    /// When `post_block_hidden_capture` is Some, the hidden state at the
+    /// END of this block (after the FFN residual add) is copied into the
+    /// supplied buffer. This is the natural attachment point for
+    /// "entrance:N+1" shim hooks (the input to block N+1) and, when
+    /// captured at the last block, the input to the final RMSNorm — i.e.
+    /// what gate / steer shims read. Buffer must be sized
+    /// `n_tokens * embed_dim * 4` bytes.
     #[allow(clippy::too_many_arguments)]
     fn forward_block_gpu_inner(
         &self,
@@ -1166,6 +1353,7 @@ impl GpuEngine {
         scratch: &BlockScratch,
         pre_softmax_capture: Option<&wgpu::Buffer>,
         kv_cache_target: Option<(&wgpu::Buffer, &wgpu::Buffer)>,
+        post_block_hidden_capture: Option<&wgpu::Buffer>,
     ) {
         let block = &self.cpu.blocks()[block_idx];
         let block_gpu = &self.blocks_gpu[block_idx];
@@ -1286,6 +1474,12 @@ impl GpuEngine {
 
         // 14. Residual: hidden += projected
         self.dispatch_add_into(encoder, hidden_buf, &scratch.projected, embed_dim, n_tokens);
+
+        // 15. (optional) capture post-block hidden state — shim hook point.
+        if let Some(capture_buf) = post_block_hidden_capture {
+            let bytes = (n_tokens * embed_dim * std::mem::size_of::<f32>()) as u64;
+            encoder.copy_buffer_to_buffer(hidden_buf, 0, capture_buf, 0, bytes);
+        }
     }
 
     /// Polar variant of `forward_block_gpu_inner`. Same RMSNorm + projections
@@ -1315,6 +1509,7 @@ impl GpuEngine {
         rotated_buf: &wgpu::Buffer,
         polar_cache: &crate::layers::gpu_polar_kv_cache::GpuPolarKvCache,
         pre_softmax_capture: Option<&wgpu::Buffer>,
+        post_block_hidden_capture: Option<&wgpu::Buffer>,
     ) {
         let block = &self.cpu.blocks()[block_idx];
         let block_gpu = &self.blocks_gpu[block_idx];
@@ -1465,6 +1660,12 @@ impl GpuEngine {
         self.dispatch_silu_mul_into(encoder, &scratch.gate, &scratch.up, &scratch.activated, intermediate, n_tokens);
         self.dispatch_matmul_into(encoder, swiglu.down_proj(), &scratch.activated, &scratch.projected, n_tokens);
         self.dispatch_add_into(encoder, hidden_buf, &scratch.projected, embed_dim, n_tokens);
+
+        // (optional) post-block hidden state capture — shim hook point.
+        if let Some(capture_buf) = post_block_hidden_capture {
+            let bytes = (n_tokens * embed_dim * std::mem::size_of::<f32>()) as u64;
+            encoder.copy_buffer_to_buffer(hidden_buf, 0, capture_buf, 0, bytes);
+        }
     }
 
     /// Dispatch a single-vector matvec on GPU using the given layer's
@@ -3146,6 +3347,66 @@ mod tests {
     /// directional agreement, not numeric equality). This is the
     /// load-bearing test that the polar attention chain in each block is
     /// computing what a polar-attention forward should compute.
+    /// Hidden-state extraction hook: capture per-layer post-block hidden
+    /// states + final post-norm hidden via `forward_full_gpu_with_hidden_capture`.
+    /// Sanity-check shapes are right, all values are finite, and the
+    /// last-token slicer helpers return what they should.
+    #[test]
+    fn hidden_capture_returns_finite_states() {
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let gpu_model = toy_float_multi_block_for_gpu(gpu.clone(), 2);
+        let n_layers = gpu_model.n_layers();
+        let embed_dim = 4; // toy model embed_dim
+        let engine = GpuEngine::with_max_seq(gpu_model, gpu, 16);
+
+        let tokens = vec![1u32, 2, 3];
+        let n_tokens = tokens.len();
+        let capture_layers: Vec<usize> = (0..n_layers).collect();
+
+        let hc = engine.forward_full_gpu_with_hidden_capture(&tokens, &capture_layers);
+
+        assert_eq!(hc.n_tokens, n_tokens);
+        assert_eq!(hc.embed_dim, embed_dim);
+        assert_eq!(hc.per_layer_hidden.len(), n_layers);
+        for (i, layer) in hc.per_layer_hidden.iter().enumerate() {
+            assert_eq!(layer.len(), n_tokens * embed_dim,
+                "layer {i} hidden size");
+            assert!(layer.iter().all(|v| v.is_finite()),
+                "layer {i} hidden contains non-finite values");
+        }
+        assert_eq!(hc.final_post_norm_hidden.len(), n_tokens * embed_dim);
+        assert!(hc.final_post_norm_hidden.iter().all(|v| v.is_finite()));
+
+        // The post-FFN hidden of the LAST block is the input to the final
+        // RMSNorm. After RMSNorm, magnitudes change but direction is
+        // preserved. Sanity: both have nonzero norm at the last token.
+        let last_layer_last_tok = hc.layer_last_token(n_layers - 1);
+        let final_last_tok = hc.final_last_token();
+        let mag_last_layer: f32 = last_layer_last_tok.iter().map(|x| x*x).sum::<f32>().sqrt();
+        let mag_final: f32 = final_last_tok.iter().map(|x| x*x).sum::<f32>().sqrt();
+        assert!(mag_last_layer > 0.0, "last-block last-token hidden should be nonzero");
+        assert!(mag_final > 0.0, "final post-norm last-token hidden should be nonzero");
+    }
+
+    /// Hooks-are-optional invariant: forward without capture (capture_layers
+    /// empty) should still produce a valid final post-norm hidden, and not
+    /// allocate any per-layer capture buffers.
+    #[test]
+    fn hidden_capture_with_empty_layers_works() {
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let gpu_model = toy_float_multi_block_for_gpu(gpu.clone(), 2);
+        let engine = GpuEngine::with_max_seq(gpu_model, gpu, 16);
+
+        let hc = engine.forward_full_gpu_with_hidden_capture(&[1u32, 2], &[]);
+        assert!(hc.per_layer_hidden.is_empty());
+        assert!(hc.final_post_norm_hidden.iter().all(|v| v.is_finite()));
+        assert_eq!(hc.final_post_norm_hidden.len(), 2 * 4); // n_tokens * embed_dim
+    }
+
     #[test]
     fn polar_traced_matches_f32_traced_directionally() {
         use crate::layers::gpu_kv_cache::GpuKvCache;
