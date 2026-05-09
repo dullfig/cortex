@@ -107,13 +107,14 @@ let response = provider.complete(&request)?;
 
 ## Testing
 
-389 tests covering: ternary packing, matmul kernels, quantization, GGUF parsing,
+390 tests covering: ternary packing, matmul kernels, quantization, GGUF parsing,
 layer forward passes, attention, RoPE, SwiGLU, full model forward, sampler,
 retrieval (forward_traced + attention-score ranking), TurboQuant compression
 (PolarQuant + QJL + QuantizedKvCache + GPU score/value/derotate shaders +
 algorithm-quality cosine pinning + resident GpuPolarKvCache storage +
 resident dispatchers byte-equal to oneshot + GPU prefill compress shader +
-GPU-only f32→polar conversion + multi-token causal-masked batch shaders).
+GPU-only f32→polar conversion + multi-token causal-masked batch shaders +
+polar trace forward through full model).
 
 For GPU-heavy tests, prefer `cargo test --workspace -- --test-threads=1`
 to avoid VRAM contention between concurrently-running GPU tests on a
@@ -156,9 +157,14 @@ Run all: `cargo test --workspace`
       (derotate.wgsl reused for the multi-token output by treating
       `n_tokens * n_query_heads` as effective head count). Full
       5-stage GPU pipeline matches CPU reference within 1e-5
-- [ ] Wire batch shaders into a `forward_full_gpu_polar_traced`
-      function — replaces dispatch_attention_inner for the polar path
-      block-by-block
+- [x] `forward_full_gpu_polar_traced` — polar-aware traced forward
+      that runs every block through `forward_block_gpu_polar_inner`:
+      f32 RMSNorm + Q/K/V projections + RoPE, then GPU compress writes
+      query K/V into the polar cache, then the polar attention chain
+      (rotate_q → score_polar_batch → softmax_batch → value_polar_batch
+      → derotate). Pre-softmax score capture via the same Option<&Buffer>
+      hook as the f32 path
+- [ ] cortex-cloud retrieve cache_load → polar backend wiring
 - [ ] cortex-cloud retrieval-cache config flag → polar backend
 - [ ] QJL correction on V dequant (currently K-only) to close the cosine-
       similarity gap on attention output (PolarQuant alone hits ~0.84)

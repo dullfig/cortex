@@ -798,6 +798,147 @@ impl GpuEngine {
         per_layer_scores
     }
 
+    /// Polar variant of `forward_full_gpu_with_cache_traced`. Runs the
+    /// transformer forward over `query_tokens` against a resident
+    /// PolarQuant-compressed KV cache, capturing per-layer pre-softmax
+    /// attention scores from `capture_layers`. The query's K/V are
+    /// compressed and written into the polar cache at offset
+    /// `polar_cache.seq_len()` for self-attention; the cache cursor is
+    /// **not** advanced (mirrors the f32 traced forward — same cache can
+    /// serve repeated queries).
+    ///
+    /// All blocks run; non-captured layers are still executed because the
+    /// hidden state must propagate through every layer. `capture_layers`
+    /// only controls which layers' pre-softmax attention scores are
+    /// returned.
+    pub fn forward_full_gpu_polar_traced(
+        &self,
+        query_tokens: &[u32],
+        polar_cache: &crate::layers::gpu_polar_kv_cache::GpuPolarKvCache,
+        capture_layers: &[usize],
+    ) -> Vec<Vec<f32>> {
+        let n_tokens = query_tokens.len();
+        assert!(n_tokens > 0, "must have at least one query token");
+
+        let n_layers = self.cpu.n_layers();
+        assert_eq!(n_layers, polar_cache.n_layers(), "polar cache layer count mismatch");
+        for &l in capture_layers {
+            assert!(l < n_layers, "capture layer {l} out of range (n_layers={n_layers})");
+        }
+
+        let attn0 = self.cpu.blocks()[0].attention();
+        assert_eq!(polar_cache.n_kv_heads(), attn0.n_kv_heads(),
+            "polar cache n_kv_heads mismatch");
+        assert_eq!(polar_cache.head_dim(), attn0.head_dim(),
+            "polar cache head_dim mismatch");
+
+        let start_pos = polar_cache.seq_len();
+        let attn_max_seq = start_pos + n_tokens;
+        assert!(attn_max_seq <= polar_cache.max_seq_len(),
+            "polar cache overflow: {} + {} > {}",
+            start_pos, n_tokens, polar_cache.max_seq_len());
+
+        // ---- Embedding lookup (CPU) ----
+        let embed_data = self.cpu.embedding_data();
+        let vocab_size = self.cpu.vocab_size();
+        let mut hidden_init: Vec<f32> = Vec::with_capacity(n_tokens * self.embed_dim);
+        for &tok in query_tokens {
+            assert!((tok as usize) < vocab_size, "token {tok} out of vocab");
+            let off = tok as usize * self.embed_dim;
+            hidden_init.extend_from_slice(&embed_data[off..off + self.embed_dim]);
+        }
+        let hidden_buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("forward_polar_traced.hidden"),
+            contents: bytemuck::cast_slice(&hidden_init),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+
+        let intermediate = self.cpu.blocks()[0].ffn().as_any()
+            .downcast_ref::<crate::layers::swiglu::SwiGLU>()
+            .unwrap_or_else(|| panic!("forward_full_gpu_polar_traced requires SwiGLU FFN"))
+            .intermediate_size();
+        let n_heads = attn0.n_heads();
+        let head_dim = attn0.head_dim();
+        let scratch = BlockScratch::allocate(
+            &self.gpu, n_tokens, self.embed_dim,
+            n_heads, attn0.n_kv_heads(), head_dim,
+            intermediate, attn_max_seq,
+        );
+
+        // Polar-only scratch: reused as both rq (post-rotate_q) and
+        // weighted_rotated_V (pre-derotate) inside each block. One
+        // allocation per trace call, not per block.
+        let rotated_bytes = (n_tokens * n_heads * head_dim * std::mem::size_of::<f32>()) as u64;
+        let rotated_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("forward_polar_traced.rotated"),
+            size: rotated_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        // Per-captured-layer scores. Same shape as the f32 path:
+        // [n_tokens, n_heads, attn_max_seq].
+        let scores_bytes = (n_tokens * n_heads * attn_max_seq * std::mem::size_of::<f32>()) as u64;
+        let capture_bufs: Vec<wgpu::Buffer> = capture_layers.iter().map(|&l| {
+            self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("forward_polar_traced.scores.layer{l}")),
+                size: scores_bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        }).collect();
+        let capture_stagings: Vec<wgpu::Buffer> = (0..capture_layers.len())
+            .map(|_| self.gpu.create_staging_buffer(scores_bytes))
+            .collect();
+        let capture_lookup: std::collections::HashMap<usize, &wgpu::Buffer> =
+            capture_layers.iter().zip(capture_bufs.iter())
+                .map(|(&l, buf)| (l, buf))
+                .collect();
+
+        // ---- All blocks in one encoder ----
+        let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("forward_polar_traced.encoder"),
+        });
+        for i in 0..n_layers {
+            let capture = capture_lookup.get(&i).copied();
+            self.forward_block_gpu_polar_inner(
+                &mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch,
+                &rotated_buf, polar_cache, capture,
+            );
+        }
+        // Skip final_norm + output projection — retrieval doesn't need logits.
+        for (cap_buf, stg_buf) in capture_bufs.iter().zip(capture_stagings.iter()) {
+            encoder.copy_buffer_to_buffer(cap_buf, 0, stg_buf, 0, scores_bytes);
+        }
+        self.gpu.queue.submit(Some(encoder.finish()));
+
+        // Batched readback (single poll for all stagings).
+        use std::sync::mpsc;
+        let mut receivers: Vec<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>> = Vec::with_capacity(capture_stagings.len());
+        let capture_slices: Vec<wgpu::BufferSlice> = capture_stagings.iter().map(|stg| {
+            let slice = stg.slice(..);
+            let (tx, rx) = mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+            receivers.push(rx);
+            slice
+        }).collect();
+        self.gpu.device.poll(wgpu::Maintain::Wait);
+        for rx in &receivers {
+            rx.recv().expect("readback channel closed").expect("buffer map failed");
+        }
+
+        let per_layer_scores: Vec<Vec<f32>> = capture_slices.iter().zip(capture_stagings.iter()).map(|(slice, stg)| {
+            let data = slice.get_mapped_range();
+            let v: Vec<f32> = data[..scores_bytes as usize].chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            drop(data);
+            stg.unmap();
+            v
+        }).collect();
+
+        per_layer_scores
+    }
+
     /// Forward pass that writes new K/V into the supplied `cache` and reads
     /// the full prefix from the cache during attention. Both prefill (cache
     /// initially empty, `cache.seq_len() == 0`) and decode (cache populated,
@@ -1144,6 +1285,185 @@ impl GpuEngine {
         self.dispatch_matmul_into(encoder, swiglu.down_proj(), &scratch.activated, &scratch.projected, n_tokens);
 
         // 14. Residual: hidden += projected
+        self.dispatch_add_into(encoder, hidden_buf, &scratch.projected, embed_dim, n_tokens);
+    }
+
+    /// Polar variant of `forward_block_gpu_inner`. Same RMSNorm + projections
+    /// + RoPE + FFN as the f32 path, but the K/V cache write is replaced by
+    /// the GPU compress shader (writing into a `GpuPolarKvCache` layer's
+    /// resident buffers) and the score → softmax → value chain runs against
+    /// the polar cache via the batch polar dispatchers + softmax_batch.
+    ///
+    /// Caller provides:
+    /// - `polar_cache`: the resident compressed cache (must hold the full
+    ///   prefix this attention attends to; the query's K/V are written here
+    ///   at offset `start_pos`).
+    /// - `rotated_buf`: scratch buffer of size `n_tokens * n_heads * head_dim`
+    ///   f32, reused inside the block as both `rq` (post-rotate_q) and
+    ///   `weighted_rotated_V` (pre-derotate). One allocation per trace call.
+    /// - `pre_softmax_capture`: optional buffer to copy scores into before
+    ///   softmax overwrites them — for retrieval-mode tracing.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_block_gpu_polar_inner(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        block_idx: usize,
+        hidden_buf: &wgpu::Buffer,
+        n_tokens: usize,
+        start_pos: usize,
+        scratch: &BlockScratch,
+        rotated_buf: &wgpu::Buffer,
+        polar_cache: &crate::layers::gpu_polar_kv_cache::GpuPolarKvCache,
+        pre_softmax_capture: Option<&wgpu::Buffer>,
+    ) {
+        let block = &self.cpu.blocks()[block_idx];
+        let block_gpu = &self.blocks_gpu[block_idx];
+        let attn = block.attention();
+
+        assert!(attn.o_sub_norm().is_none(),
+            "forward_block_gpu_polar does not support attention sub-norm yet");
+        assert!((block.attn_residual_scale() - 1.0).abs() < f32::EPSILON);
+        assert!((block.ffn_residual_scale() - 1.0).abs() < f32::EPSILON);
+
+        let swiglu = block.ffn().as_any()
+            .downcast_ref::<crate::layers::swiglu::SwiGLU>()
+            .unwrap_or_else(|| panic!("forward_block_gpu_polar requires SwiGLU FFN"));
+        assert!(swiglu.sub_norm().is_none());
+        assert_eq!(swiglu.activation(), crate::layers::swiglu::GateActivation::SiLU);
+
+        let n_heads = attn.n_heads();
+        let n_kv_heads = attn.n_kv_heads();
+        let head_dim = attn.head_dim();
+        let embed_dim = self.embed_dim;
+        let intermediate = swiglu.intermediate_size();
+        let kv_dim = n_kv_heads * head_dim;
+        let attn_max_seq = start_pos + n_tokens;
+
+        assert_eq!(n_kv_heads, polar_cache.n_kv_heads(),
+            "polar cache n_kv_heads mismatch");
+        assert_eq!(head_dim, polar_cache.head_dim(),
+            "polar cache head_dim mismatch");
+        assert!(attn_max_seq <= polar_cache.max_seq_len(),
+            "polar cache overflow: start_pos {} + n_tokens {} > max_seq {}",
+            start_pos, n_tokens, polar_cache.max_seq_len());
+        assert!(start_pos + n_tokens <= self.rope_max_seq);
+
+        // ===== ATTENTION SUBLAYER =====
+
+        // 1. attn_norm
+        self.dispatch_rmsnorm_into(
+            encoder, hidden_buf, &block_gpu.attn_norm_weight_buf, &scratch.normed,
+            embed_dim, n_tokens, block_gpu.attn_norm_eps,
+        );
+
+        // 2-4. Q, K, V projections (+ optional Qwen-style biases)
+        self.dispatch_matmul_into(encoder, attn.q_proj(), &scratch.normed, &scratch.q, n_tokens);
+        if let Some(buf) = block_gpu.q_bias_buf.as_ref() {
+            self.dispatch_bias_add_into(encoder, &scratch.q, buf, n_heads * head_dim, n_tokens);
+        }
+        self.dispatch_matmul_into(encoder, attn.k_proj(), &scratch.normed, &scratch.k, n_tokens);
+        if let Some(buf) = block_gpu.k_bias_buf.as_ref() {
+            self.dispatch_bias_add_into(encoder, &scratch.k, buf, kv_dim, n_tokens);
+        }
+        self.dispatch_matmul_into(encoder, attn.v_proj(), &scratch.normed, &scratch.v, n_tokens);
+        if let Some(buf) = block_gpu.v_bias_buf.as_ref() {
+            self.dispatch_bias_add_into(encoder, &scratch.v, buf, kv_dim, n_tokens);
+        }
+
+        // 5. RoPE on Q and K
+        self.dispatch_rope_into(
+            encoder, &scratch.q, &self.rope_cos_buf, &self.rope_sin_buf,
+            n_heads, head_dim, start_pos, n_tokens,
+        );
+        self.dispatch_rope_into(
+            encoder, &scratch.k, &self.rope_cos_buf, &self.rope_sin_buf,
+            n_kv_heads, head_dim, start_pos, n_tokens,
+        );
+
+        // 5.5 Compress K and V into the polar cache at [start_pos, start_pos+n_tokens).
+        crate::layers::gpu_polar::compress_layer_into_polar(
+            &self.gpu, encoder, polar_cache, block_idx,
+            &scratch.k, &scratch.v, n_tokens, start_pos,
+        );
+
+        // 6a. rotate_q: scratch.q (RoPE-rotated, original space) → rotated_buf (compressed/rotated space).
+        crate::layers::gpu_polar::dispatch_rotate_q(
+            &self.gpu, encoder, &scratch.q, polar_cache.rotation_layer(block_idx), rotated_buf,
+            n_tokens, n_heads, head_dim,
+        );
+
+        // 6b. attn_score_polar_batch: rotated_buf · K_polar → scratch.scores
+        crate::layers::gpu_polar::dispatch_attn_score_polar_batch(
+            &self.gpu, encoder, rotated_buf,
+            polar_cache.k_angles_layer(block_idx),
+            polar_cache.k_radius_layer(block_idx),
+            &scratch.scores, polar_cache.lut_buffer(),
+            n_heads, n_kv_heads, head_dim, start_pos, n_tokens, attn_max_seq,
+        );
+
+        // 6c. (optional) capture pre-softmax scores
+        if let Some(capture_buf) = pre_softmax_capture {
+            let bytes = (n_tokens * n_heads * attn_max_seq * std::mem::size_of::<f32>()) as u64;
+            encoder.copy_buffer_to_buffer(&scratch.scores, 0, capture_buf, 0, bytes);
+        }
+
+        // 6d. softmax in-place on scratch.scores. Reuses the f32 path's softmax_batch
+        //     pipeline; same scores buffer layout.
+        let sm_params = SoftmaxBatchParams {
+            n_heads: n_heads as u32,
+            max_seq: attn_max_seq as u32,
+            start_pos: start_pos as u32,
+            n_tokens: n_tokens as u32,
+        };
+        let sm_params_buf = self.gpu.create_params_buffer(&sm_params);
+        let sm_pipeline = &self.gpu.pipelines.softmax_batch;
+        let sm_bind = self.gpu.make_bind_group(
+            sm_pipeline, &[&scratch.scores, &sm_params_buf],
+        );
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("gpu_engine.polar.softmax.pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(sm_pipeline);
+            pass.set_bind_group(0, &sm_bind, &[]);
+            pass.dispatch_workgroups((n_tokens * n_heads) as u32, 1, 1);
+        }
+
+        // 6e. attn_value_polar_batch: scratch.scores * V_polar → rotated_buf
+        //     (overwriting rq, no longer needed)
+        crate::layers::gpu_polar::dispatch_attn_value_polar_batch(
+            &self.gpu, encoder, &scratch.scores,
+            polar_cache.v_angles_layer(block_idx),
+            polar_cache.v_radius_layer(block_idx),
+            rotated_buf, polar_cache.lut_buffer(),
+            n_heads, n_kv_heads, head_dim, start_pos, n_tokens, attn_max_seq,
+        );
+
+        // 6f. derotate: rotated_buf → scratch.attn_out (apply R^T per (tok, head))
+        //     Treat (n_tokens * n_heads) as effective head count — R is per-layer.
+        crate::layers::gpu_polar::dispatch_derotate(
+            &self.gpu, encoder, rotated_buf,
+            polar_cache.rotation_layer(block_idx), &scratch.attn_out,
+            n_tokens * n_heads, head_dim,
+        );
+
+        // 7. O projection
+        self.dispatch_matmul_into(encoder, attn.o_proj(), &scratch.attn_out, &scratch.projected, n_tokens);
+
+        // 8. Residual
+        self.dispatch_add_into(encoder, hidden_buf, &scratch.projected, embed_dim, n_tokens);
+
+        // ===== FFN SUBLAYER (unchanged from f32 path) =====
+
+        self.dispatch_rmsnorm_into(
+            encoder, hidden_buf, &block_gpu.ffn_norm_weight_buf, &scratch.normed,
+            embed_dim, n_tokens, block_gpu.ffn_norm_eps,
+        );
+        self.dispatch_matmul_into(encoder, swiglu.gate_proj(), &scratch.normed, &scratch.gate, n_tokens);
+        self.dispatch_matmul_into(encoder, swiglu.up_proj(),   &scratch.normed, &scratch.up,   n_tokens);
+        self.dispatch_silu_mul_into(encoder, &scratch.gate, &scratch.up, &scratch.activated, intermediate, n_tokens);
+        self.dispatch_matmul_into(encoder, swiglu.down_proj(), &scratch.activated, &scratch.projected, n_tokens);
         self.dispatch_add_into(encoder, hidden_buf, &scratch.projected, embed_dim, n_tokens);
     }
 
@@ -2425,6 +2745,65 @@ mod tests {
         TransformerModel::new(embedding, blocks, final_norm, OutputProjection::Float(out_proj))
     }
 
+    /// Polar-compatible toy: same shape as `toy_float_multi_block_for_gpu`
+    /// but with `head_dim = 32` so PolarQuant has enough pairs (16) for
+    /// the radius averaging to be stable. head_dim=8 lands in PolarQuant's
+    /// pathologically-lossy regime (only 4 pairs → 22.5° per-pair angle
+    /// noise, single-vector radius averaging) and produces directional
+    /// agreement near 0.3, which doesn't usefully test correctness vs
+    /// noise.
+    fn toy_float_multi_block_for_gpu_polar(gpu: Arc<GpuDevice>, n_blocks: usize) -> TransformerModel {
+        use crate::layers::attention::MultiHeadAttention;
+        use crate::layers::ffn::FeedForward;
+        use crate::layers::gpu_floatlinear::GpuFloatLinear;
+        use crate::layers::model::OutputProjection;
+        use crate::layers::rmsnorm::RmsNorm;
+        use crate::layers::swiglu::SwiGLU;
+        use crate::layers::transformer::TransformerBlock;
+
+        let embed_dim = 32;
+        let n_heads = 1;
+        let head_dim = embed_dim;
+        let intermediate = 32;
+        let vocab_size = 4;
+
+        let mut rng: u64 = 0xABCD_1234;
+        let mut roll = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng >> 33) as i32 % 200 - 100) as f32 * 0.01
+        };
+        let mk_tensor = |rows: usize, cols: usize, roll: &mut dyn FnMut() -> f32| -> FloatTensor {
+            FloatTensor::new((0..rows * cols).map(|_| roll()).collect(), vec![rows, cols])
+        };
+        let mk_gpu = |rows: usize, cols: usize, roll: &mut dyn FnMut() -> f32| -> Box<dyn crate::layers::linear::LinearLayer> {
+            Box::new(GpuFloatLinear::from_float_tensor(gpu.clone(), mk_tensor(rows, cols, roll)))
+        };
+
+        let embedding = mk_tensor(vocab_size, embed_dim, &mut roll);
+
+        let mut blocks = Vec::with_capacity(n_blocks);
+        for _ in 0..n_blocks {
+            let q = mk_gpu(embed_dim, embed_dim, &mut roll);
+            let k = mk_gpu(embed_dim, embed_dim, &mut roll);
+            let v = mk_gpu(embed_dim, embed_dim, &mut roll);
+            let o = mk_gpu(embed_dim, embed_dim, &mut roll);
+            let attention = MultiHeadAttention::with_rope_layout(
+                q, k, v, o, n_heads, n_heads, head_dim, 10000.0,
+                crate::layers::rope::RoPELayout::Halved,
+            );
+            let gate = mk_gpu(intermediate, embed_dim, &mut roll);
+            let up   = mk_gpu(intermediate, embed_dim, &mut roll);
+            let down = mk_gpu(embed_dim, intermediate, &mut roll);
+            let ffn: Box<dyn FeedForward> = Box::new(SwiGLU::new(gate, up, down));
+            let attn_norm = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
+            let ffn_norm = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
+            blocks.push(TransformerBlock::new(attn_norm, attention, ffn_norm, ffn));
+        }
+        let final_norm = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
+        let out_proj = mk_tensor(vocab_size, embed_dim, &mut roll);
+        TransformerModel::new(embedding, blocks, final_norm, OutputProjection::Float(out_proj))
+    }
+
     /// CPU-equivalent multi-block model with the same seeded weights.
     fn toy_float_multi_block_cpu(n_blocks: usize) -> TransformerModel {
         use crate::layers::attention::MultiHeadAttention;
@@ -2729,6 +3108,98 @@ mod tests {
         // Cache must NOT have advanced.
         assert_eq!(cache.seq_len(), shard_tokens.len(),
             "forward_full_gpu_with_cache_traced should not advance the cache");
+    }
+
+    /// Load-bearing phase 2c.5b test: end-to-end polar trace forward.
+    ///
+    /// Compare:
+    ///   A) prefill shard tokens into f32 cache, then
+    ///      forward_full_gpu_with_cache_traced (existing f32 path)
+    ///   B) prefill shard tokens into f32 cache, convert to polar via
+    ///      populate_from_f32_cache_gpu, then forward_full_gpu_polar_traced
+    ///      (new polar path)
+    ///
+    /// Both paths run the same model on the same query against the same
+    /// underlying K/V data; the only difference is the polar quantization
+    /// in path B. Per-layer pre-softmax scores at query positions should
+    /// agree by cosine similarity (PolarQuant is lossy, so we check
+    /// directional agreement, not numeric equality). This is the
+    /// load-bearing test that the polar attention chain in each block is
+    /// computing what a polar-attention forward should compute.
+    #[test]
+    fn polar_traced_matches_f32_traced_directionally() {
+        use crate::layers::gpu_kv_cache::GpuKvCache;
+        use crate::layers::gpu_polar_kv_cache::GpuPolarKvCache;
+
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        // head_dim=8 polar-compat fixture (toy_float_multi_block_for_gpu's
+        // head_dim=4 doesn't satisfy the polar shader's head_dim%8==0).
+        let gpu_model = toy_float_multi_block_for_gpu_polar(gpu.clone(), 2);
+        let attn0 = gpu_model.blocks()[0].attention();
+        let n_layers = gpu_model.n_layers();
+        let n_heads = attn0.n_heads();
+        let n_kv_heads = attn0.n_kv_heads();
+        let head_dim = attn0.head_dim();
+
+        let engine = GpuEngine::with_max_seq(gpu_model, gpu.clone(), 16);
+
+        let shard_tokens = vec![1u32, 2, 3];
+        let query_tokens = vec![0u32, 1];
+        let capture_layers: Vec<usize> = (0..n_layers).collect();
+
+        // Path A: f32 prefill + f32 traced forward.
+        let mut f32_cache = GpuKvCache::new(gpu.clone(), n_layers, n_kv_heads, head_dim, 16);
+        let _ = engine.forward_full_gpu_with_cache(&shard_tokens, &mut f32_cache);
+        assert_eq!(f32_cache.seq_len(), shard_tokens.len());
+        let f32_scores = engine.forward_full_gpu_with_cache_traced(
+            &query_tokens, &f32_cache, &capture_layers,
+        );
+
+        // Path B: convert f32→polar on GPU, then polar traced forward.
+        let mut polar_cache = GpuPolarKvCache::new(
+            gpu.clone(), n_layers, n_kv_heads, head_dim, /*max_seq*/ 16, /*seed_base*/ 42,
+        );
+        polar_cache.populate_from_f32_cache_gpu(&f32_cache);
+        assert_eq!(polar_cache.seq_len(), shard_tokens.len());
+        let polar_scores = engine.forward_full_gpu_polar_traced(
+            &query_tokens, &polar_cache, &capture_layers,
+        );
+
+        // Cache must NOT have advanced (mirrors f32 trace semantics).
+        assert_eq!(polar_cache.seq_len(), shard_tokens.len(),
+            "forward_full_gpu_polar_traced should not advance the cache");
+
+        // Per-layer cosine similarity of valid (causally-unmasked) score
+        // rows. Each layer captures [n_query, n_heads, max_seq] scores;
+        // for query token q, valid positions are [0, shard_len + q + 1).
+        let n_query = query_tokens.len();
+        let max_seq = shard_tokens.len() + n_query;
+        for layer in 0..n_layers {
+            for q in 0..n_query {
+                for h in 0..n_heads {
+                    let row_off = q * n_heads * max_seq + h * max_seq;
+                    let valid_len = shard_tokens.len() + q + 1;
+                    let f_row = &f32_scores[layer][row_off..row_off + valid_len];
+                    let p_row = &polar_scores[layer][row_off..row_off + valid_len];
+
+                    let dot: f32 = f_row.iter().zip(p_row).map(|(&a, &b)| a * b).sum();
+                    let na: f32 = f_row.iter().map(|&x| x * x).sum::<f32>().sqrt();
+                    let nb: f32 = p_row.iter().map(|&x| x * x).sum::<f32>().sqrt();
+                    let cos = dot / (na * nb).max(1e-12);
+
+                    // PolarQuant is lossy; agreement is directional, not
+                    // exact. Worst rows in this fixture land around 0.5 —
+                    // pin a 0.4 floor to catch sign-flips / dimension
+                    // shuffles, the failure modes that actually matter.
+                    assert!(
+                        cos > 0.4,
+                        "layer {layer} q {q} h {h}: cos={cos:.4} below 0.4 floor",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
