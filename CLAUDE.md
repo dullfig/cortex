@@ -201,9 +201,24 @@ Run all: `cargo test --workspace`
       end-to-end on Qwen 2.5-3B: identity steer (zero delta)
       produces baseline output byte-for-byte; +5 across all dims
       shifts generation completely (`pinky/tools/steer_smoke_test.sh`)
-- [ ] Shim phase dispatch — injection (#6c): residual-add at
-      `entrance:N` via `pre_block_hidden_inject` parameter on
-      `forward_block_gpu_inner`; sum composition (commutative)
+- [x] Shim phase dispatch — injection (#6c): residual-add at
+      block entrance (`entrance:N` or `entrance:all`) via
+      `pre_block_hidden_inject` parameter on `forward_block_gpu_inner`
+      and the polar variant. New `add_broadcast_batch.wgsl` shader
+      adds a `[embed_dim]` delta to every token's row of `[n_tokens,
+      embed_dim]` hidden in place — same buffer works for prefill
+      (n_tokens=prompt_len) and decode (n_tokens=1). New
+      `forward_full_gpu_with_cache_inject_returning_hidden` (and the
+      logits-returning variant) thread per-layer inject deltas
+      through every block. Composition is sum (commutative,
+      order-independent per spec). v1 limit: inject + cache_shards
+      reject (cached inject is a follow-up). Validated end-to-end
+      on Qwen 2.5-3B: identity_inject (zero delta, entrance:all)
+      produces baseline byte-for-byte; noise_inject (0.1*input,
+      entrance:0) shifts generation completely
+      (`pinky/tools/inject_smoke_test.sh`). All three shim phases
+      now compose: gate decides silence, inject shapes forward,
+      steer shapes per-token logits
 - [ ] QJL correction on V dequant (currently K-only) to close the cosine-
       similarity gap on attention output (PolarQuant alone hits ~0.84)
 - [ ] Bit-pack 3-bit angle representation (u8 → 3-bits, ~12x compression)

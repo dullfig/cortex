@@ -625,7 +625,7 @@ impl GpuEngine {
         });
         for i in 0..n_layers {
             let capture = capture_lookup.get(&i).copied();
-            self.forward_block_gpu_inner(&mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch, capture, None, None);
+            self.forward_block_gpu_inner(&mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch, capture, None, None, None);
         }
         self.dispatch_rmsnorm_into(
             &mut encoder, &hidden_buf, &self.final_norm_weight_buf, &normed_buf,
@@ -778,6 +778,7 @@ impl GpuEngine {
             self.forward_block_gpu_inner(
                 &mut encoder, i, &hidden_buf, n_tokens, /*start_pos*/ 0, &scratch,
                 /*pre_softmax_capture*/ None, /*kv_cache_target*/ None, post_capture,
+                /*pre_block_hidden_inject*/ None,
             );
         }
         // Final RMSNorm — gives the final post-norm hidden state shims read.
@@ -938,7 +939,7 @@ impl GpuEngine {
             let target = (cache.k_layer(i), cache.v_layer(i));
             self.forward_block_gpu_inner(
                 &mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch,
-                capture, Some(target), None,
+                capture, Some(target), None, None,
             );
         }
         // Skip final_norm + output projection — retrieval doesn't need
@@ -1081,7 +1082,7 @@ impl GpuEngine {
             let capture = capture_lookup.get(&i).copied();
             self.forward_block_gpu_polar_inner(
                 &mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch,
-                &rotated_buf, polar_cache, capture, None,
+                &rotated_buf, polar_cache, capture, None, None,
             );
         }
         // Skip final_norm + output projection — retrieval doesn't need logits.
@@ -1134,7 +1135,25 @@ impl GpuEngine {
         cache: &mut crate::layers::gpu_kv_cache::GpuKvCache,
     ) -> Vec<f32> {
         let n_tokens = tokens.len();
-        let normed = self.forward_full_gpu_with_cache_returning_hidden(tokens, cache);
+        let normed = self.forward_full_gpu_with_cache_inject_returning_hidden(tokens, cache, &[]);
+        self.cpu.finalize_logits(&normed, n_tokens)
+    }
+
+    /// `forward_full_gpu_with_cache` plus injection-phase deltas.
+    /// `inject_deltas` is either empty (no injection) or has length
+    /// `n_layers()` with `Some(buf)` for each layer that carries a
+    /// summed `[embed_dim]` f32 hidden_delta. Each present buffer is
+    /// broadcast-added into hidden at that block's entrance.
+    pub fn forward_full_gpu_with_cache_inject(
+        &self,
+        tokens: &[u32],
+        cache: &mut crate::layers::gpu_kv_cache::GpuKvCache,
+        inject_deltas: &[Option<wgpu::Buffer>],
+    ) -> Vec<f32> {
+        let n_tokens = tokens.len();
+        let normed = self.forward_full_gpu_with_cache_inject_returning_hidden(
+            tokens, cache, inject_deltas,
+        );
         self.cpu.finalize_logits(&normed, n_tokens)
     }
 
@@ -1154,6 +1173,27 @@ impl GpuEngine {
         &self,
         tokens: &[u32],
         cache: &mut crate::layers::gpu_kv_cache::GpuKvCache,
+    ) -> Vec<f32> {
+        self.forward_full_gpu_with_cache_inject_returning_hidden(tokens, cache, &[])
+    }
+
+    /// Inject-aware variant of `forward_full_gpu_with_cache_returning_hidden`.
+    /// `inject_deltas` is either empty (no injection — same path as the
+    /// no-inject variant) or has length `n_layers()` with `Some(buf)` for
+    /// each layer that carries a [embed_dim] f32 hidden_delta. Each
+    /// present buffer is broadcast-added into hidden BEFORE that block's
+    /// attn_norm, every forward step (prefill + decode).
+    ///
+    /// The chat handler (cortex-cloud) computes injection deltas once
+    /// per request (running each injection shim against the prompt's
+    /// prefill hidden), uploads each summed per-layer delta via
+    /// `upload_f32_to_storage`, then threads the same `inject_deltas`
+    /// slice through every prefill / decode call for the request.
+    pub fn forward_full_gpu_with_cache_inject_returning_hidden(
+        &self,
+        tokens: &[u32],
+        cache: &mut crate::layers::gpu_kv_cache::GpuKvCache,
+        inject_deltas: &[Option<wgpu::Buffer>],
     ) -> Vec<f32> {
         let n_tokens = tokens.len();
         assert!(n_tokens > 0, "must have at least one token");
@@ -1214,11 +1254,21 @@ impl GpuEngine {
         let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("forward_with_cache.encoder"),
         });
+        // Inject deltas: empty slice means no injection (same path as
+        // before); non-empty must be exactly n_layers long with
+        // Some(buf) for layers that carry a delta.
+        if !inject_deltas.is_empty() {
+            assert_eq!(
+                inject_deltas.len(), n_layers,
+                "inject_deltas must be empty or have length n_layers ({})", n_layers,
+            );
+        }
         for i in 0..n_layers {
             let target = (cache.k_layer(i), cache.v_layer(i));
+            let inject = inject_deltas.get(i).and_then(|opt| opt.as_ref());
             self.forward_block_gpu_inner(
                 &mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch,
-                None, Some(target), None,
+                None, Some(target), None, inject,
             );
         }
         self.dispatch_rmsnorm_into(
@@ -1344,7 +1394,7 @@ impl GpuEngine {
         start_pos: usize,
         scratch: &BlockScratch,
     ) {
-        self.forward_block_gpu_inner(encoder, block_idx, hidden_buf, n_tokens, start_pos, scratch, None, None, None);
+        self.forward_block_gpu_inner(encoder, block_idx, hidden_buf, n_tokens, start_pos, scratch, None, None, None, None);
     }
 
     /// Same as `forward_block_gpu` but with optional pre-softmax score
@@ -1378,10 +1428,23 @@ impl GpuEngine {
         pre_softmax_capture: Option<&wgpu::Buffer>,
         kv_cache_target: Option<(&wgpu::Buffer, &wgpu::Buffer)>,
         post_block_hidden_capture: Option<&wgpu::Buffer>,
+        pre_block_hidden_inject: Option<&wgpu::Buffer>,
     ) {
         let block = &self.cpu.blocks()[block_idx];
         let block_gpu = &self.blocks_gpu[block_idx];
         let attn = block.attention();
+
+        // Injection-phase hook (#6c). Broadcast-add a [embed_dim] delta
+        // into every token's hidden BEFORE this block's attn_norm. Deltas
+        // for `entrance:N` shims are computed once per request (caller's
+        // responsibility) and applied here at every forward step.
+        // Composition is sum (commutative, order-independent — the
+        // caller pre-sums multiple shims targeting the same layer).
+        if let Some(delta_buf) = pre_block_hidden_inject {
+            self.dispatch_add_broadcast_into(
+                encoder, hidden_buf, delta_buf, self.embed_dim, n_tokens,
+            );
+        }
 
         assert!(attn.o_sub_norm().is_none(),
             "forward_block_gpu does not support attention sub-norm yet (BitNet)");
@@ -1534,10 +1597,20 @@ impl GpuEngine {
         polar_cache: &crate::layers::gpu_polar_kv_cache::GpuPolarKvCache,
         pre_softmax_capture: Option<&wgpu::Buffer>,
         post_block_hidden_capture: Option<&wgpu::Buffer>,
+        pre_block_hidden_inject: Option<&wgpu::Buffer>,
     ) {
         let block = &self.cpu.blocks()[block_idx];
         let block_gpu = &self.blocks_gpu[block_idx];
         let attn = block.attention();
+
+        // Injection-phase hook (#6c). See forward_block_gpu_inner for
+        // full discussion — same broadcast-add semantics, just on the
+        // polar attention path.
+        if let Some(delta_buf) = pre_block_hidden_inject {
+            self.dispatch_add_broadcast_into(
+                encoder, hidden_buf, delta_buf, self.embed_dim, n_tokens,
+            );
+        }
 
         assert!(attn.o_sub_norm().is_none(),
             "forward_block_gpu_polar does not support attention sub-norm yet");
@@ -2132,6 +2205,53 @@ impl GpuEngine {
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(groups, 1, 1);
+    }
+
+    /// Broadcast in-place add: every row of `a` ([n_tokens, n]) gets the
+    /// same `delta` ([n]) added. Used by injection-phase shims (#6c) —
+    /// one [embed_dim] delta is computed per request and applied at the
+    /// chosen layer's entrance during every forward step (n_tokens=1
+    /// during decode, prompt_len during prefill).
+    pub fn dispatch_add_broadcast_into(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        a_buf: &wgpu::Buffer,
+        delta_buf: &wgpu::Buffer,
+        n: usize,
+        n_tokens: usize,
+    ) {
+        let params = AddInplaceBatchParams { n: n as u32, n_tokens: n_tokens as u32 };
+        let params_buf = self.gpu.create_params_buffer(&params);
+
+        let pipeline = &self.gpu.pipelines.add_broadcast_batch;
+        let bind = self.gpu.make_bind_group(
+            pipeline,
+            &[a_buf, delta_buf, &params_buf],
+        );
+
+        let total = (n * n_tokens) as u32;
+        let groups = (total + 255) / 256;
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_engine.add_broadcast.pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(groups, 1, 1);
+    }
+
+    /// Upload an f32 slice to a GPU storage buffer. Used by callers
+    /// (cortex-cloud) to materialize injection-phase hidden_delta
+    /// vectors as resident buffers before threading them through
+    /// `forward_full_gpu_with_cache_inject_returning_hidden`.
+    pub fn upload_f32_to_storage(&self, data: &[f32], label: &str) -> wgpu::Buffer {
+        use wgpu::util::DeviceExt;
+        self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytemuck::cast_slice(data),
+            usage: wgpu::BufferUsages::STORAGE,
+        })
     }
 
     /// Convenience wrapper around `dispatch_matvec_into`: allocates input

@@ -71,3 +71,10 @@ pub use layers::trace::ForwardTrace;
 pub use layers::transformer::FfnInjector;
 #[cfg(feature = "memory")]
 pub use layers::engram_memory::EngramMemory;
+
+// Re-export the wgpu crate so downstream crates (cortex-cloud) can
+// reference `wgpu::Buffer` and friends without a separate dependency
+// declaration. Only available when the gpu feature is enabled (which
+// it is by default).
+#[cfg(feature = "gpu")]
+pub use wgpu;

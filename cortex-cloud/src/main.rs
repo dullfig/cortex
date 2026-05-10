@@ -27,6 +27,7 @@ use tokio::sync::Mutex;
 use tracing::info;
 
 use cortex::layers::gpu_engine::{GpuEngine, HiddenCaptures};
+use cortex::wgpu;
 use cortex::layers::gpu_kv_cache::GpuKvCache;
 use cortex::layers::sampler::{Sampler, SamplerConfig};
 use cortex::{ForwardTrace, ModelConfig, Tokenizer};
@@ -293,15 +294,18 @@ impl GateOutcome {
     }
 
     /// Build the response-metadata JSON value emitted on `done`.
-    /// `active_steers` is filled by the caller (after rule overrides
-    /// are reconciled with the request's `steer_shims` default), so
-    /// metadata reflects what *actually* shaped generation, not just
-    /// what the rule asked for.
-    fn to_metadata(&self, active_steers: &[String]) -> serde_json::Value {
+    /// `active_steers` and `active_inject` are filled by the caller
+    /// so metadata reflects what *actually* shaped generation.
+    fn to_metadata_with_inject(
+        &self,
+        active_steers: &[String],
+        active_inject: &[String],
+    ) -> serde_json::Value {
         let signals: Vec<&String> = self.signal().into_iter().collect();
         serde_json::json!({
             "gate_decisions": self.decisions,
             "active_steers": active_steers,
+            "active_inject": active_inject,
             "signals": signals,
             "gate_prefill_ms": self.gate_prefill_ms,
             "ort_ms_per_shim": self.ort_ms_per_shim,
@@ -309,83 +313,81 @@ impl GateOutcome {
     }
 }
 
-/// Run all gate shims against a single shared prefill capture, then
-/// evaluate shim_rules to produce the dispatch action. Errors map to
-/// HTTP responses suitable for both streaming and non-streaming paths.
-///
-/// Constraints (rejected with 400 / 404 if violated):
-/// - Each gate shim must be registered (404 shim_not_found).
-/// - Each gate shim must have manifest.phase == "gate" (400 wrong_phase).
-/// - Returns Ok with default action when gate_shims is empty.
-async fn run_gate_shims_and_rules(
+/// Resolve gate shim IDs against the registry and validate phase=gate.
+/// Returns the resolved shims paired with their original IDs (for
+/// metadata reporting). Errors map to 404/400. Empty input returns
+/// empty result.
+async fn resolve_gate_shims(
     state: &Arc<ServerState>,
-    prompt_tokens: &[u32],
-    gate_shims: &[String],
-    shim_rules: &[ShimRule],
-) -> Result<GateOutcome, (StatusCode, Json<serde_json::Value>)> {
-    if gate_shims.is_empty() {
-        return Ok(GateOutcome {
-            decisions: HashMap::new(),
-            gate_prefill_ms: 0,
-            ort_ms_per_shim: HashMap::new(),
-            matched: None,
-        });
-    }
-
-    // Resolve every gate shim against the registry up front so a 404
-    // returns *before* we burn a prefill on a typo'd shim_id.
-    let resolved: Vec<(String, Arc<RegisteredShim>)> = {
-        let shims = state.shims.lock().await;
-        let mut out = Vec::with_capacity(gate_shims.len());
-        for id in gate_shims {
-            let shim = shims.get(id).cloned().ok_or_else(|| (
-                StatusCode::NOT_FOUND,
+    gate_ids: &[String],
+) -> Result<Vec<(String, Arc<RegisteredShim>)>, (StatusCode, Json<serde_json::Value>)> {
+    if gate_ids.is_empty() { return Ok(Vec::new()); }
+    let shims = state.shims.lock().await;
+    let mut out = Vec::with_capacity(gate_ids.len());
+    for id in gate_ids {
+        let shim = shims.get(id).cloned().ok_or_else(|| (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "shim_not_found",
+                    "message": format!("gate shim '{id}' not registered"),
+                    "shim_id": id,
+                }
+            })),
+        ))?;
+        if shim.manifest.phase != "gate" {
+            return Err((
+                StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
                     "error": {
-                        "type": "shim_not_found",
-                        "message": format!("gate shim '{id}' not registered"),
+                        "type": "wrong_phase",
+                        "message": format!(
+                            "shim '{}' has phase='{}', not 'gate' (gate_shims requires gate-phase shims)",
+                            id, shim.manifest.phase),
                         "shim_id": id,
                     }
                 })),
-            ))?;
-            if shim.manifest.phase != "gate" {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": {
-                            "type": "wrong_phase",
-                            "message": format!(
-                                "shim '{}' has phase='{}', not 'gate' (gate_shims requires gate-phase shims)",
-                                id, shim.manifest.phase),
-                            "shim_id": id,
-                        }
-                    })),
-                ));
-            }
-            out.push((id.clone(), shim));
+            ));
         }
-        out
-    };
+        // v1 gate shims read the final post-norm pooled hidden — no
+        // per-block intermediate capture is wired for gate dispatch.
+        if shim.manifest.attachment.layer != "final" {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "type": "unsupported",
+                        "message": format!(
+                            "v1 gate requires attachment.layer='final'; shim '{}' has '{}'",
+                            id, shim.manifest.attachment.layer),
+                        "shim_id": id,
+                    }
+                })),
+            ));
+        }
+        out.push((id.clone(), shim));
+    }
+    Ok(out)
+}
 
-    // One shared forward → all gate shims read the same final hidden.
-    // This is the "fused gate" property from the v1 spec: the prefill
-    // *is* the work that computes the gate's input.
-    let prefill_start = Instant::now();
-    let hc = tokio::task::block_in_place(|| {
-        state.engine.forward_full_gpu_with_hidden_capture(prompt_tokens, &[])
-    });
-    let gate_prefill_ms = prefill_start.elapsed().as_millis() as u64;
-
+/// Run gate shims against an already-computed hidden capture and
+/// evaluate shim_rules. Pulled out of `run_gate_shims_and_rules` so the
+/// prefill can be shared with injection (#6c) — both gate and inject
+/// shims read the same prompt-final hidden.
+async fn run_gate_shims_against_hc(
+    resolved: &[(String, Arc<RegisteredShim>)],
+    hc: &HiddenCaptures,
+    shim_rules: &[ShimRule],
+    gate_prefill_ms: u64,
+) -> Result<GateOutcome, (StatusCode, Json<serde_json::Value>)> {
     let mut decisions = HashMap::new();
     let mut ort_ms_per_shim = HashMap::new();
-    for (id, shim) in &resolved {
-        let result = run_shim_against_hidden(shim, &hc).await?;
+    for (id, shim) in resolved {
+        let result = run_shim_against_hidden(shim, hc).await?;
         ort_ms_per_shim.insert(id.clone(), result.ort_ms);
         decisions.insert(id.clone(), result.decision);
     }
-
     let matched = evaluate_shim_rules(shim_rules, &decisions);
-
     Ok(GateOutcome {
         decisions,
         gate_prefill_ms,
@@ -526,6 +528,182 @@ async fn resolve_steer_shims(
 /// would be transient (e.g. an ort internal allocation hiccup);
 /// panics are acceptable in v1 because they bubble up to the
 /// spawn_blocking JoinError or block_in_place caller cleanly.
+/// Where an injection-phase shim's `hidden_delta` output should be
+/// broadcast-added during forward. v1 supports two attachment forms.
+#[derive(Debug, Clone, Copy)]
+enum InjectAttachment {
+    /// Add at this single layer's entrance, every forward step.
+    EntranceN(usize),
+    /// Add at every layer's entrance, every forward step.
+    EntranceAll,
+}
+
+impl InjectAttachment {
+    fn parse(layer: &str, n_layers: usize) -> Option<Self> {
+        if layer == "entrance:all" {
+            return Some(Self::EntranceAll);
+        }
+        if let Some(rest) = layer.strip_prefix("entrance:") {
+            if let Ok(n) = rest.parse::<usize>() {
+                if n < n_layers {
+                    return Some(Self::EntranceN(n));
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Resolve injection shim IDs against the registry and validate v1
+/// shape (phase=injection, attachment.layer parses as entrance:N or
+/// entrance:all with N < n_layers, output_shape.kind=hidden_delta,
+/// hidden_dim matches embed_dim). Returns each shim paired with its
+/// parsed attachment so the caller can route the delta to the right
+/// layer(s).
+async fn resolve_inject_shims(
+    state: &Arc<ServerState>,
+    inject_ids: &[String],
+) -> Result<Vec<(Arc<RegisteredShim>, InjectAttachment)>, (StatusCode, Json<serde_json::Value>)> {
+    if inject_ids.is_empty() { return Ok(Vec::new()); }
+    let n_layers = state.engine.n_layers();
+    let embed_dim = state.engine.embed_dim();
+    let shims = state.shims.lock().await;
+    let mut out = Vec::with_capacity(inject_ids.len());
+    for id in inject_ids {
+        let shim = shims.get(id).cloned().ok_or_else(|| (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "shim_not_found",
+                    "message": format!("inject shim '{id}' not registered"),
+                    "shim_id": id,
+                }
+            })),
+        ))?;
+        let m = &shim.manifest;
+        if m.phase != "injection" {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "type": "wrong_phase",
+                        "message": format!("shim '{id}' has phase='{}', not 'injection'", m.phase),
+                        "shim_id": id,
+                    }
+                })),
+            ));
+        }
+        let attach = InjectAttachment::parse(&m.attachment.layer, n_layers).ok_or_else(|| (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "unsupported",
+                    "message": format!(
+                        "v1 injection requires attachment.layer='entrance:N' (N<{n_layers}) or 'entrance:all'; shim '{id}' has '{}'",
+                        m.attachment.layer),
+                    "shim_id": id,
+                }
+            })),
+        ))?;
+        let in_dim = m.input_shape.get("hidden_dim")
+            .and_then(|v| v.as_u64()).map(|n| n as usize)
+            .ok_or_else(|| (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "type": "invalid_manifest",
+                        "message": format!("inject shim '{id}': input_shape.hidden_dim missing"),
+                        "shim_id": id,
+                    }
+                })),
+            ))?;
+        if in_dim != embed_dim {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "type": "shape_mismatch",
+                        "message": format!(
+                            "inject shim '{id}': input_shape.hidden_dim={in_dim} != model embed_dim={embed_dim}"),
+                        "shim_id": id,
+                    }
+                })),
+            ));
+        }
+        let kind = m.output_shape.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        if kind != "hidden_delta" {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "type": "unsupported",
+                        "message": format!(
+                            "v1 injection requires output_shape.kind='hidden_delta'; shim '{id}' has '{kind}'"),
+                        "shim_id": id,
+                    }
+                })),
+            ));
+        }
+        out.push((shim, attach));
+    }
+    Ok(out)
+}
+
+/// Run each injection shim against the shared prompt prefill hidden,
+/// sum deltas per layer (composition is sum — commutative,
+/// order-independent per spec), upload one wgpu buffer per non-empty
+/// layer. Returns a Vec<Option<wgpu::Buffer>> of length n_layers
+/// suitable for `forward_full_gpu_with_cache_inject_returning_hidden`,
+/// or empty Vec when no shims resolved.
+async fn compute_inject_deltas(
+    state: &Arc<ServerState>,
+    resolved: &[(Arc<RegisteredShim>, InjectAttachment)],
+    hc: &HiddenCaptures,
+) -> Result<Vec<Option<wgpu::Buffer>>, (StatusCode, Json<serde_json::Value>)> {
+    if resolved.is_empty() { return Ok(Vec::new()); }
+    let n_layers = state.engine.n_layers();
+    let embed_dim = state.engine.embed_dim();
+
+    let mut sums: Vec<Option<Vec<f32>>> = vec![None; n_layers];
+    for (shim, attach) in resolved {
+        let result = run_shim_against_hidden(shim, hc).await?;
+        if result.raw_output.len() != embed_dim {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": {
+                        "type": "shape_mismatch",
+                        "message": format!(
+                            "inject shim '{}' produced {} values, expected embed_dim={embed_dim}",
+                            shim.manifest.id, result.raw_output.len()),
+                    }
+                })),
+            ));
+        }
+        let target_layers: Vec<usize> = match attach {
+            InjectAttachment::EntranceN(n) => vec![*n],
+            InjectAttachment::EntranceAll => (0..n_layers).collect(),
+        };
+        for layer in target_layers {
+            match sums[layer].as_mut() {
+                Some(existing) => {
+                    for (a, b) in existing.iter_mut().zip(result.raw_output.iter()) {
+                        *a += *b;
+                    }
+                }
+                None => sums[layer] = Some(result.raw_output.clone()),
+            }
+        }
+    }
+
+    let buffers: Vec<Option<wgpu::Buffer>> = sums.into_iter().enumerate().map(|(i, opt)| {
+        opt.map(|v| state.engine.upload_f32_to_storage(
+            &v, &format!("inject.layer{i}"),
+        ))
+    }).collect();
+    Ok(buffers)
+}
+
 fn apply_steers_inplace(
     steers: &[Arc<RegisteredShim>],
     hidden: &mut [f32],
@@ -1043,13 +1221,16 @@ fn generate_with_cache(
     out
 }
 
-/// Stateless steer-aware generation. Each forward returns hidden state
-/// (no LM-head projection on GPU), then steers add `hidden_delta` to
-/// the last token's slice in declared order, then the LM head runs on
-/// the modified hidden via `cpu().finalize_logits(slice, 1)`. Sample,
-/// emit, repeat. Used only when active_steers is non-empty —
-/// no-steer paths still go through the cheaper `engine.generate()`.
-fn generate_stateless_with_steers(
+/// Stateless GPU generation with optional steer + inject support.
+/// Used whenever either set is non-empty — pure plain chat (no shims)
+/// stays on the cheaper `engine.generate()` CPU path.
+///
+/// Per token: forward (with inject deltas applied at chosen layer
+/// entrances), apply steers in declared order to the last token's
+/// hidden, re-project on CPU, sample. Steers modify hidden after
+/// inject has shaped the forward — order matches the v1 spec's
+/// inject-then-gate-then-steer pipeline.
+fn generate_stateless_gpu(
     engine: &GpuEngine,
     prompt_tokens: &[u32],
     sampler_config: SamplerConfig,
@@ -1058,21 +1239,33 @@ fn generate_stateless_with_steers(
     max_tokens: usize,
     max_seq_len: usize,
     steers: &[Arc<RegisteredShim>],
+    inject_deltas: &[Option<wgpu::Buffer>],
 ) -> Vec<u32> {
     let mut cache = engine.create_gpu_kv_cache(max_seq_len);
     let mut sampler = Sampler::new(sampler_config, seed);
     let embed_dim = engine.embed_dim();
+    let has_steers = !steers.is_empty();
 
-    // Prefill: get [n_prompt * embed_dim] hidden, take the last token's
-    // slice, apply steers, project to logits, sample.
-    let mut prefill_hidden = engine.forward_full_gpu_with_cache_returning_hidden(
-        prompt_tokens, &mut cache,
-    );
-    let last_off = (prompt_tokens.len() - 1) * embed_dim;
-    let last_slice = &mut prefill_hidden[last_off..last_off + embed_dim];
-    apply_steers_inplace(steers, last_slice);
-    let last_logits = engine.cpu().finalize_logits(last_slice, 1);
-    let mut next_token = sampler.sample(&last_logits);
+    // Prefill: get [n_prompt * embed_dim] hidden (with inject), take
+    // last token's slice, apply steers (if any), project, sample.
+    let mut next_token = if has_steers {
+        let mut prefill_hidden = engine.forward_full_gpu_with_cache_inject_returning_hidden(
+            prompt_tokens, &mut cache, inject_deltas,
+        );
+        let last_off = (prompt_tokens.len() - 1) * embed_dim;
+        let last_slice = &mut prefill_hidden[last_off..last_off + embed_dim];
+        apply_steers_inplace(steers, last_slice);
+        let last_logits = engine.cpu().finalize_logits(last_slice, 1);
+        sampler.sample(&last_logits)
+    } else {
+        // Inject-only: forward already projects logits internally.
+        let prefill_logits = engine.forward_full_gpu_with_cache_inject(
+            prompt_tokens, &mut cache, inject_deltas,
+        );
+        let vocab = engine.vocab_size();
+        let last_off = (prompt_tokens.len() - 1) * vocab;
+        sampler.sample(&prefill_logits[last_off..last_off + vocab])
+    };
 
     let mut out: Vec<u32> = Vec::new();
     if next_token == eos {
@@ -1080,14 +1273,18 @@ fn generate_stateless_with_steers(
     }
     out.push(next_token);
 
-    // Decode loop: each forward returns [embed_dim] for the single new
-    // token; steers mutate it; logits re-projected; sample.
     for _ in 1..max_tokens {
-        let mut hidden = engine.forward_full_gpu_with_cache_returning_hidden(
-            &[next_token], &mut cache,
-        );
-        apply_steers_inplace(steers, &mut hidden);
-        let logits = engine.cpu().finalize_logits(&hidden, 1);
+        let logits = if has_steers {
+            let mut hidden = engine.forward_full_gpu_with_cache_inject_returning_hidden(
+                &[next_token], &mut cache, inject_deltas,
+            );
+            apply_steers_inplace(steers, &mut hidden);
+            engine.cpu().finalize_logits(&hidden, 1)
+        } else {
+            engine.forward_full_gpu_with_cache_inject(
+                &[next_token], &mut cache, inject_deltas,
+            )
+        };
         next_token = sampler.sample(&logits);
         if next_token == eos {
             break;
@@ -1158,9 +1355,80 @@ async fn chat_completions(
         ));
     }
 
-    let gate_outcome = run_gate_shims_and_rules(
-        &state, &prompt_tokens, &req.gate_shims, &req.shim_rules,
-    ).await?;
+    // Inject-phase v1 limits (rejected before any GPU work):
+    //  - inject_shims requires --enable-shims (same as gate)
+    //  - inject_shims is incompatible with cache_shards/cache_id and
+    //    with mode=retrieve (cached / retrieve injection variants
+    //    are follow-ups)
+    let inject_with_cache = !req.inject_shims.is_empty()
+        && (req.cache_shards.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
+            || req.cache_id.is_some());
+    if inject_with_cache {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "unsupported",
+                    "message": "inject_shims with cache_shards / cache_id is a planned follow-up.",
+                }
+            })),
+        ));
+    }
+    if !req.inject_shims.is_empty() && req.mode.as_deref() == Some("retrieve") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "unsupported",
+                    "message": "inject_shims is not supported with mode='retrieve'.",
+                }
+            })),
+        ));
+    }
+    if !req.inject_shims.is_empty() && !state.shims_enabled {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "feature_disabled",
+                    "message": "inject_shims requires --enable-shims",
+                }
+            })),
+        ));
+    }
+
+    // Resolve gate + inject shims against the registry up front so a
+    // bad shim_id 404s before we burn a prefill.
+    let resolved_gate_shims = resolve_gate_shims(&state, &req.gate_shims).await?;
+    let resolved_inject_shims = resolve_inject_shims(&state, &req.inject_shims).await?;
+
+    // Shared prefill: gate and inject both read the prompt's final
+    // post-norm hidden. Skip the prefill entirely when neither set
+    // has shims (preserves the existing fast path for plain chat).
+    let need_hc = !resolved_gate_shims.is_empty() || !resolved_inject_shims.is_empty();
+    let (hc, gate_prefill_ms) = if need_hc {
+        let prefill_start = Instant::now();
+        let hc = tokio::task::block_in_place(|| {
+            state.engine.forward_full_gpu_with_hidden_capture(&prompt_tokens, &[])
+        });
+        (Some(hc), prefill_start.elapsed().as_millis() as u64)
+    } else {
+        (None, 0)
+    };
+
+    let gate_outcome = match hc.as_ref() {
+        Some(hc_ref) if !resolved_gate_shims.is_empty() => {
+            run_gate_shims_against_hc(
+                &resolved_gate_shims, hc_ref, &req.shim_rules, gate_prefill_ms,
+            ).await?
+        }
+        _ => GateOutcome {
+            decisions: HashMap::new(),
+            gate_prefill_ms,
+            ort_ms_per_shim: HashMap::new(),
+            matched: None,
+        },
+    };
 
     // Compute the active steer set: a matched rule's `activate` overrides
     // the request's `steer_shims` baseline; if no rule matched we fall
@@ -1175,7 +1443,7 @@ async fn chat_completions(
     // silent SSE stream (if streaming was requested) or a silent
     // ChatResponse. Either way the metadata captures what the gate saw.
     if gate_outcome.is_silent() {
-        let metadata = gate_outcome.to_metadata(&[]);
+        let metadata = gate_outcome.to_metadata_with_inject(&[], &req.inject_shims);
         info!(
             gate_shims = ?req.gate_shims,
             silent = true,
@@ -1238,21 +1506,30 @@ async fn chat_completions(
     }
     let active_steers = resolve_steer_shims(&state, &active_steer_ids).await?;
 
+    // Compute injection deltas now that we've passed the silent check.
+    // Built per-layer wgpu buffers ready for forward_full_gpu_with_cache_inject*.
+    let inject_deltas: Vec<Option<wgpu::Buffer>> = match hc.as_ref() {
+        Some(hc_ref) => compute_inject_deltas(&state, &resolved_inject_shims, hc_ref).await?,
+        None => Vec::new(),
+    };
+
     let gate_metadata: Option<serde_json::Value> = if !req.gate_shims.is_empty()
         || !active_steer_ids.is_empty()
+        || !req.inject_shims.is_empty()
     {
-        Some(gate_outcome.to_metadata(&active_steer_ids))
+        Some(gate_outcome.to_metadata_with_inject(&active_steer_ids, &req.inject_shims))
     } else {
         None
     };
-    if !req.gate_shims.is_empty() {
+    if !req.gate_shims.is_empty() || !req.inject_shims.is_empty() {
         info!(
             gate_shims = ?req.gate_shims,
+            inject_shims = ?req.inject_shims,
             silent = false,
             active_steers = ?active_steer_ids,
             signal = ?gate_outcome.signal(),
             gate_prefill_ms = gate_outcome.gate_prefill_ms,
-            "gate dispatch: proceed",
+            "shim dispatch: proceed",
         );
     }
 
@@ -1275,7 +1552,7 @@ async fn chat_completions(
                 })),
             ));
         }
-        return chat_completions_stream(state, req, prompt_tokens, gate_metadata, active_steers).await;
+        return chat_completions_stream(state, req, prompt_tokens, gate_metadata, active_steers, inject_deltas).await;
     }
 
     let prompt_len = prompt_tokens.len() as u32;
@@ -1689,20 +1966,20 @@ async fn chat_completions(
             let len = generated.len() as u32;
             (generated, len)
         }
-    } else if !active_steers.is_empty() {
-        // Stateless with active steers: GPU forward returning hidden,
-        // apply each steer's hidden_delta in declared order, re-project
-        // logits via the LM head, sample. One token at a time.
+    } else if !active_steers.is_empty() || !inject_deltas.is_empty() {
+        // Stateless with active steers and/or inject: GPU generation
+        // path that threads inject deltas through every forward and
+        // applies steer deltas to last-token hidden each step.
         let generated = tokio::task::block_in_place(|| {
-            generate_stateless_with_steers(
+            generate_stateless_gpu(
                 &state.engine, &prompt_tokens, sampler_config, seed, eos,
-                max_tokens, state.max_seq_len, &active_steers,
+                max_tokens, state.max_seq_len, &active_steers, &inject_deltas,
             )
         });
         let len = generated.len() as u32;
         (generated, len)
     } else {
-        // Stateless, no steers: existing CPU full-forward generate path.
+        // Stateless, no shims: existing CPU full-forward generate path.
         let output_tokens = tokio::task::block_in_place(|| {
             state.engine.generate(&prompt_tokens, max_tokens, sampler_config, seed, Some(eos))
         });
@@ -1786,6 +2063,7 @@ async fn chat_completions_stream(
     prompt_tokens: Vec<u32>,
     gate_metadata: Option<serde_json::Value>,
     active_steers: Vec<Arc<RegisteredShim>>,
+    inject_deltas: Vec<Option<wgpu::Buffer>>,
 ) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
     let sampler_config = if req.temperature <= 0.0 {
         SamplerConfig::greedy()
@@ -1819,20 +2097,23 @@ async fn chat_completions_stream(
     // channel's blocking send path.
     let state_for_gen = state.clone();
     let steers_for_gen = active_steers;
+    let inject_for_gen = inject_deltas;
     tokio::task::spawn_blocking(move || {
         let mut cache = state_for_gen.engine.create_gpu_kv_cache(state_for_gen.max_seq_len);
         let mut sampler = Sampler::new(sampler_config, seed);
         let embed_dim = state_for_gen.engine.embed_dim();
         let has_steers = !steers_for_gen.is_empty();
 
-        // Prefill + first token. With steers active we read hidden state
-        // from the GPU forward, mutate the last token's slice via each
-        // steer's hidden_delta, and re-project on CPU. Without steers we
-        // skip the second projection by going through the existing
-        // forward_full_gpu_with_cache (one projection inside).
+        // Prefill + first token. Three modes:
+        //  - steers (with or without inject): forward returns hidden,
+        //    apply each steer's hidden_delta to last token, re-project,
+        //    sample.
+        //  - no steers, no inject: existing direct-projection fast path.
+        //  - no steers, has inject: inject-aware forward returns logits
+        //    directly (one projection inside), sample.
         let mut next_token = if has_steers {
-            let mut hidden = state_for_gen.engine.forward_full_gpu_with_cache_returning_hidden(
-                &prompt_tokens, &mut cache,
+            let mut hidden = state_for_gen.engine.forward_full_gpu_with_cache_inject_returning_hidden(
+                &prompt_tokens, &mut cache, &inject_for_gen,
             );
             let last_off = (prompt_tokens.len() - 1) * embed_dim;
             let last_slice = &mut hidden[last_off..last_off + embed_dim];
@@ -1840,8 +2121,8 @@ async fn chat_completions_stream(
             let logits = state_for_gen.engine.cpu().finalize_logits(last_slice, 1);
             sampler.sample(&logits)
         } else {
-            let prefill_logits = state_for_gen.engine.forward_full_gpu_with_cache(
-                &prompt_tokens, &mut cache,
+            let prefill_logits = state_for_gen.engine.forward_full_gpu_with_cache_inject(
+                &prompt_tokens, &mut cache, &inject_for_gen,
             );
             let vocab = state_for_gen.engine.vocab_size();
             let last_off = (prompt_tokens.len() - 1) * vocab;
@@ -1875,13 +2156,15 @@ async fn chat_completions_stream(
 
             for _ in 1..max_tokens {
                 let logits = if has_steers {
-                    let mut hidden = state_for_gen.engine.forward_full_gpu_with_cache_returning_hidden(
-                        &[next_token], &mut cache,
+                    let mut hidden = state_for_gen.engine.forward_full_gpu_with_cache_inject_returning_hidden(
+                        &[next_token], &mut cache, &inject_for_gen,
                     );
                     apply_steers_inplace(&steers_for_gen, &mut hidden);
                     state_for_gen.engine.cpu().finalize_logits(&hidden, 1)
                 } else {
-                    state_for_gen.engine.forward_full_gpu_with_cache(&[next_token], &mut cache)
+                    state_for_gen.engine.forward_full_gpu_with_cache_inject(
+                        &[next_token], &mut cache, &inject_for_gen,
+                    )
                 };
                 next_token = sampler.sample(&logits);
                 if next_token == eos {
@@ -2415,36 +2698,20 @@ struct ShimRunResult {
 /// Pool the captured hidden state per the shim's manifest, run the
 /// shim's ort session, and format the output per `output_shape.kind`.
 ///
-/// v1 constraints (rejected with 400 if violated):
-/// - `attachment.layer` must be `"final"` — only the final post-norm
-///   hidden is wired in v1. `entrance:N` is part of #6c (injection).
+/// `attachment.layer` is NOT checked here — it controls where the
+/// OUTPUT goes (decision payload for gate, hidden_delta for steer/
+/// inject), not where the input comes from. Callers enforce
+/// phase-appropriate layer constraints in their resolve_* helpers.
+///
+/// v1 input-side constraints (rejected with 400 if violated):
 /// - `attachment.pooling` must be `"last_token"` or `"mean"` —
 ///   `attention` and `none` need extra plumbing beyond v1.
 /// - `input_shape.hidden_dim` must equal `hc.embed_dim`.
-///
-/// Errors map cleanly to HTTP responses for the standalone endpoint;
-/// the chat-handler gate path translates them into per-shim error
-/// entries in the response metadata so one bad shim doesn't 500 the
-/// whole completion.
 async fn run_shim_against_hidden(
     shim: &Arc<RegisteredShim>,
     hc: &HiddenCaptures,
 ) -> Result<ShimRunResult, (StatusCode, Json<serde_json::Value>)> {
     let manifest = &shim.manifest;
-
-    if manifest.attachment.layer != "final" {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": {
-                    "type": "unsupported",
-                    "message": format!(
-                        "v1 supports only attachment.layer='final'; got '{}'",
-                        manifest.attachment.layer),
-                }
-            })),
-        ));
-    }
 
     let pooled: Vec<f32> = match manifest.attachment.pooling.as_str() {
         "last_token" => hc.final_last_token().to_vec(),
@@ -2599,6 +2866,23 @@ async fn shim_infer(
             })),
         ))?
     };
+
+    // /v1/shims/infer is for standalone classification — only "final"
+    // attachment is meaningful (the standalone caller has nowhere to
+    // route entrance:N output). Reject other layers up front.
+    if shim.manifest.attachment.layer != "final" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "unsupported",
+                    "message": format!(
+                        "/v1/shims/infer supports only attachment.layer='final'; got '{}'",
+                        shim.manifest.attachment.layer),
+                }
+            })),
+        ));
+    }
 
     let tokens = state.tokenizer.encode(&req.context, /*add_bos*/ true);
     if tokens.is_empty() {
