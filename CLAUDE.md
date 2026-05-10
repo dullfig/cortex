@@ -185,6 +185,22 @@ Run all: `cargo test --workspace`
       Validated end-to-end on Qwen 2.5-3B + a squared-norm gate shim
       (`pinky/tools/gate_smoke_shim.onnx`): silent + proceed paths
       pass for both streaming and non-streaming wires
+- [x] `POST /v1/shims/embed` — text → pooled hidden-state vector.
+      Used by AgentOS for shim-classifier training so trained shims
+      operate over the same substrate they'll see at inference time
+      (alternative was MiniLM stub → throwaway training data once
+      cortex's hidden states landed). Vocabulary mirrors shim
+      manifest fields exactly: `layer` ∈ {`final`, `entrance:N` for
+      `1<=N<=n_layers`}, `pooling` ∈ {`last_token`, `mean`}.
+      `entrance:0` rejects (embedding-lookup output not captured in
+      v1). Pooling primitive `pool_layer_hidden` extracted out of
+      `run_shim_against_hidden` so both `/v1/shims/infer` and
+      `/v1/shims/embed` share one path. Gated by `--enable-shims`.
+      Validated 7 cases end-to-end (`pinky/tools/embed_smoke_test.sh`):
+      final/last_token, final/mean (differ from last_token),
+      entrance:5/last_token, entrance:0 reject, entrance:9999 reject,
+      empty text reject, unknown pooling reject. Workspace tests
+      still 392/392; no regression on gate/steer/inject smokes
 - [ ] cortex-cloud retrieval-cache config flag → polar backend
 - [x] Shim phase dispatch — steer (#6b): per-token `hidden_delta`
       composition in declared order. Engine gains

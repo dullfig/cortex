@@ -2695,6 +2695,55 @@ struct ShimRunResult {
     kind: String,
 }
 
+/// Pool a `[n_tokens, embed_dim]` row-major hidden buffer to a single
+/// `[embed_dim]` vector per the v1 pooling vocabulary
+/// (`"last_token"` | `"mean"`). Errors map to a 400 the caller can
+/// pass straight to the HTTP layer.
+fn pool_layer_hidden(
+    layer_data: &[f32],
+    n_tokens: usize,
+    embed_dim: usize,
+    pooling: &str,
+) -> Result<Vec<f32>, (StatusCode, Json<serde_json::Value>)> {
+    debug_assert_eq!(layer_data.len(), n_tokens * embed_dim);
+    match pooling {
+        "last_token" => {
+            let off = (n_tokens - 1) * embed_dim;
+            Ok(layer_data[off..off + embed_dim].to_vec())
+        }
+        "mean" => {
+            let mut sum = vec![0.0f32; embed_dim];
+            for t in 0..n_tokens {
+                let off = t * embed_dim;
+                for d in 0..embed_dim {
+                    sum[d] += layer_data[off + d];
+                }
+            }
+            let n = n_tokens as f32;
+            for v in sum.iter_mut() { *v /= n; }
+            Ok(sum)
+        }
+        other => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "unsupported",
+                    "message": format!("v1 pooling supports last_token | mean; got '{other}'"),
+                }
+            })),
+        )),
+    }
+}
+
+/// Convenience wrapper around `pool_layer_hidden` for the common case
+/// of pooling the final post-norm hidden out of a `HiddenCaptures`.
+fn pool_final_hidden(
+    hc: &HiddenCaptures,
+    pooling: &str,
+) -> Result<Vec<f32>, (StatusCode, Json<serde_json::Value>)> {
+    pool_layer_hidden(&hc.final_post_norm_hidden, hc.n_tokens, hc.embed_dim, pooling)
+}
+
 /// Pool the captured hidden state per the shim's manifest, run the
 /// shim's ort session, and format the output per `output_shape.kind`.
 ///
@@ -2713,32 +2762,7 @@ async fn run_shim_against_hidden(
 ) -> Result<ShimRunResult, (StatusCode, Json<serde_json::Value>)> {
     let manifest = &shim.manifest;
 
-    let pooled: Vec<f32> = match manifest.attachment.pooling.as_str() {
-        "last_token" => hc.final_last_token().to_vec(),
-        "mean" => {
-            let mut sum = vec![0.0f32; hc.embed_dim];
-            for t in 0..hc.n_tokens {
-                let off = t * hc.embed_dim;
-                for d in 0..hc.embed_dim {
-                    sum[d] += hc.final_post_norm_hidden[off + d];
-                }
-            }
-            let n = hc.n_tokens as f32;
-            for v in sum.iter_mut() { *v /= n; }
-            sum
-        }
-        other => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": {
-                        "type": "unsupported",
-                        "message": format!("v1 pooling supports last_token | mean; got '{other}'"),
-                    }
-                })),
-            ));
-        }
-    };
+    let pooled = pool_final_hidden(hc, &manifest.attachment.pooling)?;
 
     let expected_dim = manifest.input_shape.get("hidden_dim")
         .and_then(|v| v.as_u64()).map(|n| n as usize)
@@ -2923,6 +2947,146 @@ async fn shim_infer(
         cortex_ms,
         ort_ms = result.ort_ms,
         "shim infer",
+    );
+
+    Ok(Json(response))
+}
+
+/// Which hidden state `/v1/shims/embed` returns. The vocabulary
+/// mirrors the shim manifest's `attachment.layer` field so a training
+/// pipeline can request the exact embedding the manifest will receive
+/// at inference time.
+#[derive(Debug, Clone, Copy)]
+enum EmbedLayer {
+    /// Final post-norm hidden (LM head input). What gate / steer / inject
+    /// shims read in v1 — the canonical embedding for shim training.
+    Final,
+    /// Hidden at entrance to block N (== output of block N-1). Carries
+    /// the index `N-1` so the caller can directly select
+    /// `per_layer_hidden[idx]` from the capture result.
+    EntranceN(usize),
+}
+
+impl EmbedLayer {
+    /// Parse `"final"` or `"entrance:N"` (with `1 <= N <= n_layers`).
+    /// `entrance:0` is rejected — that's the embedding-lookup output
+    /// which is not captured by `forward_full_gpu_with_hidden_capture`
+    /// in v1 (would need a new capture point).
+    fn parse(s: &str, n_layers: usize) -> Option<Self> {
+        if s == "final" { return Some(Self::Final); }
+        if let Some(rest) = s.strip_prefix("entrance:") {
+            if let Ok(n) = rest.parse::<usize>() {
+                if n >= 1 && n <= n_layers {
+                    return Some(Self::EntranceN(n - 1));
+                }
+            }
+        }
+        None
+    }
+}
+
+/// `POST /v1/shims/embed` — return a pooled hidden-state embedding
+/// for arbitrary text. Used by AgentOS to train shim classifiers
+/// against the cortex substrate (the alternative was stubbing with
+/// MiniLM, which would have produced throwaway training data once
+/// trained shims started reading actual cortex hidden states at
+/// inference time).
+#[derive(Debug, Deserialize)]
+struct ShimEmbedRequest {
+    text: String,
+    /// `"final"` (default) or `"entrance:N"` for `N` in `1..=n_layers`.
+    /// Field name + vocabulary intentionally match the shim manifest's
+    /// `attachment.layer` so training-time and inference-time
+    /// signatures are identical.
+    #[serde(default = "default_embed_layer")]
+    layer: String,
+    /// `"last_token"` (default) or `"mean"`. Same vocabulary as the
+    /// manifest's `attachment.pooling`.
+    #[serde(default = "default_embed_pooling")]
+    pooling: String,
+}
+
+fn default_embed_layer() -> String { "final".to_string() }
+fn default_embed_pooling() -> String { "last_token".to_string() }
+
+async fn shim_embed(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<ShimEmbedRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let n_layers = state.engine.n_layers();
+
+    // Parse + validate the layer specifier.
+    let layer = EmbedLayer::parse(&req.layer, n_layers).ok_or_else(|| (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": {
+                "type": "unsupported",
+                "message": format!(
+                    "v1 layer must be 'final' or 'entrance:N' for 1<=N<={n_layers}; got '{}'",
+                    req.layer),
+            }
+        })),
+    ))?;
+
+    if req.text.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": { "type": "invalid_request", "message": "text must be non-empty" }
+            })),
+        ));
+    }
+    let tokens = state.tokenizer.encode(&req.text, /*add_bos*/ true);
+    if tokens.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": { "type": "invalid_request", "message": "empty text after tokenization" }
+            })),
+        ));
+    }
+
+    // Build capture_layers: empty for Final (only need final post-norm),
+    // single-element for EntranceN(idx).
+    let capture_layers: Vec<usize> = match layer {
+        EmbedLayer::Final => Vec::new(),
+        EmbedLayer::EntranceN(idx) => vec![idx],
+    };
+
+    let infer_start = Instant::now();
+    let hc = tokio::task::block_in_place(|| {
+        state.engine.forward_full_gpu_with_hidden_capture(&tokens, &capture_layers)
+    });
+    let cortex_ms = infer_start.elapsed().as_millis() as u64;
+
+    let embedding = match layer {
+        EmbedLayer::Final => pool_final_hidden(&hc, &req.pooling)?,
+        EmbedLayer::EntranceN(_) => {
+            // capture_layers had one element; per_layer_hidden[0] holds it.
+            pool_layer_hidden(
+                &hc.per_layer_hidden[0], hc.n_tokens, hc.embed_dim, &req.pooling,
+            )?
+        }
+    };
+
+    let response = serde_json::json!({
+        "embedding": embedding,
+        "metadata": {
+            "model": state.model_name,
+            "layer": req.layer,
+            "pooling": req.pooling,
+            "n_tokens": hc.n_tokens,
+            "embed_dim": hc.embed_dim,
+            "cortex_ms": cortex_ms,
+        }
+    });
+
+    info!(
+        layer = %req.layer,
+        pooling = %req.pooling,
+        n_tokens = hc.n_tokens,
+        cortex_ms,
+        "shim embed",
     );
 
     Ok(Json(response))
@@ -3140,6 +3304,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         app = app
             .route("/v1/shims/", get(shims_list))
             .route("/v1/shims/infer", post(shim_infer))
+            .route("/v1/shims/embed", post(shim_embed))
             .route("/v1/shims/{id}", get(shim_get).put(shim_put).delete(shim_delete));
     }
 
