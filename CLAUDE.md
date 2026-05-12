@@ -185,6 +185,34 @@ Run all: `cargo test --workspace`
       Validated end-to-end on Qwen 2.5-3B + a squared-norm gate shim
       (`pinky/tools/gate_smoke_shim.onnx`): silent + proceed paths
       pass for both streaming and non-streaming wires
+- [x] Batched GPU bitnet path (#bn): unblocks bitnet 1.58b prefill on
+      GPU end-to-end. Before this, `dispatch_matmul_into` hard-panicked
+      on `GpuBitLinear` and the block forward additionally rejected
+      BitNet's attention/FFN sub-norms and ReLU² activation, so any
+      ternary GGUF fell back to CPU full-forward. Now:
+      - `quantize_absmax_batch.wgsl` (per-token absmax → i8 + scales)
+        and `ternary_matmul_batch.wgsl` (multi-token analog of
+        `ternary_matvec`, decode byte-matches the single-token shader)
+      - `dispatch_linear_batch_into` routes by concrete layer type
+        (`GpuFloatLinear` → existing matmul, `GpuBitLinear` →
+        quantize-then-matmul); all six block linear call sites
+        (Q/K/V/o/gate/up/down) go through it
+      - `TernaryScratch` (activations_i8 + scales buffers) added to
+        `BlockScratch`, sized for `max(embed_dim, intermediate)`
+      - `GpuBlock` gains optional `o_sub_norm_weight_buf` +
+        `ffn_sub_norm_weight_buf` (uploaded from `attn.o_sub_norm()` /
+        `swiglu.sub_norm()`); `forward_block_gpu_inner` and the polar
+        variant insert `dispatch_rmsnorm_into` before o_proj/down_proj
+        when present
+      - `relu2_mul_batch.wgsl` + `dispatch_gate_mul_into` route between
+        SiLU and ReLU² based on `swiglu.activation()`
+      Validated against `models/ggml-model-i2_s.gguf` (BitNet 1.58b
+      1.2 GB GGUF): streaming chat completion through
+      `forward_full_gpu_with_cache` returns coherent text ("The
+      capital of France is Paris. Paris is known for its historical
+      landmarks, cultural institutions, and..."). Three shader-level
+      parity tests + one toy-block integration test cover the new
+      surface; workspace tests at 396/396
 - [x] `POST /v1/shims/embed` — text → pooled hidden-state vector.
       Used by AgentOS for shim-classifier training so trained shims
       operate over the same substrate they'll see at inference time

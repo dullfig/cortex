@@ -159,6 +159,15 @@ struct GpuBlock {
     q_bias_buf: Option<wgpu::Buffer>,
     k_bias_buf: Option<wgpu::Buffer>,
     v_bias_buf: Option<wgpu::Buffer>,
+    /// BitNet b1.58 attention sub-norm: RMSNorm applied to the attention
+    /// output BEFORE `o_proj`. None for non-BitNet models. `attn.o_sub_norm()`
+    /// supplies the source weight + eps when present.
+    o_sub_norm_weight_buf: Option<wgpu::Buffer>,
+    o_sub_norm_eps: f32,
+    /// BitNet b1.58 FFN sub-norm: RMSNorm applied to `silu(gate) * up`
+    /// BEFORE `down_proj`. None for non-BitNet SwiGLU.
+    ffn_sub_norm_weight_buf: Option<wgpu::Buffer>,
+    ffn_sub_norm_eps: f32,
 }
 
 /// Per-block scratch buffers reused across all dispatches inside a single
@@ -208,6 +217,23 @@ pub struct BlockScratch {
     pub up: wgpu::Buffer,        // [n_tokens, intermediate]
     pub activated: wgpu::Buffer, // [n_tokens, intermediate] SiLU(gate)*up
     pub projected: wgpu::Buffer, // [n_tokens, embed_dim] both attn-out-proj and FFN-down output reuse this
+    /// Scratch for the bitnet batch matmul path (#bn-5). Sized for the
+    /// widest input dim across Q/K/V projections (embed_dim) and FFN
+    /// (intermediate, for the gate/up projection in_features = embed_dim;
+    /// for the down projection in_features = intermediate). One buffer
+    /// pair fits all six call sites because the bottleneck is the
+    /// largest in_features = max(embed_dim, intermediate).
+    pub ternary: TernaryScratch,
+}
+
+/// Scratch buffers consumed by the bitnet batch matmul path.
+/// `activations_i8` holds 4 i8 values per u32 (matches the layout
+/// `ternary_matmul_batch.wgsl` expects). `scales` holds one f32 per
+/// token. Both sized so that any of the six linear-call sites in a
+/// block fits.
+pub struct TernaryScratch {
+    pub activations_i8: wgpu::Buffer,
+    pub scales: wgpu::Buffer,
 }
 
 impl BlockScratch {
@@ -231,6 +257,16 @@ impl BlockScratch {
             })
         };
         let f32_bytes = std::mem::size_of::<f32>() as u64;
+        let u32_bytes = std::mem::size_of::<u32>() as u64;
+        // Ternary scratch sizing: largest in_features across all linear
+        // call sites in a block is max(embed_dim, intermediate). One i8
+        // per element packed 4-per-u32, plus one f32 scale per token.
+        let max_in = embed_dim.max(intermediate);
+        let act_q_u32_count = (n_tokens * ((max_in + 3) / 4)) as u64;
+        let ternary = TernaryScratch {
+            activations_i8: mk(act_q_u32_count * u32_bytes, "scratch.ternary.activations_i8"),
+            scales:         mk((n_tokens as u64) * f32_bytes, "scratch.ternary.scales"),
+        };
         Self {
             normed:    mk((n_tokens * embed_dim) as u64 * f32_bytes, "scratch.normed"),
             q:         mk((n_tokens * n_heads * head_dim) as u64 * f32_bytes, "scratch.q"),
@@ -242,6 +278,7 @@ impl BlockScratch {
             up:        mk((n_tokens * intermediate) as u64 * f32_bytes, "scratch.up"),
             activated: mk((n_tokens * intermediate) as u64 * f32_bytes, "scratch.activated"),
             projected: mk((n_tokens * embed_dim) as u64 * f32_bytes, "scratch.projected"),
+            ternary,
         }
     }
 }
@@ -308,6 +345,23 @@ impl GpuEngine {
             let an = blk.attn_norm();
             let fn_ = blk.ffn_norm();
             let attn = blk.attention();
+            let swiglu_opt = blk.ffn().as_any()
+                .downcast_ref::<crate::layers::swiglu::SwiGLU>();
+            let upload_norm = |w: &[f32], label: String| -> wgpu::Buffer {
+                gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(&label),
+                    contents: bytemuck::cast_slice(w),
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+            };
+            let (o_sub_norm_buf, o_sub_norm_eps) = match attn.o_sub_norm() {
+                Some(n) => (Some(upload_norm(n.weight(), format!("gpu_engine.block{i}.o_sub_norm.weight"))), n.eps()),
+                None => (None, 0.0),
+            };
+            let (ffn_sub_norm_buf, ffn_sub_norm_eps) = match swiglu_opt.and_then(|s| s.sub_norm()) {
+                Some(n) => (Some(upload_norm(n.weight(), format!("gpu_engine.block{i}.ffn_sub_norm.weight"))), n.eps()),
+                None => (None, 0.0),
+            };
             GpuBlock {
                 attn_norm_weight_buf: gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some(&format!("gpu_engine.block{i}.attn_norm.weight")),
@@ -324,6 +378,10 @@ impl GpuEngine {
                 q_bias_buf: attn.q_bias().map(|b| upload_bias(b, i, "q")),
                 k_bias_buf: attn.k_bias().map(|b| upload_bias(b, i, "k")),
                 v_bias_buf: attn.v_bias().map(|b| upload_bias(b, i, "v")),
+                o_sub_norm_weight_buf: o_sub_norm_buf,
+                o_sub_norm_eps,
+                ffn_sub_norm_weight_buf: ffn_sub_norm_buf,
+                ffn_sub_norm_eps,
             }
         }).collect();
 
@@ -428,6 +486,125 @@ impl GpuEngine {
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(dx, dy, dz);
+    }
+
+    /// Per-token absmax quantization of f32 hidden → packed i8 activations
+    /// + per-token f32 scales. One workgroup per token. Used by the
+    /// bitnet batch path (#6c) to feed `dispatch_ternary_matmul_batch_into`.
+    ///
+    /// `act_q_buf` must be sized at least `n_tokens * ceil(cols / 4)` u32s.
+    /// `act_scales_buf` must be sized at least `n_tokens` f32s.
+    pub fn dispatch_quantize_absmax_batch_into(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        input_f32_buf: &wgpu::Buffer,
+        act_q_buf: &wgpu::Buffer,
+        act_scales_buf: &wgpu::Buffer,
+        cols: usize,
+        n_tokens: usize,
+    ) {
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct QuantParams { cols: u32, n_tokens: u32 }
+        let params = QuantParams { cols: cols as u32, n_tokens: n_tokens as u32 };
+        let params_buf = self.gpu.create_params_buffer(&params);
+
+        let pipeline = &self.gpu.pipelines.quantize_absmax_batch;
+        let bind = self.gpu.make_bind_group(
+            pipeline,
+            &[input_f32_buf, act_q_buf, act_scales_buf, &params_buf],
+        );
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_engine.quantize_absmax_batch.pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(n_tokens as u32, 1, 1);
+    }
+
+    /// Batched ternary matmul. Multi-token analog of the single-token
+    /// `ternary_matvec`. Reads resident 2-bit packed weights from
+    /// `GpuBitLinear`, i8 packed activations + per-token scales (output
+    /// of `dispatch_quantize_absmax_batch_into`), writes f32 output with
+    /// the per-token scale and the layer's weight_scale applied inline.
+    pub fn dispatch_ternary_matmul_batch_into(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        layer: &crate::layers::gpu_bitlinear::GpuBitLinear,
+        act_q_buf: &wgpu::Buffer,
+        act_scales_buf: &wgpu::Buffer,
+        out_f32_buf: &wgpu::Buffer,
+        n_tokens: usize,
+    ) {
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct TmmParams { rows: u32, cols: u32, n_tokens: u32, weight_scale_bits: u32 }
+        let params = TmmParams {
+            rows: layer.out_features() as u32,
+            cols: layer.in_features() as u32,
+            n_tokens: n_tokens as u32,
+            weight_scale_bits: layer.weight_scale().to_bits(),
+        };
+        let params_buf = self.gpu.create_params_buffer(&params);
+
+        let pipeline = &self.gpu.pipelines.ternary_matmul_batch;
+        let bind = self.gpu.make_bind_group(
+            pipeline,
+            &[layer.weight_buffer(), act_q_buf, act_scales_buf, out_f32_buf, &params_buf],
+        );
+
+        let rows = layer.out_features();
+        let dx = (rows.min(65535)) as u32;
+        let dy = ((rows + 65534) / 65535) as u32;
+        let dz = n_tokens as u32;
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_engine.ternary_matmul_batch.pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(dx, dy, dz);
+    }
+
+    /// Unified linear-layer dispatcher used by `forward_block_gpu_inner`.
+    /// Downcasts to `GpuFloatLinear` (existing float matmul path) or
+    /// `GpuBitLinear` (new bitnet batch path: quantize then ternary
+    /// matmul). Panics with the layer's concrete type if neither
+    /// matches — same failure mode as `dispatch_matmul_into` had, just
+    /// with both cases covered.
+    pub fn dispatch_linear_batch_into(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        layer: &dyn LinearLayer,
+        in_buf: &wgpu::Buffer,
+        out_buf: &wgpu::Buffer,
+        n_tokens: usize,
+        ternary_scratch: &TernaryScratch,
+    ) {
+        let any = layer.as_any();
+        if any.downcast_ref::<crate::layers::gpu_floatlinear::GpuFloatLinear>().is_some() {
+            self.dispatch_matmul_into(encoder, layer, in_buf, out_buf, n_tokens);
+            return;
+        }
+        if let Some(bit) = any.downcast_ref::<crate::layers::gpu_bitlinear::GpuBitLinear>() {
+            self.dispatch_quantize_absmax_batch_into(
+                encoder, in_buf, &ternary_scratch.activations_i8, &ternary_scratch.scales,
+                bit.in_features(), n_tokens,
+            );
+            self.dispatch_ternary_matmul_batch_into(
+                encoder, bit, &ternary_scratch.activations_i8, &ternary_scratch.scales,
+                out_buf, n_tokens,
+            );
+            return;
+        }
+        panic!(
+            "GpuEngine.dispatch_linear_batch_into: layer is neither GpuFloatLinear \
+             nor GpuBitLinear (concrete type: {:?})",
+            layer
+        );
     }
 
     /// GPU-native dispatch of the per-token final RMSNorm using the
@@ -1446,8 +1623,10 @@ impl GpuEngine {
             );
         }
 
-        assert!(attn.o_sub_norm().is_none(),
-            "forward_block_gpu does not support attention sub-norm yet (BitNet)");
+        // BitNet b1.58 sub-norms (#bn-11): when present on the CPU layer,
+        // their resident weight buffers are populated on the GpuBlock at
+        // construction. The dispatch sites below insert dispatch_rmsnorm_into
+        // calls before o_proj / down_proj respectively.
         assert!((block.attn_residual_scale() - 1.0).abs() < f32::EPSILON,
             "forward_block_gpu requires attn_residual_scale == 1.0");
         assert!((block.ffn_residual_scale() - 1.0).abs() < f32::EPSILON,
@@ -1456,10 +1635,8 @@ impl GpuEngine {
         let swiglu = block.ffn().as_any()
             .downcast_ref::<crate::layers::swiglu::SwiGLU>()
             .unwrap_or_else(|| panic!("forward_block_gpu requires SwiGLU FFN"));
-        assert!(swiglu.sub_norm().is_none(),
-            "forward_block_gpu does not support FFN sub-norm yet (BitNet)");
-        assert_eq!(swiglu.activation(), crate::layers::swiglu::GateActivation::SiLU,
-            "forward_block_gpu only supports SiLU activation");
+        // Activation routing: SiLU (LLaMA / Qwen) or ReLU² (BitNet b1.58).
+        // dispatch_gate_mul_into picks the right pipeline at dispatch time.
 
         let n_heads = attn.n_heads();
         let n_kv_heads = attn.n_kv_heads();
@@ -1479,18 +1656,22 @@ impl GpuEngine {
             embed_dim, n_tokens, block_gpu.attn_norm_eps,
         );
 
-        // 2-4. Q, K, V projections (batch matmul) + optional Qwen-style biases
+        // 2-4. Q, K, V projections (batch matmul) + optional Qwen-style biases.
+        // `dispatch_linear_batch_into` routes by layer concrete type:
+        //   GpuFloatLinear → existing float matmul shader
+        //   GpuBitLinear   → quantize_absmax_batch + ternary_matmul_batch
+        // Bias-add semantics unchanged (operates on f32 output either way).
         let q_dim = n_heads * head_dim;
         let kv_dim = n_kv_heads * head_dim;
-        self.dispatch_matmul_into(encoder, attn.q_proj(), &scratch.normed, &scratch.q, n_tokens);
+        self.dispatch_linear_batch_into(encoder, attn.q_proj(), &scratch.normed, &scratch.q, n_tokens, &scratch.ternary);
         if let Some(buf) = block_gpu.q_bias_buf.as_ref() {
             self.dispatch_bias_add_into(encoder, &scratch.q, buf, q_dim, n_tokens);
         }
-        self.dispatch_matmul_into(encoder, attn.k_proj(), &scratch.normed, &scratch.k, n_tokens);
+        self.dispatch_linear_batch_into(encoder, attn.k_proj(), &scratch.normed, &scratch.k, n_tokens, &scratch.ternary);
         if let Some(buf) = block_gpu.k_bias_buf.as_ref() {
             self.dispatch_bias_add_into(encoder, &scratch.k, buf, kv_dim, n_tokens);
         }
-        self.dispatch_matmul_into(encoder, attn.v_proj(), &scratch.normed, &scratch.v, n_tokens);
+        self.dispatch_linear_batch_into(encoder, attn.v_proj(), &scratch.normed, &scratch.v, n_tokens, &scratch.ternary);
         if let Some(buf) = block_gpu.v_bias_buf.as_ref() {
             self.dispatch_bias_add_into(encoder, &scratch.v, buf, kv_dim, n_tokens);
         }
@@ -1535,8 +1716,21 @@ impl GpuEngine {
             pre_softmax_capture,
         );
 
-        // 7. O projection: attn_out -> projected
-        self.dispatch_matmul_into(encoder, attn.o_proj(), &scratch.attn_out, &scratch.projected, n_tokens);
+        // 6.5 (BitNet b1.58) attention sub-norm: RMSNorm on scratch.attn_out
+        // BEFORE o_proj. Writes into scratch.normed (free between attention
+        // and o_proj; Q/K/V already consumed it earlier in the block).
+        let o_proj_in: &wgpu::Buffer = if let Some(sub_norm_w) = block_gpu.o_sub_norm_weight_buf.as_ref() {
+            self.dispatch_rmsnorm_into(
+                encoder, &scratch.attn_out, sub_norm_w, &scratch.normed,
+                embed_dim, n_tokens, block_gpu.o_sub_norm_eps,
+            );
+            &scratch.normed
+        } else {
+            &scratch.attn_out
+        };
+
+        // 7. O projection: (sub-normed) attn_out -> projected
+        self.dispatch_linear_batch_into(encoder, attn.o_proj(), o_proj_in, &scratch.projected, n_tokens, &scratch.ternary);
 
         // 8. Residual: hidden += projected
         self.dispatch_add_into(encoder, hidden_buf, &scratch.projected, embed_dim, n_tokens);
@@ -1550,14 +1744,26 @@ impl GpuEngine {
         );
 
         // 10-11. Gate / Up projections
-        self.dispatch_matmul_into(encoder, swiglu.gate_proj(), &scratch.normed, &scratch.gate, n_tokens);
-        self.dispatch_matmul_into(encoder, swiglu.up_proj(),   &scratch.normed, &scratch.up,   n_tokens);
+        self.dispatch_linear_batch_into(encoder, swiglu.gate_proj(), &scratch.normed, &scratch.gate, n_tokens, &scratch.ternary);
+        self.dispatch_linear_batch_into(encoder, swiglu.up_proj(),   &scratch.normed, &scratch.up,   n_tokens, &scratch.ternary);
 
         // 12. silu(gate) * up
-        self.dispatch_silu_mul_into(encoder, &scratch.gate, &scratch.up, &scratch.activated, intermediate, n_tokens);
+        self.dispatch_gate_mul_into(encoder, &scratch.gate, &scratch.up, &scratch.activated, intermediate, n_tokens, swiglu.activation());
+
+        // 12.5 (BitNet b1.58) FFN sub-norm: RMSNorm on silu(gate)*up BEFORE
+        // down_proj. Writes into scratch.up (free after silu_mul consumed it).
+        let down_proj_in: &wgpu::Buffer = if let Some(sub_norm_w) = block_gpu.ffn_sub_norm_weight_buf.as_ref() {
+            self.dispatch_rmsnorm_into(
+                encoder, &scratch.activated, sub_norm_w, &scratch.up,
+                intermediate, n_tokens, block_gpu.ffn_sub_norm_eps,
+            );
+            &scratch.up
+        } else {
+            &scratch.activated
+        };
 
         // 13. Down projection
-        self.dispatch_matmul_into(encoder, swiglu.down_proj(), &scratch.activated, &scratch.projected, n_tokens);
+        self.dispatch_linear_batch_into(encoder, swiglu.down_proj(), down_proj_in, &scratch.projected, n_tokens, &scratch.ternary);
 
         // 14. Residual: hidden += projected
         self.dispatch_add_into(encoder, hidden_buf, &scratch.projected, embed_dim, n_tokens);
@@ -1612,16 +1818,15 @@ impl GpuEngine {
             );
         }
 
-        assert!(attn.o_sub_norm().is_none(),
-            "forward_block_gpu_polar does not support attention sub-norm yet");
+        // BitNet b1.58 sub-norms are routed through the same GpuBlock-
+        // resident buffers used by the f32 forward path (#bn-11).
         assert!((block.attn_residual_scale() - 1.0).abs() < f32::EPSILON);
         assert!((block.ffn_residual_scale() - 1.0).abs() < f32::EPSILON);
 
         let swiglu = block.ffn().as_any()
             .downcast_ref::<crate::layers::swiglu::SwiGLU>()
             .unwrap_or_else(|| panic!("forward_block_gpu_polar requires SwiGLU FFN"));
-        assert!(swiglu.sub_norm().is_none());
-        assert_eq!(swiglu.activation(), crate::layers::swiglu::GateActivation::SiLU);
+        // Activation routed at dispatch time (SiLU vs ReLU²).
 
         let n_heads = attn.n_heads();
         let n_kv_heads = attn.n_kv_heads();
@@ -1648,16 +1853,18 @@ impl GpuEngine {
             embed_dim, n_tokens, block_gpu.attn_norm_eps,
         );
 
-        // 2-4. Q, K, V projections (+ optional Qwen-style biases)
-        self.dispatch_matmul_into(encoder, attn.q_proj(), &scratch.normed, &scratch.q, n_tokens);
+        // 2-4. Q, K, V projections — dispatch_linear_batch_into routes by
+        // layer type (float vs ternary). See forward_block_gpu_inner for
+        // the full rationale.
+        self.dispatch_linear_batch_into(encoder, attn.q_proj(), &scratch.normed, &scratch.q, n_tokens, &scratch.ternary);
         if let Some(buf) = block_gpu.q_bias_buf.as_ref() {
             self.dispatch_bias_add_into(encoder, &scratch.q, buf, n_heads * head_dim, n_tokens);
         }
-        self.dispatch_matmul_into(encoder, attn.k_proj(), &scratch.normed, &scratch.k, n_tokens);
+        self.dispatch_linear_batch_into(encoder, attn.k_proj(), &scratch.normed, &scratch.k, n_tokens, &scratch.ternary);
         if let Some(buf) = block_gpu.k_bias_buf.as_ref() {
             self.dispatch_bias_add_into(encoder, &scratch.k, buf, kv_dim, n_tokens);
         }
-        self.dispatch_matmul_into(encoder, attn.v_proj(), &scratch.normed, &scratch.v, n_tokens);
+        self.dispatch_linear_batch_into(encoder, attn.v_proj(), &scratch.normed, &scratch.v, n_tokens, &scratch.ternary);
         if let Some(buf) = block_gpu.v_bias_buf.as_ref() {
             self.dispatch_bias_add_into(encoder, &scratch.v, buf, kv_dim, n_tokens);
         }
@@ -1740,22 +1947,45 @@ impl GpuEngine {
             n_tokens * n_heads, head_dim,
         );
 
+        // 6.5 (BitNet b1.58) attention sub-norm before o_proj
+        let o_proj_in: &wgpu::Buffer = if let Some(sub_norm_w) = block_gpu.o_sub_norm_weight_buf.as_ref() {
+            self.dispatch_rmsnorm_into(
+                encoder, &scratch.attn_out, sub_norm_w, &scratch.normed,
+                embed_dim, n_tokens, block_gpu.o_sub_norm_eps,
+            );
+            &scratch.normed
+        } else {
+            &scratch.attn_out
+        };
+
         // 7. O projection
-        self.dispatch_matmul_into(encoder, attn.o_proj(), &scratch.attn_out, &scratch.projected, n_tokens);
+        self.dispatch_linear_batch_into(encoder, attn.o_proj(), o_proj_in, &scratch.projected, n_tokens, &scratch.ternary);
 
         // 8. Residual
         self.dispatch_add_into(encoder, hidden_buf, &scratch.projected, embed_dim, n_tokens);
 
-        // ===== FFN SUBLAYER (unchanged from f32 path) =====
+        // ===== FFN SUBLAYER (unchanged from f32 path apart from sub-norm) =====
 
         self.dispatch_rmsnorm_into(
             encoder, hidden_buf, &block_gpu.ffn_norm_weight_buf, &scratch.normed,
             embed_dim, n_tokens, block_gpu.ffn_norm_eps,
         );
-        self.dispatch_matmul_into(encoder, swiglu.gate_proj(), &scratch.normed, &scratch.gate, n_tokens);
-        self.dispatch_matmul_into(encoder, swiglu.up_proj(),   &scratch.normed, &scratch.up,   n_tokens);
-        self.dispatch_silu_mul_into(encoder, &scratch.gate, &scratch.up, &scratch.activated, intermediate, n_tokens);
-        self.dispatch_matmul_into(encoder, swiglu.down_proj(), &scratch.activated, &scratch.projected, n_tokens);
+        self.dispatch_linear_batch_into(encoder, swiglu.gate_proj(), &scratch.normed, &scratch.gate, n_tokens, &scratch.ternary);
+        self.dispatch_linear_batch_into(encoder, swiglu.up_proj(),   &scratch.normed, &scratch.up,   n_tokens, &scratch.ternary);
+        self.dispatch_gate_mul_into(encoder, &scratch.gate, &scratch.up, &scratch.activated, intermediate, n_tokens, swiglu.activation());
+
+        // 12.5 (BitNet b1.58) FFN sub-norm before down_proj
+        let down_proj_in: &wgpu::Buffer = if let Some(sub_norm_w) = block_gpu.ffn_sub_norm_weight_buf.as_ref() {
+            self.dispatch_rmsnorm_into(
+                encoder, &scratch.activated, sub_norm_w, &scratch.up,
+                intermediate, n_tokens, block_gpu.ffn_sub_norm_eps,
+            );
+            &scratch.up
+        } else {
+            &scratch.activated
+        };
+
+        self.dispatch_linear_batch_into(encoder, swiglu.down_proj(), down_proj_in, &scratch.projected, n_tokens, &scratch.ternary);
         self.dispatch_add_into(encoder, hidden_buf, &scratch.projected, embed_dim, n_tokens);
 
         // (optional) post-block hidden state capture — shim hook point.
@@ -2075,24 +2305,45 @@ impl GpuEngine {
         n: usize,
         n_tokens: usize,
     ) {
+        self.dispatch_gate_mul_into(
+            encoder, gate_buf, up_buf, out_buf, n, n_tokens,
+            crate::layers::swiglu::GateActivation::SiLU,
+        );
+    }
+
+    /// Activation-aware gate*up dispatcher: routes to `silu_mul_batch`
+    /// or `relu2_mul_batch` based on the SwiGLU's activation kind.
+    /// Both pipelines share the same binding layout, so the buffer
+    /// arguments are interchangeable.
+    pub fn dispatch_gate_mul_into(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        gate_buf: &wgpu::Buffer,
+        up_buf: &wgpu::Buffer,
+        out_buf: &wgpu::Buffer,
+        n: usize,
+        n_tokens: usize,
+        activation: crate::layers::swiglu::GateActivation,
+    ) {
         let params = SiluMulBatchParams { n: n as u32, n_tokens: n_tokens as u32 };
         let params_buf = self.gpu.create_params_buffer(&params);
 
-        let pipeline = &self.gpu.pipelines.silu_mul_batch;
+        let pipeline = match activation {
+            crate::layers::swiglu::GateActivation::SiLU => &self.gpu.pipelines.silu_mul_batch,
+            crate::layers::swiglu::GateActivation::ReLU2 => &self.gpu.pipelines.relu2_mul_batch,
+        };
         let bind = self.gpu.make_bind_group(
             pipeline,
             &[gate_buf, up_buf, out_buf, &params_buf],
         );
 
-        // 2D dispatch when total exceeds 65535 X-dim workgroups (Qwen 3B
-        // FFN intermediate=11008 × 2318 tokens / 256 = ~99k).
         let total = (n * n_tokens) as u32;
         let groups = (total + 255) / 256;
         let dx = groups.min(65535);
         let dy = (groups + 65534) / 65535;
 
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("gpu_engine.silu_mul.pass"),
+            label: Some("gpu_engine.gate_mul.pass"),
             timestamp_writes: None,
         });
         pass.set_pipeline(pipeline);
@@ -4118,6 +4369,183 @@ mod tests {
             assert!(
                 (c - g).abs() < 0.01,
                 "elem {i}: cpu={c} gpu={g} (diff={})",
+                (c - g).abs()
+            );
+        }
+    }
+
+    /// Build a matched (CPU, GPU) toy block pair backed by ternary
+    /// `BitLinear` / `GpuBitLinear` layers with shared weights. Used by
+    /// `forward_block_gpu_matches_cpu_bitnet_block` to validate the new
+    /// batched ternary matmul path against the CPU reference.
+    fn toy_ternary_block_pair(gpu: Arc<GpuDevice>)
+        -> (TransformerModel, TransformerModel)
+    {
+        use crate::layers::attention::MultiHeadAttention;
+        use crate::layers::bitlinear::BitLinear;
+        use crate::layers::ffn::FeedForward;
+        use crate::layers::gpu_bitlinear::GpuBitLinear;
+        use crate::layers::model::OutputProjection;
+        use crate::layers::rmsnorm::RmsNorm;
+        use crate::layers::swiglu::SwiGLU;
+        use crate::layers::transformer::TransformerBlock;
+        use crate::tensor::TernaryTensor;
+
+        let embed_dim = 8;
+        let n_heads = 1;
+        let head_dim = embed_dim;
+        let intermediate = 16;
+        let vocab_size = 4;
+
+        let mut rng: u64 = 0xBADD_F00D_FACE_BEEF;
+        fn step(rng: &mut u64) -> u64 {
+            *rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *rng
+        }
+        let roll_ternary = |rng: &mut u64| -> crate::tensor::Ternary {
+            let r = step(rng);
+            match ((r >> 33) % 3) as i8 {
+                0 => crate::tensor::Ternary::Neg,
+                1 => crate::tensor::Ternary::Zero,
+                _ => crate::tensor::Ternary::Pos,
+            }
+        };
+        let roll_f32 = |rng: &mut u64| -> f32 {
+            let r = step(rng);
+            ((r >> 33) as i32 % 200 - 100) as f32 * 0.01
+        };
+
+        let mk_pair = |rng: &mut u64, rows: usize, cols: usize, scale: f32|
+            -> (Box<dyn crate::layers::linear::LinearLayer>, Box<dyn crate::layers::linear::LinearLayer>) {
+            let values: Vec<crate::tensor::Ternary> = (0..rows * cols).map(|_| roll_ternary(rng)).collect();
+            let tensor = TernaryTensor::pack(&values, rows, cols);
+            let cpu_layer: Box<dyn crate::layers::linear::LinearLayer> =
+                Box::new(BitLinear::new(tensor.clone(), scale));
+            let gpu_layer: Box<dyn crate::layers::linear::LinearLayer> =
+                Box::new(GpuBitLinear::from_weights(gpu.clone(), tensor, scale));
+            (cpu_layer, gpu_layer)
+        };
+
+        let embed_data: Vec<f32> = (0..vocab_size * embed_dim)
+            .map(|_| roll_f32(&mut rng)).collect();
+        let embedding = FloatTensor::new(embed_data, vec![vocab_size, embed_dim]);
+
+        let mut cpu_blocks = Vec::new();
+        let mut gpu_blocks = Vec::new();
+        let scale = 0.02f32;
+        // One block is enough to exercise all six linear call sites.
+        for _ in 0..1 {
+            let (q_c, q_g) = mk_pair(&mut rng, embed_dim, embed_dim, scale);
+            let (k_c, k_g) = mk_pair(&mut rng, embed_dim, embed_dim, scale);
+            let (v_c, v_g) = mk_pair(&mut rng, embed_dim, embed_dim, scale);
+            let (o_c, o_g) = mk_pair(&mut rng, embed_dim, embed_dim, scale);
+            let attn_c = MultiHeadAttention::with_rope_layout(
+                q_c, k_c, v_c, o_c, n_heads, n_heads, head_dim, 10000.0,
+                crate::layers::rope::RoPELayout::Halved,
+            );
+            let attn_g = MultiHeadAttention::with_rope_layout(
+                q_g, k_g, v_g, o_g, n_heads, n_heads, head_dim, 10000.0,
+                crate::layers::rope::RoPELayout::Halved,
+            );
+            let (gate_c, gate_g) = mk_pair(&mut rng, intermediate, embed_dim, scale);
+            let (up_c, up_g)     = mk_pair(&mut rng, intermediate, embed_dim, scale);
+            let (down_c, down_g) = mk_pair(&mut rng, embed_dim, intermediate, scale);
+            let ffn_c: Box<dyn FeedForward> = Box::new(SwiGLU::new(gate_c, up_c, down_c));
+            let ffn_g: Box<dyn FeedForward> = Box::new(SwiGLU::new(gate_g, up_g, down_g));
+            let an_c = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
+            let an_g = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
+            let fn_c = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
+            let fn_g = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
+            cpu_blocks.push(TransformerBlock::new(an_c, attn_c, fn_c, ffn_c));
+            gpu_blocks.push(TransformerBlock::new(an_g, attn_g, fn_g, ffn_g));
+        }
+
+        let final_norm_c = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
+        let final_norm_g = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
+        let out_proj = FloatTensor::new(
+            (0..vocab_size * embed_dim).map(|_| roll_f32(&mut rng)).collect(),
+            vec![vocab_size, embed_dim],
+        );
+        let cpu_model = TransformerModel::new(
+            embedding.clone(), cpu_blocks, final_norm_c, OutputProjection::Float(out_proj.clone()),
+        );
+        let gpu_model = TransformerModel::new(
+            embedding, gpu_blocks, final_norm_g, OutputProjection::Float(out_proj),
+        );
+        (cpu_model, gpu_model)
+    }
+
+    #[test]
+    fn forward_block_gpu_matches_cpu_bitnet_block() {
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let (cpu_model, gpu_model) = toy_ternary_block_pair(gpu.clone());
+
+        let n_tokens = 4;
+        let embed_dim = cpu_model.embed_dim();
+
+        // Random f32 hidden state input (not embedded — direct injection).
+        let mut rng: u64 = 0xAA11_BB22_CC33_DD44;
+        let hidden_in: Vec<f32> = (0..n_tokens * embed_dim).map(|_| {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng >> 33) as i32 % 200 - 100) as f32 * 0.01
+        }).collect();
+
+        // CPU reference.
+        let cpu_out = cpu_model.blocks()[0].forward(&hidden_in, n_tokens, /*start_pos*/ 0);
+
+        // GPU path.
+        let engine = GpuEngine::with_max_seq(gpu_model, gpu.clone(), 16);
+
+        let bytes = (n_tokens * embed_dim * 4) as u64;
+        let hidden_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("test.bitnet.hidden"),
+            contents: bytemuck::cast_slice(&hidden_in),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let staging = gpu.create_staging_buffer(bytes);
+
+        let attn0 = engine.cpu().blocks()[0].attention();
+        let intermediate = engine.cpu().blocks()[0].ffn().as_any()
+            .downcast_ref::<crate::layers::swiglu::SwiGLU>().unwrap()
+            .intermediate_size();
+        let scratch = BlockScratch::allocate(
+            &gpu, n_tokens, embed_dim,
+            attn0.n_heads(), attn0.n_kv_heads(), attn0.head_dim(),
+            intermediate, /*max_seq*/ n_tokens,
+        );
+
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test.bitnet.encoder"),
+        });
+        engine.forward_block_gpu(&mut encoder, 0, &hidden_buf, n_tokens, 0, &scratch);
+        encoder.copy_buffer_to_buffer(&hidden_buf, 0, &staging, 0, bytes);
+        gpu.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+        gpu.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        let gpu_out: Vec<f32> = data.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        drop(data);
+        staging.unmap();
+
+        // Tolerance: per-token absmax quantization rounding accumulates
+        // through Q/K/V/attention/o_proj/gate/up/down. ~1e-2 is realistic
+        // for a single block with embed_dim=8 (small enough that one
+        // unit of quantization noise scales meaningfully). The CPU
+        // BitLinear uses the same absmax-then-quantize approach, so
+        // discrepancy comes from FMA reordering + per-token-vs-per-
+        // matvec accumulation order, not algorithmic differences.
+        assert_eq!(cpu_out.len(), gpu_out.len(), "shape mismatch");
+        for (i, (c, g)) in cpu_out.iter().zip(&gpu_out).enumerate() {
+            assert!(
+                (c - g).abs() < 1e-2,
+                "bitnet block elem {i}: cpu={c} gpu={g} (diff={})",
                 (c - g).abs()
             );
         }

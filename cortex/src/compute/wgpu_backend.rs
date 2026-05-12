@@ -214,6 +214,8 @@ pub struct Pipelines {
     pub rmsnorm_batch: wgpu::ComputePipeline,
     pub rope_batch: wgpu::ComputePipeline,
     pub silu_mul_batch: wgpu::ComputePipeline,
+    /// Batched ReLU²(gate) * up for BitNet b1.58 SwiGLU activations.
+    pub relu2_mul_batch: wgpu::ComputePipeline,
     pub add_inplace_batch: wgpu::ComputePipeline,
     pub add_broadcast_batch: wgpu::ComputePipeline,
     pub kv_write_batch: wgpu::ComputePipeline,
@@ -222,6 +224,10 @@ pub struct Pipelines {
     pub attn_value_batch: wgpu::ComputePipeline,
     // Resident-weight ternary path (GpuBitLinear)
     pub ternary_matvec: wgpu::ComputePipeline,
+    // Batched ternary matmul: f32 hidden → quantize_absmax_batch (i8 + scales)
+    // → ternary_matmul_batch (f32 out). Used for prefill on bitnet models.
+    pub quantize_absmax_batch: wgpu::ComputePipeline,
+    pub ternary_matmul_batch: wgpu::ComputePipeline,
     // Broadcast bias add (Q/K/V biases for Qwen-family)
     pub bias_add_batch: wgpu::ComputePipeline,
 }
@@ -286,6 +292,7 @@ impl Pipelines {
             rmsnorm_batch: make(include_str!("shaders/rmsnorm_batch.wgsl"), "rmsnorm_batch"),
             rope_batch: make(include_str!("shaders/rope_batch.wgsl"), "rope_batch"),
             silu_mul_batch: make(include_str!("shaders/silu_mul_batch.wgsl"), "silu_mul_batch"),
+            relu2_mul_batch: make(include_str!("shaders/relu2_mul_batch.wgsl"), "relu2_mul_batch"),
             add_inplace_batch: make(include_str!("shaders/add_inplace_batch.wgsl"), "add_inplace_batch"),
             add_broadcast_batch: make(include_str!("shaders/add_broadcast_batch.wgsl"), "add_broadcast_batch"),
             kv_write_batch: make(include_str!("shaders/kv_write_batch.wgsl"), "kv_write_batch"),
@@ -294,6 +301,8 @@ impl Pipelines {
             attn_value_batch: make(include_str!("shaders/attn_value_batch.wgsl"), "attn_value_batch"),
             // Resident-weight ternary path — entry point differs from "main"
             ternary_matvec: make_with_entry(TERNARY_SHADER, "ternary_matvec_resident", "ternary_matvec"),
+            quantize_absmax_batch: make(include_str!("shaders/quantize_absmax_batch.wgsl"), "quantize_absmax_batch"),
+            ternary_matmul_batch: make(include_str!("shaders/ternary_matmul_batch.wgsl"), "ternary_matmul_batch"),
             bias_add_batch: make(include_str!("shaders/bias_add_batch.wgsl"), "bias_add_batch"),
         }
     }
@@ -881,5 +890,323 @@ mod tests {
         let hi0 = half::f16::from_bits((packed[0] >> 16) as u16).to_f32();
         assert!((lo0 - 1.0).abs() < 0.01);
         assert!((hi0 - 2.0).abs() < 0.01);
+    }
+
+    // ===== Batched ternary matmul (#bn-7) =====
+
+    /// Read N u32s back from a GPU buffer via a staging copy.
+    fn readback_u32(gpu: &GpuDevice, staging: &wgpu::Buffer, n: usize) -> Vec<u32> {
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| { tx.send(result).ok(); });
+        gpu.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        let out: Vec<u32> = data[..n * 4].chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        drop(data);
+        staging.unmap();
+        out
+    }
+
+    fn readback_f32(gpu: &GpuDevice, staging: &wgpu::Buffer, n: usize) -> Vec<f32> {
+        let raw = readback_u32(gpu, staging, n);
+        raw.iter().map(|&u| f32::from_bits(u)).collect()
+    }
+
+    fn readback_i32(gpu: &GpuDevice, staging: &wgpu::Buffer, n: usize) -> Vec<i32> {
+        let raw = readback_u32(gpu, staging, n);
+        raw.iter().map(|&u| u as i32).collect()
+    }
+    // Suppress an unused-function warning when readback_i32 isn't exercised
+    // in every test build.
+    #[allow(dead_code)]
+    fn _force_use(_: fn(&GpuDevice, &wgpu::Buffer, usize) -> Vec<i32>) {}
+
+    /// Pack i8 → u32 (4 per u32) using the same layout the ternary_matmul_batch
+    /// shader reads. Caller validates round-trip when comparing shader vs CPU.
+    fn pack_i8_to_u32(values: &[i8]) -> Vec<u32> {
+        let n_u32 = (values.len() + 3) / 4;
+        let mut out = vec![0u32; n_u32];
+        for (i, &v) in values.iter().enumerate() {
+            let byte = (v as i32 & 0xFF) as u32;
+            out[i / 4] |= byte << ((i % 4) * 8);
+        }
+        out
+    }
+
+    #[test]
+    fn quantize_absmax_batch_parity() {
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        use crate::ops::quantize::quantize_per_token;
+
+        let n_tokens = 4usize;
+        let cols = 64usize;
+        let mut rng: u64 = 0xCAFE_F00D;
+        let mut input: Vec<f32> = Vec::with_capacity(n_tokens * cols);
+        for _ in 0..(n_tokens * cols) {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let frac = ((rng >> 33) as f32) / (i32::MAX as f32);
+            input.push(frac * 5.0 - 2.5);
+        }
+        let (cpu_q, cpu_scales) = quantize_per_token(&input, cols);
+
+        // Build GPU buffers.
+        let in_bytes = bytemuck::cast_slice(&input);
+        let input_buf = gpu.create_storage_buffer(in_bytes, "test.input");
+        let n_u32_per_token = (cols + 3) / 4;
+        let act_q_buf = gpu.create_empty_buffer(
+            (n_tokens * n_u32_per_token * 4) as u64, "test.act_q",
+        );
+        let scales_buf = gpu.create_empty_buffer((n_tokens * 4) as u64, "test.scales");
+
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct P { cols: u32, n_tokens: u32 }
+        let params_buf = gpu.create_params_buffer(&P {
+            cols: cols as u32, n_tokens: n_tokens as u32,
+        });
+
+        let pipeline = &gpu.pipelines.quantize_absmax_batch;
+        let bind = gpu.make_bind_group(pipeline, &[&input_buf, &act_q_buf, &scales_buf, &params_buf]);
+
+        let act_q_staging = gpu.create_staging_buffer((n_tokens * n_u32_per_token * 4) as u64);
+        let scales_staging = gpu.create_staging_buffer((n_tokens * 4) as u64);
+
+        let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None, timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(n_tokens as u32, 1, 1);
+        }
+        enc.copy_buffer_to_buffer(&act_q_buf, 0, &act_q_staging, 0, (n_tokens * n_u32_per_token * 4) as u64);
+        enc.copy_buffer_to_buffer(&scales_buf, 0, &scales_staging, 0, (n_tokens * 4) as u64);
+        gpu.queue.submit(Some(enc.finish()));
+
+        let gpu_q_packed = readback_u32(&gpu, &act_q_staging, n_tokens * n_u32_per_token);
+        let gpu_scales = readback_f32(&gpu, &scales_staging, n_tokens);
+
+        // Compare scales.
+        for (i, (g, c)) in gpu_scales.iter().zip(cpu_scales.iter()).enumerate() {
+            assert!((g - c).abs() < 1e-6, "scale mismatch at token {i}: gpu={g}, cpu={c}");
+        }
+
+        // Compare quantized values element-by-element (unpack the u32 packing).
+        let mut gpu_q_i8: Vec<i8> = Vec::with_capacity(n_tokens * cols);
+        for tok in 0..n_tokens {
+            for col in 0..cols {
+                let u = gpu_q_packed[tok * n_u32_per_token + col / 4];
+                let byte = (u >> ((col % 4) * 8)) & 0xFF;
+                let signed = if byte > 127 { byte as i32 - 256 } else { byte as i32 };
+                gpu_q_i8.push(signed as i8);
+            }
+        }
+        for (i, (g, c)) in gpu_q_i8.iter().zip(cpu_q.iter()).enumerate() {
+            assert_eq!(g, c, "quantized mismatch at {i}: gpu={g}, cpu={c}");
+        }
+    }
+
+    #[test]
+    fn ternary_matmul_batch_parity() {
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let scalar = crate::compute::scalar::ScalarBackend;
+
+        let rows = 32usize;
+        let cols = 64usize;
+        let n_tokens = 4usize;
+        let weight_scale = 0.0123f32;
+
+        // Random ternary weights + i8 activations + per-token scales.
+        let mut rng: u64 = 0xBEEF_CAFE;
+        let mut w_i8: Vec<i8> = Vec::with_capacity(rows * cols);
+        for _ in 0..(rows * cols) {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            w_i8.push(((rng >> 33) % 3) as i8 - 1);
+        }
+        let w = weights_from_i8(&w_i8, rows, cols);
+
+        let mut acts: Vec<i8> = Vec::with_capacity(n_tokens * cols);
+        for _ in 0..(n_tokens * cols) {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let v = ((rng >> 33) % 255) as i32 - 127;
+            acts.push(v as i8);
+        }
+        let scales: Vec<f32> = (0..n_tokens)
+            .map(|i| 0.001 * (i as f32 + 1.0))
+            .collect();
+
+        // Build a GpuBitLinear so we can reuse the resident-weight buffer
+        // path (matches the production dispatch site).
+        let gpu_arc = std::sync::Arc::new(gpu);
+        let bit_layer = crate::layers::gpu_bitlinear::GpuBitLinear::from_weights(
+            gpu_arc.clone(), w.clone(), weight_scale,
+        );
+
+        // Pack activations + upload scales as separate buffers.
+        let act_u32 = pack_i8_to_u32(&acts);
+        let act_bytes: Vec<u8> = act_u32.iter().flat_map(|u| u.to_le_bytes()).collect();
+        let act_buf = gpu_arc.create_storage_buffer(&act_bytes, "test.acts");
+        let scales_bytes: Vec<u8> = scales.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let scales_buf = gpu_arc.create_storage_buffer(&scales_bytes, "test.scales");
+
+        let out_bytes = (n_tokens * rows * 4) as u64;
+        let out_buf = gpu_arc.create_empty_buffer(out_bytes, "test.out");
+        let out_staging = gpu_arc.create_staging_buffer(out_bytes);
+
+        // Dispatch via raw pipeline (mirrors what dispatch_ternary_matmul_batch_into does).
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct P { rows: u32, cols: u32, n_tokens: u32, weight_scale_bits: u32 }
+        let params_buf = gpu_arc.create_params_buffer(&P {
+            rows: rows as u32, cols: cols as u32, n_tokens: n_tokens as u32,
+            weight_scale_bits: weight_scale.to_bits(),
+        });
+        let pipeline = &gpu_arc.pipelines.ternary_matmul_batch;
+        let bind = gpu_arc.make_bind_group(
+            pipeline,
+            &[bit_layer.weight_buffer(), &act_buf, &scales_buf, &out_buf, &params_buf],
+        );
+
+        let mut enc = gpu_arc.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None, timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            let dx = rows.min(65535) as u32;
+            let dy = ((rows + 65534) / 65535) as u32;
+            pass.dispatch_workgroups(dx, dy, n_tokens as u32);
+        }
+        enc.copy_buffer_to_buffer(&out_buf, 0, &out_staging, 0, out_bytes);
+        gpu_arc.queue.submit(Some(enc.finish()));
+
+        let gpu_out = readback_f32(&gpu_arc, &out_staging, n_tokens * rows);
+
+        // CPU reference: for each token, ternary_matvec(weights, acts[tok]) * scale[tok] * weight_scale.
+        for tok in 0..n_tokens {
+            let acts_t = &acts[tok * cols..(tok + 1) * cols];
+            let cpu_i32 = scalar.ternary_matvec(&w, acts_t);
+            for row in 0..rows {
+                let expected = cpu_i32[row] as f32 * scales[tok] * weight_scale;
+                let actual = gpu_out[tok * rows + row];
+                assert!(
+                    (actual - expected).abs() < 1e-4,
+                    "row {row} tok {tok}: gpu={actual}, cpu={expected}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ternary_pipeline_end_to_end() {
+        // f32 hidden → quantize_absmax_batch → ternary_matmul_batch
+        // Compared against BitLinear::forward looped per-token.
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        use crate::layers::bitlinear::BitLinear;
+        use crate::layers::linear::LinearLayer;
+
+        let rows = 16usize;
+        let cols = 32usize;
+        let n_tokens = 3usize;
+        let weight_scale = 0.05f32;
+
+        let mut rng: u64 = 0x1234_5678_DEAD_BEEF;
+        let mut w_i8: Vec<i8> = Vec::with_capacity(rows * cols);
+        for _ in 0..(rows * cols) {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            w_i8.push(((rng >> 33) % 3) as i8 - 1);
+        }
+        let w_tensor = weights_from_i8(&w_i8, rows, cols);
+
+        let mut hidden_f32: Vec<f32> = Vec::with_capacity(n_tokens * cols);
+        for _ in 0..(n_tokens * cols) {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let frac = ((rng >> 33) as f32) / (i32::MAX as f32);
+            hidden_f32.push(frac * 2.0 - 1.0);
+        }
+
+        // CPU reference: BitLinear forward looped per token (this is the
+        // path the prefill currently degenerates to before #bn lands).
+        let cpu_layer = BitLinear::new(w_tensor.clone(), weight_scale);
+        let mut cpu_out: Vec<f32> = Vec::with_capacity(n_tokens * rows);
+        for tok in 0..n_tokens {
+            let row_in = &hidden_f32[tok * cols..(tok + 1) * cols];
+            cpu_out.extend(cpu_layer.forward(row_in));
+        }
+
+        // GPU pipeline: f32 → quantize → ternary matmul → f32.
+        let gpu_arc = std::sync::Arc::new(gpu);
+        let bit_layer = crate::layers::gpu_bitlinear::GpuBitLinear::from_weights(
+            gpu_arc.clone(), w_tensor, weight_scale,
+        );
+
+        let in_bytes: Vec<u8> = hidden_f32.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let in_buf = gpu_arc.create_storage_buffer(&in_bytes, "e2e.in");
+
+        let n_u32_per_token = (cols + 3) / 4;
+        let act_q_buf = gpu_arc.create_empty_buffer((n_tokens * n_u32_per_token * 4) as u64, "e2e.act_q");
+        let scales_buf = gpu_arc.create_empty_buffer((n_tokens * 4) as u64, "e2e.scales");
+        let out_bytes = (n_tokens * rows * 4) as u64;
+        let out_buf = gpu_arc.create_empty_buffer(out_bytes, "e2e.out");
+        let out_staging = gpu_arc.create_staging_buffer(out_bytes);
+
+        // Stage 1: quantize.
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct QP { cols: u32, n_tokens: u32 }
+        let qp_buf = gpu_arc.create_params_buffer(&QP {
+            cols: cols as u32, n_tokens: n_tokens as u32,
+        });
+        let q_pipe = &gpu_arc.pipelines.quantize_absmax_batch;
+        let q_bind = gpu_arc.make_bind_group(q_pipe, &[&in_buf, &act_q_buf, &scales_buf, &qp_buf]);
+
+        // Stage 2: ternary matmul.
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct MP { rows: u32, cols: u32, n_tokens: u32, ws_bits: u32 }
+        let mp_buf = gpu_arc.create_params_buffer(&MP {
+            rows: rows as u32, cols: cols as u32, n_tokens: n_tokens as u32,
+            ws_bits: weight_scale.to_bits(),
+        });
+        let m_pipe = &gpu_arc.pipelines.ternary_matmul_batch;
+        let m_bind = gpu_arc.make_bind_group(
+            m_pipe,
+            &[bit_layer.weight_buffer(), &act_q_buf, &scales_buf, &out_buf, &mp_buf],
+        );
+
+        let mut enc = gpu_arc.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None, timestamp_writes: None,
+            });
+            pass.set_pipeline(q_pipe);
+            pass.set_bind_group(0, &q_bind, &[]);
+            pass.dispatch_workgroups(n_tokens as u32, 1, 1);
+
+            pass.set_pipeline(m_pipe);
+            pass.set_bind_group(0, &m_bind, &[]);
+            let dx = rows.min(65535) as u32;
+            let dy = ((rows + 65534) / 65535) as u32;
+            pass.dispatch_workgroups(dx, dy, n_tokens as u32);
+        }
+        enc.copy_buffer_to_buffer(&out_buf, 0, &out_staging, 0, out_bytes);
+        gpu_arc.queue.submit(Some(enc.finish()));
+
+        let gpu_out = readback_f32(&gpu_arc, &out_staging, n_tokens * rows);
+
+        // Tolerance: per-token quantization rounding noise. With cols=32 and
+        // small weight magnitudes this is well under 1e-3 in practice.
+        for (i, (g, c)) in gpu_out.iter().zip(cpu_out.iter()).enumerate() {
+            assert!(
+                (g - c).abs() < 5e-4,
+                "mismatch at {i} (tok={}, row={}): gpu={g}, cpu={c}, diff={}",
+                i / rows, i % rows, (g - c).abs(),
+            );
+        }
     }
 }
