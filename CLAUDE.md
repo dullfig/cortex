@@ -212,7 +212,17 @@ Run all: `cargo test --workspace`
       capital of France is Paris. Paris is known for its historical
       landmarks, cultural institutions, and..."). Three shader-level
       parity tests + one toy-block integration test cover the new
-      surface; workspace tests at 396/396
+      surface; workspace tests at 396/396.
+      Also: routed non-streaming `chat_completions` through
+      `generate_stateless_gpu` (same path streaming uses) instead of
+      the per-layer-CPU-sync `engine.generate()` fallback. Bitnet
+      non-streaming jumps 6-7x (1.7→12.5 t/s @ 32 tokens, 2.8→18.1
+      t/s @ 128, ~3→19.1 t/s @ 256). Float Q4_K_M unchanged. Single-
+      token `ternary_matvec` shader also tuned (16-col tile, unrolled
+      decode, branchless sign) but the routing win dominates;
+      `cortex_local::CortexLocal::complete()` still uses the slow
+      `model.generate()` path and would need analogous wrapping in
+      `GpuEngine` to match — separate follow-up.
 - [x] `POST /v1/shims/embed` — text → pooled hidden-state vector.
       Used by AgentOS for shim-classifier training so trained shims
       operate over the same substrate they'll see at inference time

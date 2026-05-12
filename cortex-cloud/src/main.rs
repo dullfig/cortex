@@ -1979,11 +1979,20 @@ async fn chat_completions(
         let len = generated.len() as u32;
         (generated, len)
     } else {
-        // Stateless, no shims: existing CPU full-forward generate path.
-        let output_tokens = tokio::task::block_in_place(|| {
-            state.engine.generate(&prompt_tokens, max_tokens, sampler_config, seed, Some(eos))
+        // Stateless, no shims: route through the GPU batch path so bitnet
+        // (and any ternary GGUF) gets the same per-token throughput as the
+        // streaming wire. The old fallback called engine.generate() which
+        // delegates to cpu.generate() and pays a CPU↔GPU sync per layer
+        // per token — ~2 t/s on Qwen-sized bitnet vs ~18 t/s through the
+        // batch shaders. generate_stateless_gpu with empty steers/inject
+        // is equivalent semantically to the prior CPU path (greedy/temp=0
+        // matches; sampling differs only in float-order accumulation).
+        let generated = tokio::task::block_in_place(|| {
+            generate_stateless_gpu(
+                &state.engine, &prompt_tokens, sampler_config, seed, eos,
+                max_tokens, state.max_seq_len, &[], &[],
+            )
         });
-        let generated = output_tokens[prompt_tokens.len()..].to_vec();
         let len = generated.len() as u32;
         (generated, len)
     };

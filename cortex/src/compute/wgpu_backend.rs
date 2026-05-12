@@ -493,6 +493,18 @@ impl std::fmt::Debug for WgpuBackend {
 
 /// Ternary matvec shader — separate from the f16 shaders above.
 /// Unpacks 2-bit packed weights and i8 activations on GPU.
+///
+/// Inner-loop layout: each thread tiles 16 columns per outer iteration,
+/// since one u32 of weights packs exactly 16 ternary values (2 bits each)
+/// and four u32s of activations cover 16 i8 entries. The unrolled
+/// 16-step decode amortizes the bit-shift overhead vs the previous
+/// per-element loop (~6x fewer global memory ops). A scalar tail handles
+/// the residual columns when `cols % 16 != 0` (toy test fixtures hit
+/// this; production models all have cols divisible by 16+).
+///
+/// Decode is branchless: `sign = i32(w_bits == 2) - i32(w_bits == 0)`,
+/// then `acc += act * sign`. Encoding: 0 → -1, 1 → 0, 2 → +1, 3 → 0
+/// (same as the previous shader and matches CPU `ternary_matvec`).
 const TERNARY_SHADER: &str = r#"
 struct Params {
     rows: u32,
@@ -507,6 +519,14 @@ struct Params {
 const WG_SIZE: u32 = 256u;
 var<workgroup> shared_acc: array<i32, 256>;
 
+// Decode one i8 from a u32 holding 4 packed acts at byte `k mod 4`.
+fn unpack_i8(packed: u32, k: u32) -> i32 {
+    let byte = (packed >> ((k & 3u) * 8u)) & 0xFFu;
+    var v: i32 = i32(byte);
+    if (v > 127) { v = v - 256; }
+    return v;
+}
+
 @compute @workgroup_size(256)
 fn ternary_matvec(
     @builtin(local_invocation_index) lid: u32,
@@ -518,7 +538,59 @@ fn ternary_matvec(
     let cols = params.cols;
     var acc: i32 = 0;
 
-    var col = lid;
+    // Bulk path: process 16 columns per thread per outer iteration.
+    // Each iter reads one weight u32 (= 16 packed ternary weights for
+    // flat positions [row*cols + col_base, row*cols + col_base + 15])
+    // and four activation u32s (= 16 i8 values at cols [col_base, +15]).
+    let aligned_cols: u32 = (cols / 16u) * 16u;
+    var col_base: u32 = lid * 16u;
+    let stride: u32 = WG_SIZE * 16u;
+
+    while (col_base < aligned_cols) {
+        let w_flat: u32 = row * cols + col_base;
+        let w_u32: u32 = weights[w_flat / 16u];
+
+        let a_base: u32 = col_base / 4u;
+        let a0: u32 = activations[a_base];
+        let a1: u32 = activations[a_base + 1u];
+        let a2: u32 = activations[a_base + 2u];
+        let a3: u32 = activations[a_base + 3u];
+
+        // Unrolled 16-step decode. The inner branch chooses which act u32
+        // to pull from based on the (compile-time-constant) tile index.
+        // Branchless decode: contribution = act * sign.
+        // k = 0..3   → a0   (act bytes 0..3 of a0)
+        // k = 4..7   → a1
+        // k = 8..11  → a2
+        // k = 12..15 → a3
+        for (var k: u32 = 0u; k < 4u; k = k + 1u) {
+            let w_bits = (w_u32 >> (k * 2u)) & 3u;
+            let sign = i32(w_bits == 2u) - i32(w_bits == 0u);
+            acc += unpack_i8(a0, k) * sign;
+        }
+        for (var k: u32 = 4u; k < 8u; k = k + 1u) {
+            let w_bits = (w_u32 >> (k * 2u)) & 3u;
+            let sign = i32(w_bits == 2u) - i32(w_bits == 0u);
+            acc += unpack_i8(a1, k) * sign;
+        }
+        for (var k: u32 = 8u; k < 12u; k = k + 1u) {
+            let w_bits = (w_u32 >> (k * 2u)) & 3u;
+            let sign = i32(w_bits == 2u) - i32(w_bits == 0u);
+            acc += unpack_i8(a2, k) * sign;
+        }
+        for (var k: u32 = 12u; k < 16u; k = k + 1u) {
+            let w_bits = (w_u32 >> (k * 2u)) & 3u;
+            let sign = i32(w_bits == 2u) - i32(w_bits == 0u);
+            acc += unpack_i8(a3, k) * sign;
+        }
+
+        col_base += stride;
+    }
+
+    // Tail path: any cols in [aligned_cols, cols). Per-element with
+    // stride-WG_SIZE. Mirrors the original shader's semantics so the
+    // small-cols test fixtures (cols=2, cols=4) still pass.
+    var col: u32 = aligned_cols + lid;
     while (col < cols) {
         let flat = row * cols + col;
         let w_byte_idx = flat / 4u;
@@ -528,15 +600,9 @@ fn ternary_matvec(
         let w_bits = (w_byte >> w_bit_shift) & 3u;
 
         let act_u32 = activations[col / 4u];
-        let act_byte = (act_u32 >> ((col % 4u) * 8u)) & 0xFFu;
-        var act_val: i32 = i32(act_byte);
-        if (act_val > 127) { act_val = act_val - 256; }
-
-        if (w_bits == 0u) {
-            acc -= act_val;
-        } else if (w_bits == 2u) {
-            acc += act_val;
-        }
+        let act_val = unpack_i8(act_u32, col);
+        let sign = i32(w_bits == 2u) - i32(w_bits == 0u);
+        acc += act_val * sign;
 
         col += WG_SIZE;
     }
