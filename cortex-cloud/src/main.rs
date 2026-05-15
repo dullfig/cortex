@@ -2353,6 +2353,27 @@ async fn cache_load(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<CacheLoadRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    // Pre-flight overflow check (Bug 1): return a structured 400 instead
+    // of letting `forward_full_gpu_with_cache_returning_hidden` panic
+    // inside `block_in_place`.
+    if req.tokens.len() + SINK_TOKENS > state.max_seq_len {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "cache_overflow",
+                    "message": format!(
+                        "cache_load would overflow: {} tokens + {} sinks > {} (--max-seq-len). \
+                         Increase --max-seq-len at server startup or shard the corpus.",
+                        req.tokens.len(), SINK_TOKENS, state.max_seq_len),
+                    "cache_id": req.cache_id,
+                    "tokens_to_load": req.tokens.len(),
+                    "max_seq_len": state.max_seq_len,
+                }
+            })),
+        ));
+    }
+
     let mut cache = state.engine.create_gpu_kv_cache(state.max_seq_len);
 
     // Prepend sink tokens (BOS repeated) to absorb position-0 attention
@@ -2363,8 +2384,25 @@ async fn cache_load(
     all_tokens.extend_from_slice(&req.tokens);
 
     if !all_tokens.is_empty() {
+        // Chunk to keep BlockScratch.scores under the safe budget — same
+        // wedge protection as cache_append. Uses the no-LM-head forward
+        // variant since cache_load discards logits.
+        let n_heads = state.engine.cpu().blocks()[0].attention().n_heads();
+        let cache_id_for_log = req.cache_id.clone();
         tokio::task::block_in_place(|| {
-            let _ = state.engine.forward_full_gpu_with_cache(&all_tokens, &mut cache);
+            forward_chunked_into_cache(
+                &state.engine, &all_tokens, &mut cache, n_heads,
+                |chunk_idx, chunk_size, new_seq_len, chunk_ms| {
+                    tracing::debug!(
+                        cache_id = %cache_id_for_log,
+                        chunk = chunk_idx,
+                        chunk_tokens = chunk_size,
+                        new_seq_len,
+                        chunk_ms,
+                        "cache_load chunk",
+                    );
+                },
+            );
         });
     }
 
@@ -2429,57 +2467,191 @@ async fn cache_load(
 ///
 /// Runs forward_cached on the new tokens against the existing cache.
 /// "append extends" — the cache grows by the new tokens.
+/// Largest n_tokens to feed into a single `forward_full_gpu_with_cache`
+/// call given the existing cache size. The attention scratch buffer
+/// (`BlockScratch.scores`) is sized as `n_tokens * n_heads * (start_pos
+/// + n_tokens) * 4` bytes. wgpu/Vulkan begins to silently hang the
+/// forward at scratch sizes around 1 GB on typical hardware (4080
+/// Laptop, 12 GB VRAM, Vulkan), so we budget 512 MB and chunk
+/// accordingly.
+///
+/// Solving `n * (start_pos + n) * n_heads * 4 < BUDGET`:
+///   n^2 + start_pos * n - BUDGET / (n_heads * 4) < 0
+///   n < (-start_pos + sqrt(start_pos^2 + BUDGET / n_heads)) / 2
+fn safe_chunk_size(start_pos: usize, n_heads: usize) -> usize {
+    const SCORES_BUDGET_BYTES: usize = 512 * 1024 * 1024;
+    let term = SCORES_BUDGET_BYTES / (n_heads * std::mem::size_of::<f32>());
+    let sp = start_pos as f64;
+    let disc = (sp * sp + term as f64).sqrt();
+    let n_max = ((-sp + disc) * 0.5).floor() as usize;
+    n_max.max(1)
+}
+
+/// Run `forward_full_gpu_with_cache_returning_hidden` on `tokens` in
+/// safe-sized chunks against `cache`. Used by both `cache_load` and
+/// `cache_append` to prevent wgpu from wedging on huge BlockScratch.scores
+/// allocations at large cumulative seq_len. Caller is responsible for
+/// ensuring the cache has capacity (`cache.seq_len() + tokens.len() <=
+/// cache.max_seq_len()`); this fn does NOT validate.
+///
+/// The `progress` callback fires after each chunk with the chunk index,
+/// chunk size, and new cumulative seq_len. Use it for tracing or to
+/// report streaming progress to the client.
+fn forward_chunked_into_cache<F>(
+    engine: &GpuEngine,
+    tokens: &[u32],
+    cache: &mut GpuKvCache,
+    n_heads: usize,
+    mut progress: F,
+)
+where
+    F: FnMut(usize, usize, usize, u64),
+{
+    let mut tokens_remaining = tokens;
+    let mut chunk_idx = 0usize;
+    while !tokens_remaining.is_empty() {
+        let start = cache.seq_len();
+        let chunk_size = safe_chunk_size(start, n_heads).min(tokens_remaining.len());
+        let chunk = &tokens_remaining[..chunk_size];
+        chunk_idx += 1;
+        let t0 = Instant::now();
+        let _ = engine.forward_full_gpu_with_cache_returning_hidden(chunk, cache);
+        progress(chunk_idx, chunk_size, cache.seq_len(), t0.elapsed().as_millis() as u64);
+        tokens_remaining = &tokens_remaining[chunk_size..];
+    }
+}
+
 async fn cache_append(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<CacheAppendRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    let mut pool = state.cache_pool.lock().await;
-    let entry = pool.get_mut(&req.cache_id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": {
-                    "type": "cache_not_found",
-                    "message": format!("cache_id '{}' not found", req.cache_id),
-                    "cache_id": req.cache_id,
-                }
-            })),
-        )
-    })?;
-
-    if !req.tokens.is_empty() {
-        tokio::task::block_in_place(|| {
-            let _ = state.engine.forward_full_gpu_with_cache(&req.tokens, &mut entry.cache);
-        });
-        entry.tokens.extend_from_slice(&req.tokens);
-        entry.version += 1;
-        // The polar cache (if any) was a snapshot of the f32 cache at
-        // load time. After append, it's stale. Drop it; the next /v1/retrieve
-        // against this shard will fall back to the f32 path. A future
-        // refinement can rebuild the polar cache here, but for first wiring
-        // we keep it conservative.
-        entry.polar = None;
+    // Verify the cache exists before kicking off any GPU work. Snapshot
+    // metadata (current seq_len for chunk sizing, max_seq_len for the
+    // overflow error message), then drop the lock so /health stays
+    // responsive while the forward runs.
+    {
+        let pool = state.cache_pool.lock().await;
+        if !pool.contains_key(&req.cache_id) {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": {
+                        "type": "cache_not_found",
+                        "message": format!("cache_id '{}' not found", req.cache_id),
+                        "cache_id": req.cache_id,
+                    }
+                })),
+            ));
+        }
     }
 
-    entry.last_used = Instant::now();
-    let seq_len = entry.cache.seq_len();
-    drop(pool);
-    // Invalidate composition cache; any composition that included this
-    // shard is now stale (version bumped above).
-    if !req.tokens.is_empty() {
+    let final_seq_len = if req.tokens.is_empty() {
+        // Re-acquire briefly to read current seq_len for the response.
+        let pool = state.cache_pool.lock().await;
+        pool.get(&req.cache_id).map(|e| e.cache.seq_len()).unwrap_or(0)
+    } else {
+        // Pre-flight overflow check using a snapshot of current seq_len.
+        // The actual cache may grow concurrently if other appends race
+        // (no protection here in v1; cache_append is single-writer per
+        // shard by convention), but this catches the common case.
+        let n_heads = state.engine.cpu().blocks()[0].attention().n_heads();
+        let (start_seq, max_seq) = {
+            let pool = state.cache_pool.lock().await;
+            let e = pool.get(&req.cache_id).unwrap();
+            (e.cache.seq_len(), e.cache.max_seq_len())
+        };
+        if start_seq + req.tokens.len() > max_seq {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "type": "cache_overflow",
+                        "message": format!(
+                            "cache '{}' would overflow: {} + {} > {} (--max-seq-len). \
+                             Increase --max-seq-len at server startup or shard the corpus.",
+                            req.cache_id, start_seq, req.tokens.len(), max_seq),
+                        "cache_id": req.cache_id,
+                        "current_seq_len": start_seq,
+                        "tokens_to_append": req.tokens.len(),
+                        "max_seq_len": max_seq,
+                    }
+                })),
+            ));
+        }
+
+        // Chunk the tokens to keep BlockScratch.scores under the safe
+        // budget. Each chunk runs the GPU forward, advances the cache,
+        // and updates entry state. The pool lock is acquired BRIEFLY
+        // around each chunk's mutation (to allow /health and other
+        // handlers a chance to schedule between chunks), held DURING
+        // the GPU work for that chunk only (memex's sequential append
+        // pattern means no other writer is racing for this shard).
+        //
+        // We use forward_full_gpu_with_cache_returning_hidden — which
+        // skips the LM-head projection — because cache_append discards
+        // the logits anyway. Saves ~10s per chunk on Qwen-class vocab.
+        let mut current_start = start_seq;
+        let mut tokens_remaining = &req.tokens[..];
+        while !tokens_remaining.is_empty() {
+            let next_start = current_start;
+            let chunk_size = safe_chunk_size(next_start, n_heads).min(tokens_remaining.len());
+            let chunk = &tokens_remaining[..chunk_size];
+
+            // Hold the pool lock only across the GPU work for THIS chunk.
+            // Between chunks the lock is released so /health can land.
+            let mut pool = state.cache_pool.lock().await;
+            let entry = pool.get_mut(&req.cache_id).ok_or_else(|| (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": {
+                        "type": "cache_not_found",
+                        "message": format!("cache_id '{}' evicted mid-append", req.cache_id),
+                    }
+                })),
+            ))?;
+            let chunk_t0 = Instant::now();
+            tokio::task::block_in_place(|| {
+                let _ = state.engine.forward_full_gpu_with_cache_returning_hidden(
+                    chunk, &mut entry.cache,
+                );
+            });
+            entry.tokens.extend_from_slice(chunk);
+            entry.version += 1;
+            entry.polar = None;
+            entry.last_used = Instant::now();
+            current_start = entry.cache.seq_len();
+            let chunk_ms = chunk_t0.elapsed().as_millis() as u64;
+            drop(pool);
+
+            tracing::debug!(
+                cache_id = %req.cache_id,
+                chunk_tokens = chunk_size,
+                start_pos = next_start,
+                new_seq_len = current_start,
+                chunk_ms,
+                "cache_append chunk",
+            );
+
+            tokens_remaining = &tokens_remaining[chunk_size..];
+        }
+
+        // Invalidate composition cache once at the end; any composition
+        // that included this shard is now stale (version bumped per chunk).
         *state.composition.lock().await = None;
-    }
+
+        current_start
+    };
 
     info!(
         cache_id = %req.cache_id,
-        seq_len = seq_len,
+        seq_len = final_seq_len,
         tokens_appended = req.tokens.len(),
         "cache appended",
     );
 
     Ok(Json(CacheInfoResponse {
         cache_id: req.cache_id,
-        seq_len,
+        seq_len: final_seq_len,
         max_seq_len: state.max_seq_len,
     }))
 }
@@ -3201,14 +3373,20 @@ async fn list_models(
 async fn health(
     State(state): State<Arc<ServerState>>,
 ) -> Json<HealthResponse> {
-    let pool = state.cache_pool.lock().await;
-    let total_tokens: usize = pool.values().map(|e| e.cache.seq_len()).sum();
+    // Use try_lock so /health stays responsive even when cache_append /
+    // cache_load are holding the pool mutex during a long forward pass.
+    // Reporting "(busy)" is much better than letting health probes hang
+    // — orchestrators (memex, AgentOS) need timely liveness signals.
+    let (pool_size, total_tokens) = match state.cache_pool.try_lock() {
+        Ok(pool) => (pool.len(), pool.values().map(|e| e.cache.seq_len()).sum()),
+        Err(_) => (0, 0), // pool busy; report zeros rather than hang
+    };
     Json(HealthResponse {
         status: "ready".to_string(),
         model: state.model_name.clone(),
         uptime_secs: state.start_time.elapsed().as_secs(),
         memory: HealthMemory {
-            cache_pool_size: pool.len(),
+            cache_pool_size: pool_size,
             cache_pool_total_tokens: total_tokens,
             max_seq_len: state.max_seq_len,
         },
