@@ -406,9 +406,34 @@ impl GpuEngine {
     /// Dispatch RMSNorm into `out_buf` from `in_buf`, using `weight_buf` for
     /// the per-feature scale. Both buffers are `[n_tokens, n]` flat. One
     /// workgroup per token via `rmsnorm_batch`.
+    ///
+    /// Opens its own compute pass. For callers that want to batch multiple
+    /// dispatches into a single pass (saves ~0.8ms of Vulkan
+    /// pipeline-barrier overhead per dispatch), use
+    /// `dispatch_rmsnorm_in_pass`.
     pub fn dispatch_rmsnorm_into(
         &self,
         encoder: &mut wgpu::CommandEncoder,
+        in_buf: &wgpu::Buffer,
+        weight_buf: &wgpu::Buffer,
+        out_buf: &wgpu::Buffer,
+        n: usize,
+        n_tokens: usize,
+        eps: f32,
+    ) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_engine.rmsnorm.pass"),
+            timestamp_writes: None,
+        });
+        self.dispatch_rmsnorm_in_pass(&mut pass, in_buf, weight_buf, out_buf, n, n_tokens, eps);
+    }
+
+    /// In-pass variant of `dispatch_rmsnorm_into`. Records the dispatch
+    /// into the caller-supplied compute pass instead of opening a new one.
+    /// See `dispatch_rmsnorm_into` for semantics.
+    pub fn dispatch_rmsnorm_in_pass(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
         in_buf: &wgpu::Buffer,
         weight_buf: &wgpu::Buffer,
         out_buf: &wgpu::Buffer,
@@ -424,10 +449,6 @@ impl GpuEngine {
         let bind = self.gpu.make_bind_group(
             pipeline, &[in_buf, weight_buf, out_buf, &params_buf],
         );
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("gpu_engine.rmsnorm.pass"),
-            timestamp_writes: None,
-        });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(n_tokens as u32, 1, 1);
@@ -445,12 +466,28 @@ impl GpuEngine {
         out_buf: &wgpu::Buffer,
         n_tokens: usize,
     ) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_engine.matmul.pass"),
+            timestamp_writes: None,
+        });
+        self.dispatch_matmul_in_pass(&mut pass, layer, in_buf, out_buf, n_tokens);
+    }
+
+    /// In-pass variant. See `dispatch_matmul_into`.
+    pub fn dispatch_matmul_in_pass(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        layer: &dyn LinearLayer,
+        in_buf: &wgpu::Buffer,
+        out_buf: &wgpu::Buffer,
+        n_tokens: usize,
+    ) {
         let float = layer
             .as_any()
             .downcast_ref::<crate::layers::gpu_floatlinear::GpuFloatLinear>()
             .unwrap_or_else(|| {
                 panic!(
-                    "GpuEngine.dispatch_matmul_into: layer is not GpuFloatLinear \
+                    "GpuEngine.dispatch_matmul_in_pass: layer is not GpuFloatLinear \
                      (concrete type: {:?})",
                     layer
                 )
@@ -473,16 +510,11 @@ impl GpuEngine {
             &[float.weight_buffer(), in_buf, out_buf, &params_buf],
         );
 
-        // Workgroup dispatch: x = row & 65535, y = row >> 16, z = tok.
         let rows = float.out_features();
         let dx = (rows.min(65535)) as u32;
         let dy = ((rows + 65534) / 65535) as u32;
         let dz = n_tokens as u32;
 
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("gpu_engine.matmul.pass"),
-            timestamp_writes: None,
-        });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(dx, dy, dz);
@@ -503,6 +535,25 @@ impl GpuEngine {
         cols: usize,
         n_tokens: usize,
     ) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_engine.quantize_absmax_batch.pass"),
+            timestamp_writes: None,
+        });
+        self.dispatch_quantize_absmax_batch_in_pass(
+            &mut pass, input_f32_buf, act_q_buf, act_scales_buf, cols, n_tokens,
+        );
+    }
+
+    /// In-pass variant. See `dispatch_quantize_absmax_batch_into`.
+    pub fn dispatch_quantize_absmax_batch_in_pass(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        input_f32_buf: &wgpu::Buffer,
+        act_q_buf: &wgpu::Buffer,
+        act_scales_buf: &wgpu::Buffer,
+        cols: usize,
+        n_tokens: usize,
+    ) {
         #[repr(C)]
         #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
         struct QuantParams { cols: u32, n_tokens: u32 }
@@ -515,10 +566,6 @@ impl GpuEngine {
             &[input_f32_buf, act_q_buf, act_scales_buf, &params_buf],
         );
 
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("gpu_engine.quantize_absmax_batch.pass"),
-            timestamp_writes: None,
-        });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(n_tokens as u32, 1, 1);
@@ -532,6 +579,25 @@ impl GpuEngine {
     pub fn dispatch_ternary_matmul_batch_into(
         &self,
         encoder: &mut wgpu::CommandEncoder,
+        layer: &crate::layers::gpu_bitlinear::GpuBitLinear,
+        act_q_buf: &wgpu::Buffer,
+        act_scales_buf: &wgpu::Buffer,
+        out_f32_buf: &wgpu::Buffer,
+        n_tokens: usize,
+    ) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_engine.ternary_matmul_batch.pass"),
+            timestamp_writes: None,
+        });
+        self.dispatch_ternary_matmul_batch_in_pass(
+            &mut pass, layer, act_q_buf, act_scales_buf, out_f32_buf, n_tokens,
+        );
+    }
+
+    /// In-pass variant. See `dispatch_ternary_matmul_batch_into`.
+    pub fn dispatch_ternary_matmul_batch_in_pass(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
         layer: &crate::layers::gpu_bitlinear::GpuBitLinear,
         act_q_buf: &wgpu::Buffer,
         act_scales_buf: &wgpu::Buffer,
@@ -560,10 +626,6 @@ impl GpuEngine {
         let dy = ((rows + 65534) / 65535) as u32;
         let dz = n_tokens as u32;
 
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("gpu_engine.ternary_matmul_batch.pass"),
-            timestamp_writes: None,
-        });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(dx, dy, dz);
@@ -584,24 +646,41 @@ impl GpuEngine {
         n_tokens: usize,
         ternary_scratch: &TernaryScratch,
     ) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_engine.linear_batch.pass"),
+            timestamp_writes: None,
+        });
+        self.dispatch_linear_batch_in_pass(&mut pass, layer, in_buf, out_buf, n_tokens, ternary_scratch);
+    }
+
+    /// In-pass variant. See `dispatch_linear_batch_into`.
+    pub fn dispatch_linear_batch_in_pass(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        layer: &dyn LinearLayer,
+        in_buf: &wgpu::Buffer,
+        out_buf: &wgpu::Buffer,
+        n_tokens: usize,
+        ternary_scratch: &TernaryScratch,
+    ) {
         let any = layer.as_any();
         if any.downcast_ref::<crate::layers::gpu_floatlinear::GpuFloatLinear>().is_some() {
-            self.dispatch_matmul_into(encoder, layer, in_buf, out_buf, n_tokens);
+            self.dispatch_matmul_in_pass(pass, layer, in_buf, out_buf, n_tokens);
             return;
         }
         if let Some(bit) = any.downcast_ref::<crate::layers::gpu_bitlinear::GpuBitLinear>() {
-            self.dispatch_quantize_absmax_batch_into(
-                encoder, in_buf, &ternary_scratch.activations_i8, &ternary_scratch.scales,
+            self.dispatch_quantize_absmax_batch_in_pass(
+                pass, in_buf, &ternary_scratch.activations_i8, &ternary_scratch.scales,
                 bit.in_features(), n_tokens,
             );
-            self.dispatch_ternary_matmul_batch_into(
-                encoder, bit, &ternary_scratch.activations_i8, &ternary_scratch.scales,
+            self.dispatch_ternary_matmul_batch_in_pass(
+                pass, bit, &ternary_scratch.activations_i8, &ternary_scratch.scales,
                 out_buf, n_tokens,
             );
             return;
         }
         panic!(
-            "GpuEngine.dispatch_linear_batch_into: layer is neither GpuFloatLinear \
+            "GpuEngine.dispatch_linear_batch_in_pass: layer is neither GpuFloatLinear \
              nor GpuBitLinear (concrete type: {:?})",
             layer
         );
@@ -1389,6 +1468,8 @@ impl GpuEngine {
             start_pos, n_tokens, cache.max_seq_len(),
         );
 
+        let t_start = std::time::Instant::now();
+
         // ---- Embedding lookup (CPU) ----
         let embed_data = self.cpu.embedding_data();
         let vocab_size = self.cpu.vocab_size();
@@ -1398,6 +1479,7 @@ impl GpuEngine {
             let off = tok as usize * self.embed_dim;
             hidden_init.extend_from_slice(&embed_data[off..off + self.embed_dim]);
         }
+        let t_embed = t_start.elapsed();
 
         let bytes = (hidden_init.len() * std::mem::size_of::<f32>()) as u64;
         let hidden_buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1412,6 +1494,7 @@ impl GpuEngine {
             mapped_at_creation: false,
         });
         let staging = self.gpu.create_staging_buffer(bytes);
+        let t_io_alloc = t_start.elapsed() - t_embed;
 
         let intermediate = self.cpu.blocks()[0].ffn().as_any()
             .downcast_ref::<crate::layers::swiglu::SwiGLU>()
@@ -1421,11 +1504,13 @@ impl GpuEngine {
         // Scratch sized for ATTENTION over the full prefix (max_seq =
         // start_pos + n_tokens). Scores buffer must hold the score grid.
         let attn_max_seq = start_pos + n_tokens;
+        let t_pre_scratch = t_start.elapsed();
         let scratch = BlockScratch::allocate(
             &self.gpu, n_tokens, self.embed_dim,
             attn0.n_heads(), attn0.n_kv_heads(), attn0.head_dim(),
             intermediate, attn_max_seq,
         );
+        let t_scratch = t_start.elapsed() - t_pre_scratch;
 
         // ---- All blocks + final_norm in one encoder ----
         let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1440,6 +1525,7 @@ impl GpuEngine {
                 "inject_deltas must be empty or have length n_layers ({})", n_layers,
             );
         }
+        let t_pre_record = t_start.elapsed();
         for i in 0..n_layers {
             let target = (cache.k_layer(i), cache.v_layer(i));
             let inject = inject_deltas.get(i).and_then(|opt| opt.as_ref());
@@ -1453,15 +1539,33 @@ impl GpuEngine {
             self.embed_dim, n_tokens, self.final_norm_eps,
         );
         encoder.copy_buffer_to_buffer(&normed_buf, 0, &staging, 0, bytes);
-        self.gpu.queue.submit(Some(encoder.finish()));
+        let t_record = t_start.elapsed() - t_pre_record;
 
+        let t_pre_submit = t_start.elapsed();
+        self.gpu.queue.submit(Some(encoder.finish()));
+        let t_submit = t_start.elapsed() - t_pre_submit;
+
+        let t_pre_readback = t_start.elapsed();
         let normed = read_back_buffer(&self.gpu, &staging, bytes as usize);
+        let t_readback = t_start.elapsed() - t_pre_readback;
 
         // Successful forward — bump the cache's write cursor. The caller
         // either runs `cpu().finalize_logits(&normed, n_tokens)` for plain
         // decode, or applies steer hidden_delta to the last token's slice
         // first and then re-projects.
         cache.advance(n_tokens);
+        let t_total = t_start.elapsed();
+        tracing::info!(
+            n_tokens, start_pos, attn_max_seq,
+            embed_us = t_embed.as_micros() as u64,
+            io_alloc_us = t_io_alloc.as_micros() as u64,
+            scratch_us = t_scratch.as_micros() as u64,
+            record_us = t_record.as_micros() as u64,
+            submit_us = t_submit.as_micros() as u64,
+            readback_us = t_readback.as_micros() as u64,
+            total_us = t_total.as_micros() as u64,
+            "fwd_cache stage timings",
+        );
         normed
     }
 
@@ -1611,21 +1715,17 @@ impl GpuEngine {
         let block_gpu = &self.blocks_gpu[block_idx];
         let attn = block.attention();
 
-        // Injection-phase hook (#6c). Broadcast-add a [embed_dim] delta
-        // into every token's hidden BEFORE this block's attn_norm. Deltas
-        // for `entrance:N` shims are computed once per request (caller's
-        // responsibility) and applied here at every forward step.
-        // Composition is sum (commutative, order-independent — the
-        // caller pre-sums multiple shims targeting the same layer).
-        if let Some(delta_buf) = pre_block_hidden_inject {
-            self.dispatch_add_broadcast_into(
-                encoder, hidden_buf, delta_buf, self.embed_dim, n_tokens,
-            );
-        }
+        // Per-block pass merging (#pass-2): collapse the ~17 sequential
+        // `begin_compute_pass` calls per block into 3 grouped passes
+        // separated only by encoder-level operations (copy_buffer_to_buffer
+        // for capture hooks) and the attention triple (which has its own
+        // internal pass splits at score↔softmax↔value hazards). Saves
+        // ~14 × ~0.8ms = ~11ms per block × 30 blocks = ~330ms per forward
+        // of Vulkan pipeline-barrier overhead.
 
         // BitNet b1.58 sub-norms (#bn-11): when present on the CPU layer,
         // their resident weight buffers are populated on the GpuBlock at
-        // construction. The dispatch sites below insert dispatch_rmsnorm_into
+        // construction. The dispatch sites below insert dispatch_rmsnorm
         // calls before o_proj / down_proj respectively.
         assert!((block.attn_residual_scale() - 1.0).abs() < f32::EPSILON,
             "forward_block_gpu requires attn_residual_scale == 1.0");
@@ -1636,73 +1736,81 @@ impl GpuEngine {
             .downcast_ref::<crate::layers::swiglu::SwiGLU>()
             .unwrap_or_else(|| panic!("forward_block_gpu requires SwiGLU FFN"));
         // Activation routing: SiLU (LLaMA / Qwen) or ReLU² (BitNet b1.58).
-        // dispatch_gate_mul_into picks the right pipeline at dispatch time.
 
         let n_heads = attn.n_heads();
         let n_kv_heads = attn.n_kv_heads();
         let head_dim = attn.head_dim();
         let embed_dim = self.embed_dim;
         let intermediate = swiglu.intermediate_size();
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
 
         assert!(start_pos + n_tokens <= self.rope_max_seq,
             "start_pos + n_tokens ({}) exceeds rope_max_seq ({})",
             start_pos + n_tokens, self.rope_max_seq);
 
-        // ===== ATTENTION SUBLAYER =====
+        // ----- PASS 1: inject (optional) + attn_norm + Q/K/V projs (+biases)
+        // + RoPE + kv_write. All dispatches read/write block-local scratch
+        // buffers with the implicit ordering wgpu enforces between dispatches
+        // in a single pass on most drivers.
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("gpu_engine.block.pass1"),
+                timestamp_writes: None,
+            });
 
-        // 1. attn_norm: hidden -> normed
-        self.dispatch_rmsnorm_into(
-            encoder, hidden_buf, &block_gpu.attn_norm_weight_buf, &scratch.normed,
-            embed_dim, n_tokens, block_gpu.attn_norm_eps,
-        );
+            // Injection-phase hook (#6c). Broadcast-add a [embed_dim] delta
+            // into every token's hidden BEFORE attn_norm.
+            if let Some(delta_buf) = pre_block_hidden_inject {
+                self.dispatch_add_broadcast_in_pass(
+                    &mut pass, hidden_buf, delta_buf, embed_dim, n_tokens,
+                );
+            }
 
-        // 2-4. Q, K, V projections (batch matmul) + optional Qwen-style biases.
-        // `dispatch_linear_batch_into` routes by layer concrete type:
-        //   GpuFloatLinear → existing float matmul shader
-        //   GpuBitLinear   → quantize_absmax_batch + ternary_matmul_batch
-        // Bias-add semantics unchanged (operates on f32 output either way).
-        let q_dim = n_heads * head_dim;
-        let kv_dim = n_kv_heads * head_dim;
-        self.dispatch_linear_batch_into(encoder, attn.q_proj(), &scratch.normed, &scratch.q, n_tokens, &scratch.ternary);
-        if let Some(buf) = block_gpu.q_bias_buf.as_ref() {
-            self.dispatch_bias_add_into(encoder, &scratch.q, buf, q_dim, n_tokens);
-        }
-        self.dispatch_linear_batch_into(encoder, attn.k_proj(), &scratch.normed, &scratch.k, n_tokens, &scratch.ternary);
-        if let Some(buf) = block_gpu.k_bias_buf.as_ref() {
-            self.dispatch_bias_add_into(encoder, &scratch.k, buf, kv_dim, n_tokens);
-        }
-        self.dispatch_linear_batch_into(encoder, attn.v_proj(), &scratch.normed, &scratch.v, n_tokens, &scratch.ternary);
-        if let Some(buf) = block_gpu.v_bias_buf.as_ref() {
-            self.dispatch_bias_add_into(encoder, &scratch.v, buf, kv_dim, n_tokens);
-        }
-
-        // 5. RoPE on Q and K
-        self.dispatch_rope_into(
-            encoder, &scratch.q, &self.rope_cos_buf, &self.rope_sin_buf,
-            n_heads, head_dim, start_pos, n_tokens,
-        );
-        self.dispatch_rope_into(
-            encoder, &scratch.k, &self.rope_cos_buf, &self.rope_sin_buf,
-            n_kv_heads, head_dim, start_pos, n_tokens,
-        );
-
-        // 5.5 (cached path) Write the freshly-projected, RoPE-rotated K/V
-        // into the layer's resident cache buffers at offset start_pos.
-        // Attention will then read K/V from the cache covering the full
-        // prefix [0, start_pos + n_tokens).
-        if let Some((k_cache, v_cache)) = kv_cache_target {
-            self.dispatch_kv_write_into(
-                encoder, &scratch.k, &scratch.v, k_cache, v_cache,
-                kv_dim, start_pos, n_tokens,
+            // 1. attn_norm: hidden -> normed
+            self.dispatch_rmsnorm_in_pass(
+                &mut pass, hidden_buf, &block_gpu.attn_norm_weight_buf, &scratch.normed,
+                embed_dim, n_tokens, block_gpu.attn_norm_eps,
             );
+
+            // 2-4. Q, K, V projections (+ optional Qwen-style biases)
+            self.dispatch_linear_batch_in_pass(&mut pass, attn.q_proj(), &scratch.normed, &scratch.q, n_tokens, &scratch.ternary);
+            if let Some(buf) = block_gpu.q_bias_buf.as_ref() {
+                self.dispatch_bias_add_in_pass(&mut pass, &scratch.q, buf, q_dim, n_tokens);
+            }
+            self.dispatch_linear_batch_in_pass(&mut pass, attn.k_proj(), &scratch.normed, &scratch.k, n_tokens, &scratch.ternary);
+            if let Some(buf) = block_gpu.k_bias_buf.as_ref() {
+                self.dispatch_bias_add_in_pass(&mut pass, &scratch.k, buf, kv_dim, n_tokens);
+            }
+            self.dispatch_linear_batch_in_pass(&mut pass, attn.v_proj(), &scratch.normed, &scratch.v, n_tokens, &scratch.ternary);
+            if let Some(buf) = block_gpu.v_bias_buf.as_ref() {
+                self.dispatch_bias_add_in_pass(&mut pass, &scratch.v, buf, kv_dim, n_tokens);
+            }
+
+            // 5. RoPE on Q and K (in-place on scratch.q / scratch.k)
+            self.dispatch_rope_in_pass(
+                &mut pass, &scratch.q, &self.rope_cos_buf, &self.rope_sin_buf,
+                n_heads, head_dim, start_pos, n_tokens,
+            );
+            self.dispatch_rope_in_pass(
+                &mut pass, &scratch.k, &self.rope_cos_buf, &self.rope_sin_buf,
+                n_kv_heads, head_dim, start_pos, n_tokens,
+            );
+
+            // 5.5 (cached path) Write K/V into the layer's resident cache.
+            if let Some((k_cache, v_cache)) = kv_cache_target {
+                self.dispatch_kv_write_in_pass(
+                    &mut pass, &scratch.k, &scratch.v, k_cache, v_cache,
+                    kv_dim, start_pos, n_tokens,
+                );
+            }
+            // pass1 ends here (drop)
         }
 
         // 6. Attention math: Q · K^T, softmax, weighted V.
-        //
-        // - Prefill-only (no cache): K/V live in scratch.k / scratch.v;
-        //   start_pos=0, max_seq=n_tokens.
-        // - Cached: K/V come from the cache buffers; max_seq = start_pos +
-        //   n_tokens covers the full prefix the new tokens attend to.
+        // Kept as its own dispatcher because score↔softmax↔value share
+        // scratch.scores with conflicting access — needs explicit pass
+        // splits inside `dispatch_attention_inner`.
         let (k_for_attn, v_for_attn, attn_max_seq) = match kv_cache_target {
             Some((kc, vc)) => (kc, vc, start_pos + n_tokens),
             None => (&scratch.k, &scratch.v, n_tokens),
@@ -1716,57 +1824,65 @@ impl GpuEngine {
             pre_softmax_capture,
         );
 
-        // 6.5 (BitNet b1.58) attention sub-norm: RMSNorm on scratch.attn_out
-        // BEFORE o_proj. Writes into scratch.normed (free between attention
-        // and o_proj; Q/K/V already consumed it earlier in the block).
-        let o_proj_in: &wgpu::Buffer = if let Some(sub_norm_w) = block_gpu.o_sub_norm_weight_buf.as_ref() {
-            self.dispatch_rmsnorm_into(
-                encoder, &scratch.attn_out, sub_norm_w, &scratch.normed,
-                embed_dim, n_tokens, block_gpu.o_sub_norm_eps,
+        // ----- PASS 2: o_sub_norm (BitNet) + o_proj + residual + ffn_norm
+        // + gate/up + silu_mul + ffn_sub_norm (BitNet) + down + residual.
+        // All purely intra-block; ends at the optional post-block capture
+        // (encoder copy outside any pass).
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("gpu_engine.block.pass2"),
+                timestamp_writes: None,
+            });
+
+            // 6.5 (BitNet) attention sub-norm before o_proj. Reuses
+            // scratch.normed (free after Q/K/V consumed it in pass 1).
+            let o_proj_in: &wgpu::Buffer = if let Some(sub_norm_w) = block_gpu.o_sub_norm_weight_buf.as_ref() {
+                self.dispatch_rmsnorm_in_pass(
+                    &mut pass, &scratch.attn_out, sub_norm_w, &scratch.normed,
+                    embed_dim, n_tokens, block_gpu.o_sub_norm_eps,
+                );
+                &scratch.normed
+            } else {
+                &scratch.attn_out
+            };
+
+            // 7. O projection: (sub-normed) attn_out -> projected
+            self.dispatch_linear_batch_in_pass(&mut pass, attn.o_proj(), o_proj_in, &scratch.projected, n_tokens, &scratch.ternary);
+
+            // 8. Residual: hidden += projected
+            self.dispatch_add_in_pass(&mut pass, hidden_buf, &scratch.projected, embed_dim, n_tokens);
+
+            // 9. ffn_norm: hidden -> normed
+            self.dispatch_rmsnorm_in_pass(
+                &mut pass, hidden_buf, &block_gpu.ffn_norm_weight_buf, &scratch.normed,
+                embed_dim, n_tokens, block_gpu.ffn_norm_eps,
             );
-            &scratch.normed
-        } else {
-            &scratch.attn_out
-        };
 
-        // 7. O projection: (sub-normed) attn_out -> projected
-        self.dispatch_linear_batch_into(encoder, attn.o_proj(), o_proj_in, &scratch.projected, n_tokens, &scratch.ternary);
+            // 10-11. Gate / Up projections
+            self.dispatch_linear_batch_in_pass(&mut pass, swiglu.gate_proj(), &scratch.normed, &scratch.gate, n_tokens, &scratch.ternary);
+            self.dispatch_linear_batch_in_pass(&mut pass, swiglu.up_proj(),   &scratch.normed, &scratch.up,   n_tokens, &scratch.ternary);
 
-        // 8. Residual: hidden += projected
-        self.dispatch_add_into(encoder, hidden_buf, &scratch.projected, embed_dim, n_tokens);
+            // 12. silu(gate) * up
+            self.dispatch_gate_mul_in_pass(&mut pass, &scratch.gate, &scratch.up, &scratch.activated, intermediate, n_tokens, swiglu.activation());
 
-        // ===== FFN SUBLAYER =====
+            // 12.5 (BitNet) FFN sub-norm before down_proj. Reuses scratch.up.
+            let down_proj_in: &wgpu::Buffer = if let Some(sub_norm_w) = block_gpu.ffn_sub_norm_weight_buf.as_ref() {
+                self.dispatch_rmsnorm_in_pass(
+                    &mut pass, &scratch.activated, sub_norm_w, &scratch.up,
+                    intermediate, n_tokens, block_gpu.ffn_sub_norm_eps,
+                );
+                &scratch.up
+            } else {
+                &scratch.activated
+            };
 
-        // 9. ffn_norm: hidden -> normed
-        self.dispatch_rmsnorm_into(
-            encoder, hidden_buf, &block_gpu.ffn_norm_weight_buf, &scratch.normed,
-            embed_dim, n_tokens, block_gpu.ffn_norm_eps,
-        );
+            // 13. Down projection
+            self.dispatch_linear_batch_in_pass(&mut pass, swiglu.down_proj(), down_proj_in, &scratch.projected, n_tokens, &scratch.ternary);
 
-        // 10-11. Gate / Up projections
-        self.dispatch_linear_batch_into(encoder, swiglu.gate_proj(), &scratch.normed, &scratch.gate, n_tokens, &scratch.ternary);
-        self.dispatch_linear_batch_into(encoder, swiglu.up_proj(),   &scratch.normed, &scratch.up,   n_tokens, &scratch.ternary);
-
-        // 12. silu(gate) * up
-        self.dispatch_gate_mul_into(encoder, &scratch.gate, &scratch.up, &scratch.activated, intermediate, n_tokens, swiglu.activation());
-
-        // 12.5 (BitNet b1.58) FFN sub-norm: RMSNorm on silu(gate)*up BEFORE
-        // down_proj. Writes into scratch.up (free after silu_mul consumed it).
-        let down_proj_in: &wgpu::Buffer = if let Some(sub_norm_w) = block_gpu.ffn_sub_norm_weight_buf.as_ref() {
-            self.dispatch_rmsnorm_into(
-                encoder, &scratch.activated, sub_norm_w, &scratch.up,
-                intermediate, n_tokens, block_gpu.ffn_sub_norm_eps,
-            );
-            &scratch.up
-        } else {
-            &scratch.activated
-        };
-
-        // 13. Down projection
-        self.dispatch_linear_batch_into(encoder, swiglu.down_proj(), down_proj_in, &scratch.projected, n_tokens, &scratch.ternary);
-
-        // 14. Residual: hidden += projected
-        self.dispatch_add_into(encoder, hidden_buf, &scratch.projected, embed_dim, n_tokens);
+            // 14. Residual: hidden += projected
+            self.dispatch_add_in_pass(&mut pass, hidden_buf, &scratch.projected, embed_dim, n_tokens);
+            // pass2 ends here (drop)
+        }
 
         // 15. (optional) capture post-block hidden state — shim hook point.
         if let Some(capture_buf) = post_block_hidden_capture {
@@ -2099,6 +2215,26 @@ impl GpuEngine {
         start_pos: usize,
         n_tokens: usize,
     ) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_engine.rope.pass"),
+            timestamp_writes: None,
+        });
+        self.dispatch_rope_in_pass(&mut pass, x_buf, cos_buf, sin_buf, n_heads, head_dim, start_pos, n_tokens);
+    }
+
+    /// In-pass variant. See `dispatch_rope_into`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_rope_in_pass(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        x_buf: &wgpu::Buffer,
+        cos_buf: &wgpu::Buffer,
+        sin_buf: &wgpu::Buffer,
+        n_heads: usize,
+        head_dim: usize,
+        start_pos: usize,
+        n_tokens: usize,
+    ) {
         assert!(head_dim % 2 == 0, "RoPE head_dim must be even");
         let half_dim = head_dim / 2;
 
@@ -2118,14 +2254,9 @@ impl GpuEngine {
             &[x_buf, cos_buf, sin_buf, &params_buf],
         );
 
-        // Total threads = n_tokens * n_heads * half_dim. Workgroup size is 64.
         let total_threads = (n_tokens * n_heads * half_dim) as u32;
         let dispatch_x = (total_threads + 63) / 64;
 
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("gpu_engine.rope.pass"),
-            timestamp_writes: None,
-        });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups(dispatch_x, 1, 1);
@@ -2325,6 +2456,25 @@ impl GpuEngine {
         n_tokens: usize,
         activation: crate::layers::swiglu::GateActivation,
     ) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_engine.gate_mul.pass"),
+            timestamp_writes: None,
+        });
+        self.dispatch_gate_mul_in_pass(&mut pass, gate_buf, up_buf, out_buf, n, n_tokens, activation);
+    }
+
+    /// In-pass variant. See `dispatch_gate_mul_into`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_gate_mul_in_pass(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        gate_buf: &wgpu::Buffer,
+        up_buf: &wgpu::Buffer,
+        out_buf: &wgpu::Buffer,
+        n: usize,
+        n_tokens: usize,
+        activation: crate::layers::swiglu::GateActivation,
+    ) {
         let params = SiluMulBatchParams { n: n as u32, n_tokens: n_tokens as u32 };
         let params_buf = self.gpu.create_params_buffer(&params);
 
@@ -2342,10 +2492,6 @@ impl GpuEngine {
         let dx = groups.min(65535);
         let dy = (groups + 65534) / 65535;
 
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("gpu_engine.gate_mul.pass"),
-            timestamp_writes: None,
-        });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(dx, dy, 1);
@@ -2358,6 +2504,26 @@ impl GpuEngine {
     pub fn dispatch_kv_write_into(
         &self,
         encoder: &mut wgpu::CommandEncoder,
+        k_src: &wgpu::Buffer,
+        v_src: &wgpu::Buffer,
+        k_cache: &wgpu::Buffer,
+        v_cache: &wgpu::Buffer,
+        kv_dim: usize,
+        start_pos: usize,
+        n_tokens: usize,
+    ) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_engine.kv_write.pass"),
+            timestamp_writes: None,
+        });
+        self.dispatch_kv_write_in_pass(&mut pass, k_src, v_src, k_cache, v_cache, kv_dim, start_pos, n_tokens);
+    }
+
+    /// In-pass variant. See `dispatch_kv_write_into`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_kv_write_in_pass(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
         k_src: &wgpu::Buffer,
         v_src: &wgpu::Buffer,
         k_cache: &wgpu::Buffer,
@@ -2380,16 +2546,11 @@ impl GpuEngine {
             &[k_src, v_src, k_cache, v_cache, &params_buf],
         );
 
-        // 2D dispatch in case kv_dim * n_tokens / 128 exceeds 65535.
         let total = (kv_dim * n_tokens) as u32;
         let groups = (total + 127) / 128;
         let dx = groups.min(65535);
         let dy = (groups + 65534) / 65535;
 
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("gpu_engine.kv_write.pass"),
-            timestamp_writes: None,
-        });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(dx, dy, 1);
@@ -2405,7 +2566,22 @@ impl GpuEngine {
         n: usize,
         n_tokens: usize,
     ) {
-        // Reuses AddInplaceBatchParams layout (n, n_tokens — same shape).
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_engine.bias_add.pass"),
+            timestamp_writes: None,
+        });
+        self.dispatch_bias_add_in_pass(&mut pass, a_buf, bias_buf, n, n_tokens);
+    }
+
+    /// In-pass variant. See `dispatch_bias_add_into`.
+    pub fn dispatch_bias_add_in_pass(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        a_buf: &wgpu::Buffer,
+        bias_buf: &wgpu::Buffer,
+        n: usize,
+        n_tokens: usize,
+    ) {
         let params = AddInplaceBatchParams { n: n as u32, n_tokens: n_tokens as u32 };
         let params_buf = self.gpu.create_params_buffer(&params);
 
@@ -2418,10 +2594,6 @@ impl GpuEngine {
         let total = (n * n_tokens) as u32;
         let groups = (total + 255) / 256;
 
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("gpu_engine.bias_add.pass"),
-            timestamp_writes: None,
-        });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(groups, 1, 1);
@@ -2432,6 +2604,22 @@ impl GpuEngine {
     pub fn dispatch_add_into(
         &self,
         encoder: &mut wgpu::CommandEncoder,
+        a_buf: &wgpu::Buffer,
+        b_buf: &wgpu::Buffer,
+        n: usize,
+        n_tokens: usize,
+    ) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_engine.add.pass"),
+            timestamp_writes: None,
+        });
+        self.dispatch_add_in_pass(&mut pass, a_buf, b_buf, n, n_tokens);
+    }
+
+    /// In-pass variant. See `dispatch_add_into`.
+    pub fn dispatch_add_in_pass(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
         a_buf: &wgpu::Buffer,
         b_buf: &wgpu::Buffer,
         n: usize,
@@ -2449,10 +2637,6 @@ impl GpuEngine {
         let total = (n * n_tokens) as u32;
         let groups = (total + 255) / 256;
 
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("gpu_engine.add.pass"),
-            timestamp_writes: None,
-        });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(groups, 1, 1);
@@ -2471,6 +2655,22 @@ impl GpuEngine {
         n: usize,
         n_tokens: usize,
     ) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_engine.add_broadcast.pass"),
+            timestamp_writes: None,
+        });
+        self.dispatch_add_broadcast_in_pass(&mut pass, a_buf, delta_buf, n, n_tokens);
+    }
+
+    /// In-pass variant. See `dispatch_add_broadcast_into`.
+    pub fn dispatch_add_broadcast_in_pass(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        a_buf: &wgpu::Buffer,
+        delta_buf: &wgpu::Buffer,
+        n: usize,
+        n_tokens: usize,
+    ) {
         let params = AddInplaceBatchParams { n: n as u32, n_tokens: n_tokens as u32 };
         let params_buf = self.gpu.create_params_buffer(&params);
 
@@ -2483,10 +2683,6 @@ impl GpuEngine {
         let total = (n * n_tokens) as u32;
         let groups = (total + 255) / 256;
 
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("gpu_engine.add_broadcast.pass"),
-            timestamp_writes: None,
-        });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(groups, 1, 1);
