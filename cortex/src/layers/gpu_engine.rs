@@ -473,7 +473,10 @@ impl GpuEngine {
         self.dispatch_matmul_in_pass(&mut pass, layer, in_buf, out_buf, n_tokens);
     }
 
-    /// In-pass variant. See `dispatch_matmul_into`.
+    /// In-pass variant. See `dispatch_matmul_into`. Routes to the
+    /// tiled matmul shader when `n_tokens >= 8` (TILE_M), falling
+    /// back to the per-output-element legacy shader for decode-sized
+    /// batches where register blocking has nothing to amortize.
     pub fn dispatch_matmul_in_pass(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
@@ -493,6 +496,40 @@ impl GpuEngine {
                 )
             });
 
+        // Routing between legacy (per-output-element with tree reduction)
+        // and the tiled 16×16 / 8×8 register-blocked shader. The tiled
+        // path is **disabled by default** on this codebase because the
+        // first cut (matmul_tiled.wgsl + this dispatcher) measured ~30%
+        // SLOWER on Qwen-3B long-prompt prefill (60s vs 46s for ~3500
+        // tokens) on a 4080 Laptop / Vulkan / naga. Suspected cause: naga
+        // doesn't unroll the nested TILE_M × TILE_N inner loops the way
+        // Metal did in Zach Nussbaum's reference benchmark, leaving the
+        // 8×8 register accumulator in scratch memory rather than registers.
+        // Set `CORTEX_TILED_MATMUL_THRESHOLD=8` (or lower) to enable the
+        // tiled path for experimentation; default usize::MAX keeps it off.
+        let threshold: usize = std::env::var("CORTEX_TILED_MATMUL_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(usize::MAX);
+        if n_tokens >= threshold {
+            self.dispatch_matmul_tiled_inner_in_pass(pass, float, in_buf, out_buf, n_tokens);
+        } else {
+            self.dispatch_matmul_legacy_inner_in_pass(pass, float, in_buf, out_buf, n_tokens);
+        }
+    }
+
+    /// Legacy per-output-element matmul. One workgroup per (row, token);
+    /// 256 threads do a tree reduction over `cols`. Used for n_tokens < 8
+    /// (decode). Kept as an internal in_pass helper so the public dispatch
+    /// API can pick at the boundary.
+    fn dispatch_matmul_legacy_inner_in_pass(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        float: &crate::layers::gpu_floatlinear::GpuFloatLinear,
+        in_buf: &wgpu::Buffer,
+        out_buf: &wgpu::Buffer,
+        n_tokens: usize,
+    ) {
         #[repr(C)]
         #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
         struct MatmulParams { rows: u32, cols: u32, n_tokens: u32, _pad: u32 }
@@ -518,6 +555,52 @@ impl GpuEngine {
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(dx, dy, dz);
+    }
+
+    /// Tiled matmul. 16×16 workgroup × 8×8 register tile per thread.
+    /// Each workgroup produces a 128×128 block of output. Dispatch is
+    /// 2D over (rows / TILE_N, n_tokens / TILE_M) with the workgroup-
+    /// size shader-side. See `matmul_tiled.wgsl` for the inner loop
+    /// structure. Hardcoded BLOCKSIZE / TILE constants — autotune is
+    /// follow-up work.
+    fn dispatch_matmul_tiled_inner_in_pass(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        float: &crate::layers::gpu_floatlinear::GpuFloatLinear,
+        in_buf: &wgpu::Buffer,
+        out_buf: &wgpu::Buffer,
+        n_tokens: usize,
+    ) {
+        const BLOCKSIZE: usize = 16;
+        const TILE_M: usize = 8;
+        const TILE_N: usize = 8;
+
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct MatmulParams { rows: u32, cols: u32, n_tokens: u32, _pad: u32 }
+        let params = MatmulParams {
+            rows: float.out_features() as u32,
+            cols: float.in_features() as u32,
+            n_tokens: n_tokens as u32,
+            _pad: 0,
+        };
+        let params_buf = self.gpu.create_params_buffer(&params);
+
+        let pipeline = &self.gpu.pipelines.matmul_tiled;
+        let bind = self.gpu.make_bind_group(
+            pipeline,
+            &[float.weight_buffer(), in_buf, out_buf, &params_buf],
+        );
+
+        // Workgroup grid: each workgroup produces (BLOCKSIZE*TILE_N)
+        // output rows × (BLOCKSIZE*TILE_M) output tokens. Round up.
+        let rows = float.out_features();
+        let dx = ((rows + BLOCKSIZE * TILE_N - 1) / (BLOCKSIZE * TILE_N)) as u32;
+        let dy = ((n_tokens + BLOCKSIZE * TILE_M - 1) / (BLOCKSIZE * TILE_M)) as u32;
+
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(dx, dy, 1);
     }
 
     /// Per-token absmax quantization of f32 hidden → packed i8 activations
@@ -4959,6 +5042,86 @@ mod tests {
         let layer_ref: &dyn crate::layers::linear::LinearLayer = &cpu_layer;
         let engine = GpuEngine::from_cpu_model(toy_model(), gpu);
         let _ = engine.matvec_oneshot(layer_ref, &[1.0, 0.0]);
+    }
+
+    /// Parity test for the tiled matmul shader (mm-4): with the same
+    /// weights + input, the tiled path must produce numerically-identical
+    /// output to the legacy per-output-element matmul. Uses n_tokens=16
+    /// so the router actually selects tiled (threshold is n_tokens >= 8).
+    #[test]
+    fn matmul_tiled_matches_legacy() {
+        use crate::layers::gpu_floatlinear::GpuFloatLinear;
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let rows = 32usize;
+        let cols = 64usize;
+        let n_tokens = 16usize;
+        let mut rng: u64 = 0x12345678ABCDEF;
+        let weights: Vec<f32> = (0..rows * cols).map(|_| {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng >> 33) as i32 % 1000 - 500) as f32 * 0.001
+        }).collect();
+        let input: Vec<f32> = (0..n_tokens * cols).map(|_| {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng >> 33) as i32 % 1000 - 500) as f32 * 0.001
+        }).collect();
+
+        let tensor = FloatTensor::new(weights, vec![rows, cols]);
+        let layer = GpuFloatLinear::from_float_tensor(gpu.clone(), tensor);
+
+        let in_bytes = (input.len() * std::mem::size_of::<f32>()) as u64;
+        let in_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("test.in"),
+            contents: bytemuck::cast_slice(&input),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let out_bytes = (n_tokens * rows * std::mem::size_of::<f32>()) as u64;
+
+        let make_out_buf = || gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test.out"),
+            size: out_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let out_legacy = make_out_buf();
+        let out_tiled = make_out_buf();
+        let staging_legacy = gpu.create_staging_buffer(out_bytes);
+        let staging_tiled = gpu.create_staging_buffer(out_bytes);
+
+        let engine = GpuEngine::from_cpu_model(toy_model(), gpu.clone());
+
+        // Run both paths. The router would pick tiled for n_tokens=16
+        // automatically; here we explicitly call each inner helper to
+        // guarantee the comparison.
+        let _ = in_bytes;
+        let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+            engine.dispatch_matmul_legacy_inner_in_pass(&mut pass, &layer, &in_buf, &out_legacy, n_tokens);
+        }
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+            engine.dispatch_matmul_tiled_inner_in_pass(&mut pass, &layer, &in_buf, &out_tiled, n_tokens);
+        }
+        enc.copy_buffer_to_buffer(&out_legacy, 0, &staging_legacy, 0, out_bytes);
+        enc.copy_buffer_to_buffer(&out_tiled, 0, &staging_tiled, 0, out_bytes);
+        gpu.queue.submit(Some(enc.finish()));
+
+        let r_legacy = read_back_buffer(&gpu, &staging_legacy, out_bytes as usize);
+        let r_tiled = read_back_buffer(&gpu, &staging_tiled, out_bytes as usize);
+
+        assert_eq!(r_legacy.len(), r_tiled.len());
+        // Both unpack the same f16 weights and do the same K-accumulation,
+        // differing only in summation order (tree reduction vs straight loop).
+        // 1e-4 absolute is comfortable for these magnitudes (~0.5 max).
+        for (i, (l, t)) in r_legacy.iter().zip(&r_tiled).enumerate() {
+            assert!(
+                (l - t).abs() < 1e-4,
+                "elem {i} (tok={}, row={}): legacy={l} tiled={t} diff={}",
+                i / rows, i % rows, (l - t).abs(),
+            );
+        }
     }
 
     #[test]

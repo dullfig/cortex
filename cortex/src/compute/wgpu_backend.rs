@@ -210,6 +210,12 @@ pub struct Pipelines {
     pub argmax: wgpu::ComputePipeline,
     // Batch (prefill)
     pub matmul: wgpu::ComputePipeline,
+    /// Tiled batched matmul (16×16 workgroup × 8×8 register tile per
+    /// thread). Used for n_tokens >= TILE_M=8 — large prefill batches.
+    /// Decode (n_tokens < 8) still routes through the legacy `matmul`
+    /// pipeline above which is one-output-per-workgroup with tree
+    /// reduction (better fit when there's nothing to amortize).
+    pub matmul_tiled: wgpu::ComputePipeline,
     pub matmul_bias: wgpu::ComputePipeline,
     pub rmsnorm_batch: wgpu::ComputePipeline,
     pub rope_batch: wgpu::ComputePipeline,
@@ -288,6 +294,7 @@ impl Pipelines {
             argmax: make(include_str!("shaders/argmax.wgsl"), "argmax"),
             // Batch
             matmul: make(include_str!("shaders/matmul.wgsl"), "matmul"),
+            matmul_tiled: make(include_str!("shaders/matmul_tiled.wgsl"), "matmul_tiled"),
             matmul_bias: make(include_str!("shaders/matmul_bias.wgsl"), "matmul_bias"),
             rmsnorm_batch: make(include_str!("shaders/rmsnorm_batch.wgsl"), "rmsnorm_batch"),
             rope_batch: make(include_str!("shaders/rope_batch.wgsl"), "rope_batch"),
