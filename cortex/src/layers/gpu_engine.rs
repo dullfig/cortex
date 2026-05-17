@@ -1433,6 +1433,100 @@ impl GpuEngine {
         self.forward_full_gpu_with_cache_inject_returning_hidden(tokens, cache, &[])
     }
 
+    /// Fire-and-forget forward: runs all blocks, writes K/V into the
+    /// cache, advances the cache cursor — but does NOT compute the final
+    /// RMSNorm, does NOT copy to a staging buffer, and does NOT wait for
+    /// the GPU. Callers that discard the hidden state entirely (e.g.
+    /// `cache_append` building a shard) should use this to skip the
+    /// `device.poll(Maintain::Wait)` round-trip, which empirical
+    /// profiling shows costs ~300 ms per call on a 4080 Laptop /
+    /// Vulkan independent of token count.
+    ///
+    /// **Ordering / safety**: wgpu's queue guarantees in-submission-order
+    /// execution. The cache cursor is a CPU counter advanced after submit;
+    /// any subsequent call that submits more work to the same cache will
+    /// observe the previous K/V writes because the GPU executes them in
+    /// order. If the GPU work fails (e.g. device lost), the failure
+    /// surfaces on the next call that DOES wait — typical late-binding
+    /// error reporting. For cache_append's HTTP handler this is
+    /// acceptable: success means "queued and cursor advanced," not
+    /// "GPU work completed."
+    pub fn forward_full_gpu_with_cache_advance_only(
+        &self,
+        tokens: &[u32],
+        cache: &mut crate::layers::gpu_kv_cache::GpuKvCache,
+    ) {
+        let n_tokens = tokens.len();
+        assert!(n_tokens > 0, "must have at least one token");
+
+        let n_layers = self.cpu.n_layers();
+        assert_eq!(n_layers, cache.n_layers(), "cache layer count mismatch");
+
+        let attn0 = self.cpu.blocks()[0].attention();
+        assert_eq!(cache.n_kv_heads(), attn0.n_kv_heads(), "cache n_kv_heads mismatch");
+        assert_eq!(cache.head_dim(), attn0.head_dim(), "cache head_dim mismatch");
+
+        let start_pos = cache.seq_len();
+        assert!(
+            start_pos + n_tokens <= cache.max_seq_len(),
+            "cache overflow: {} + {} > {}",
+            start_pos, n_tokens, cache.max_seq_len(),
+        );
+
+        let t_start = std::time::Instant::now();
+
+        // Embedding lookup (CPU) — same as full forward.
+        let embed_data = self.cpu.embedding_data();
+        let vocab_size = self.cpu.vocab_size();
+        let mut hidden_init: Vec<f32> = Vec::with_capacity(n_tokens * self.embed_dim);
+        for &tok in tokens {
+            assert!((tok as usize) < vocab_size, "token {tok} out of vocab");
+            let off = tok as usize * self.embed_dim;
+            hidden_init.extend_from_slice(&embed_data[off..off + self.embed_dim]);
+        }
+
+        let hidden_buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("forward_advance_only.hidden"),
+            contents: bytemuck::cast_slice(&hidden_init),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+
+        let intermediate = self.cpu.blocks()[0].ffn().as_any()
+            .downcast_ref::<crate::layers::swiglu::SwiGLU>()
+            .unwrap_or_else(|| panic!("forward_full_gpu_with_cache_advance_only requires SwiGLU FFN"))
+            .intermediate_size();
+
+        let attn_max_seq = start_pos + n_tokens;
+        let scratch = BlockScratch::allocate(
+            &self.gpu, n_tokens, self.embed_dim,
+            attn0.n_heads(), attn0.n_kv_heads(), attn0.head_dim(),
+            intermediate, attn_max_seq,
+        );
+
+        let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("forward_advance_only.encoder"),
+        });
+        for i in 0..n_layers {
+            let target = (cache.k_layer(i), cache.v_layer(i));
+            self.forward_block_gpu_inner(
+                &mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch,
+                None, Some(target), None, None,
+            );
+        }
+        // No final RMSNorm, no copy_buffer_to_buffer, no readback.
+        self.gpu.queue.submit(Some(encoder.finish()));
+
+        // Advance cache cursor (CPU). Subsequent submits will see ordered
+        // K/V writes via the wgpu queue's in-order guarantee.
+        cache.advance(n_tokens);
+        let t_total = t_start.elapsed();
+        tracing::info!(
+            n_tokens, start_pos, attn_max_seq,
+            total_us = t_total.as_micros() as u64,
+            "fwd_advance_only stage timings",
+        );
+    }
+
     /// Inject-aware variant of `forward_full_gpu_with_cache_returning_hidden`.
     /// `inject_deltas` is either empty (no injection — same path as the
     /// no-inject variant) or has length `n_layers()` with `Some(buf)` for

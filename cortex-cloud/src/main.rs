@@ -2515,7 +2515,14 @@ where
         let chunk = &tokens_remaining[..chunk_size];
         chunk_idx += 1;
         let t0 = Instant::now();
-        let _ = engine.forward_full_gpu_with_cache_returning_hidden(chunk, cache);
+        // Use the no-readback forward: cache_load/cache_append discard
+        // the hidden state anyway. Skipping the device.poll(Maintain::Wait)
+        // round-trip drops per-call wall time substantially on small
+        // chunks (where the sync round-trip otherwise dominates).
+        // Correctness is preserved because wgpu's queue executes in
+        // submission order, so subsequent forwards observe the K/V
+        // writes via cache buffer storage.
+        engine.forward_full_gpu_with_cache_advance_only(chunk, cache);
         progress(chunk_idx, chunk_size, cache.seq_len(), t0.elapsed().as_millis() as u64);
         tokens_remaining = &tokens_remaining[chunk_size..];
     }
@@ -2587,9 +2594,14 @@ async fn cache_append(
         // the GPU work for that chunk only (memex's sequential append
         // pattern means no other writer is racing for this shard).
         //
-        // We use forward_full_gpu_with_cache_returning_hidden — which
-        // skips the LM-head projection — because cache_append discards
-        // the logits anyway. Saves ~10s per chunk on Qwen-class vocab.
+        // We use forward_full_gpu_with_cache_advance_only — submits GPU
+        // work, advances the cache cursor, doesn't readback or sync.
+        // cache_append discards the hidden anyway. Skipping the
+        // device.poll(Maintain::Wait) round-trip saves ~300ms per chunk
+        // on a 4080 Laptop / Vulkan (empirical; the sync cost is
+        // roughly constant regardless of token count). Correctness is
+        // preserved because wgpu's queue is in-order: subsequent
+        // forwards see the K/V writes via cache buffer storage.
         let mut current_start = start_seq;
         let mut tokens_remaining = &req.tokens[..];
         while !tokens_remaining.is_empty() {
@@ -2611,7 +2623,7 @@ async fn cache_append(
             ))?;
             let chunk_t0 = Instant::now();
             tokio::task::block_in_place(|| {
-                let _ = state.engine.forward_full_gpu_with_cache_returning_hidden(
+                state.engine.forward_full_gpu_with_cache_advance_only(
                     chunk, &mut entry.cache,
                 );
             });
