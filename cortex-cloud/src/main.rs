@@ -32,6 +32,8 @@ use cortex::layers::gpu_kv_cache::GpuKvCache;
 use cortex::layers::sampler::{Sampler, SamplerConfig};
 use cortex::{ForwardTrace, ModelConfig, Tokenizer};
 
+mod metrics;
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -784,6 +786,9 @@ struct ServerState {
     shims: Mutex<HashMap<String, Arc<RegisteredShim>>>,
     /// Whether shim endpoints are enabled.
     shims_enabled: bool,
+    /// Prometheus telemetry. Recorded by chat_completions / cache_load /
+    /// cache_append handlers; rendered via `GET /metrics`.
+    metrics: Arc<crate::metrics::Metrics>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1309,11 +1314,18 @@ async fn chat_completions(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<ChatRequest>,
 ) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
+    // Telemetry: stamp on entry, mark success at each Ok return path.
+    // Drop records duration + endpoint counter regardless. Streaming
+    // responses record duration up to handoff (the SSE stream itself
+    // is recorded by TTFT inside chat_completions_stream).
+    let mut _telemetry = metrics::RequestTimer::new(state.metrics.clone(), metrics::Endpoint::ChatCompletions);
+
     let prompt_tokens = apply_chat_template(
         &req.messages,
         req.tools.as_deref(),
         &state.tokenizer,
     );
+    state.metrics.record_tokens(prompt_tokens.len() as u64, 0);
 
     // Gate-phase dispatch (#6a). Per `project_cortex_v1_shim_api.md`, the
     // gate fires once after a prefill that *is* the work computing its
@@ -1459,8 +1471,10 @@ async fn chat_completions(
             "gate dispatch: silent",
         );
         if req.stream {
+            _telemetry.mark_success();
             return Ok(silent_stream_response(&state.model_name, metadata));
         }
+        _telemetry.mark_success();
         return Ok(Json(serde_json::to_value(ChatResponse {
             id: format!("cortex-{}", &uuid::Uuid::new_v4().to_string()[..12]),
             model: state.model_name.clone(),
@@ -1559,6 +1573,7 @@ async fn chat_completions(
                 })),
             ));
         }
+        _telemetry.mark_success();
         return chat_completions_stream(state, req, prompt_tokens, gate_metadata, active_steers, inject_deltas).await;
     }
 
@@ -1867,6 +1882,7 @@ async fn chat_completions(
 
         let retrieval_ms = retrieve_start.elapsed().as_millis() as u64;
 
+        _telemetry.mark_success();
         return Ok(Json(serde_json::to_value(RetrievalResponse {
             hits,
             metadata: RetrievalMetadata {
@@ -2050,6 +2066,8 @@ async fn chat_completions(
         metadata: gate_metadata,
     };
 
+    state.metrics.record_tokens(0, completion_len as u64);
+    _telemetry.mark_success();
     Ok(Json(serde_json::to_value(response).unwrap()).into_response())
 }
 
@@ -2107,6 +2125,13 @@ async fn chat_completions_stream(
     // an Option<String>: Some(delta) for content, None for "we're done,
     // emit the final finish_reason chunk".
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamMessage>(8);
+
+    // Telemetry: stamp start so the streaming TTFT histogram records
+    // request-arrival to first content delta. (record_request for the
+    // streaming response itself fires in the parent chat_completions
+    // handler on handoff — see _telemetry.mark_success before this is
+    // called.)
+    let ttft_start = Instant::now();
 
     // Spawn the generation. block_in_place isn't an option from inside a
     // spawn_blocking, so we keep this in a blocking thread and use the
@@ -2174,6 +2199,10 @@ async fn chat_completions_stream(
 
         if next_token != eos {
             generated.push(next_token);
+            // Record TTFT now: the first sampled token is about to land in
+            // the stream channel. Even if the receiver hasn't read yet,
+            // this is the GPU-side definition of "first token ready".
+            state_for_gen.metrics.record_ttft(ttft_start.elapsed().as_secs_f64());
             if !push_delta(&generated, &mut emitted_text, &tx) {
                 return; // client gone
             }
@@ -2202,6 +2231,7 @@ async fn chat_completions_stream(
         }
 
         let finish = if generated.len() >= max_tokens { "length" } else { "stop" };
+        state_for_gen.metrics.record_tokens(0, generated.len() as u64);
         let _ = tx.blocking_send(StreamMessage::Finish(finish.to_string()));
         // Cache dropped on scope exit.
     });
@@ -2368,6 +2398,8 @@ async fn cache_load(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<CacheLoadRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let mut _telemetry = metrics::RequestTimer::new(state.metrics.clone(), metrics::Endpoint::CacheLoad);
+
     // Pre-flight overflow check (Bug 1): return a structured 400 instead
     // of letting `forward_full_gpu_with_cache_returning_hidden` panic
     // inside `block_in_place`.
@@ -2468,6 +2500,8 @@ async fn cache_load(
         "cache loaded",
     );
 
+    state.metrics.record_tokens(req.tokens.len() as u64, 0);
+    _telemetry.mark_success();
     Ok((
         StatusCode::CREATED,
         Json(CacheLoadResponse {
@@ -2547,6 +2581,8 @@ async fn cache_append(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<CacheAppendRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let mut _telemetry = metrics::RequestTimer::new(state.metrics.clone(), metrics::Endpoint::CacheAppend);
+
     // Verify the cache exists before kicking off any GPU work. Snapshot
     // metadata (current seq_len for chunk sizing, max_seq_len for the
     // overflow error message), then drop the lock so /health stays
@@ -2676,6 +2712,8 @@ async fn cache_append(
         "cache appended",
     );
 
+    state.metrics.record_tokens(req.tokens.len() as u64, 0);
+    _telemetry.mark_success();
     Ok(Json(CacheInfoResponse {
         cache_id: req.cache_id,
         seq_len: final_seq_len,
@@ -3397,6 +3435,20 @@ async fn list_models(
     })
 }
 
+/// Prometheus text-format metrics. Served at `GET /metrics`.
+/// Pulls counters/histograms from `state.metrics`. New metrics belong
+/// in `metrics.rs` — see the module doc for the no-phantom rule.
+async fn metrics_endpoint(
+    State(state): State<Arc<ServerState>>,
+) -> axum::response::Response {
+    let body = state.metrics.render_prometheus();
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+        .body(body.into())
+        .expect("static response builder cannot fail")
+}
+
 async fn health(
     State(state): State<Arc<ServerState>>,
 ) -> Json<HealthResponse> {
@@ -3496,16 +3548,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         polar_rotation_seed,
         shims: Mutex::new(HashMap::new()),
         shims_enabled: cli.enable_shims,
+        metrics: Arc::new(metrics::Metrics::new(
+            model_name.clone(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        )),
     });
 
-    // Build router: always include completions, models, health.
+    // Build router: always include completions, models, health, metrics.
     // Cache and retrieve endpoints are conditional on startup flags.
     let mut app = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/tokenize", post(tokenize))
         .route("/v1/detokenize", post(detokenize))
         .route("/v1/models", get(list_models))
-        .route("/health", get(health));
+        .route("/health", get(health))
+        .route("/metrics", get(metrics_endpoint));
 
     if cache_enabled {
         app = app
