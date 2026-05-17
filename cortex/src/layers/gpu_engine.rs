@@ -496,25 +496,35 @@ impl GpuEngine {
                 )
             });
 
-        // Routing between legacy (per-output-element with tree reduction)
-        // and the tiled 16×16 / 8×8 register-blocked shader. The tiled
-        // path is **disabled by default** on this codebase because the
-        // first cut (matmul_tiled.wgsl + this dispatcher) measured ~30%
-        // SLOWER on Qwen-3B long-prompt prefill (60s vs 46s for ~3500
-        // tokens) on a 4080 Laptop / Vulkan / naga. Suspected cause: naga
-        // doesn't unroll the nested TILE_M × TILE_N inner loops the way
-        // Metal did in Zach Nussbaum's reference benchmark, leaving the
-        // 8×8 register accumulator in scratch memory rather than registers.
-        // Set `CORTEX_TILED_MATMUL_THRESHOLD=8` (or lower) to enable the
-        // tiled path for experimentation; default usize::MAX keeps it off.
-        let threshold: usize = std::env::var("CORTEX_TILED_MATMUL_THRESHOLD")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(usize::MAX);
-        if n_tokens >= threshold {
-            self.dispatch_matmul_tiled_inner_in_pass(pass, float, in_buf, out_buf, n_tokens);
-        } else {
-            self.dispatch_matmul_legacy_inner_in_pass(pass, float, in_buf, out_buf, n_tokens);
+        // Three available backends for batched matmul:
+        //   - "legacy" → matmul.wgsl (one workgroup per output element,
+        //     tree reduction). The original baseline. Selected by
+        //     default; A/B testing on Qwen-3B long prefill (4080 Laptop
+        //     / Vulkan) shows all three backends within 1-2s of each
+        //     other on real workloads — matmul shader speed is NOT the
+        //     bottleneck. Real bottlenecks are bandwidth / driver
+        //     overhead / non-matmul shaders.
+        //   - "shared" → matmul_shared.wgsl (workgroup-shared-mem
+        //     tiled SGEMM, 16×16 wg, BM=BN=64, BK=16, TM=TN=4,
+        //     hand-unrolled inner 4×4 outer product). Textbook fast
+        //     path; measured equivalent to legacy on this hardware.
+        //   - "tiled" → matmul_tiled.wgsl (16×16 wg, 8×8 register tile,
+        //     nested loops). Measured ~30% slower than legacy on naga
+        //     (likely scratch spills); experimental.
+        //
+        // Override via CORTEX_MATMUL_BACKEND={legacy|shared|tiled}.
+        let backend = std::env::var("CORTEX_MATMUL_BACKEND").ok();
+        let backend = backend.as_deref();
+        match backend {
+            Some("shared") if n_tokens >= 4 => {
+                self.dispatch_matmul_shared_inner_in_pass(pass, float, in_buf, out_buf, n_tokens);
+            }
+            Some("tiled") if n_tokens >= 8 => {
+                self.dispatch_matmul_tiled_inner_in_pass(pass, float, in_buf, out_buf, n_tokens);
+            }
+            _ => {
+                self.dispatch_matmul_legacy_inner_in_pass(pass, float, in_buf, out_buf, n_tokens);
+            }
         }
     }
 
@@ -555,6 +565,48 @@ impl GpuEngine {
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(dx, dy, dz);
+    }
+
+    /// Shared-memory tiled SGEMM. 16×16 workgroup, BM=BN=64 output
+    /// block, BK=16 K-tile in workgroup-shared memory, TM=TN=4
+    /// per-thread register accumulator (hand-unrolled outer product).
+    /// Textbook fast path on naga/Vulkan when matmul is the bottleneck.
+    fn dispatch_matmul_shared_inner_in_pass(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        float: &crate::layers::gpu_floatlinear::GpuFloatLinear,
+        in_buf: &wgpu::Buffer,
+        out_buf: &wgpu::Buffer,
+        n_tokens: usize,
+    ) {
+        const BM: usize = 64;
+        const BN: usize = 64;
+
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct MatmulParams { rows: u32, cols: u32, n_tokens: u32, _pad: u32 }
+        let params = MatmulParams {
+            rows: float.out_features() as u32,
+            cols: float.in_features() as u32,
+            n_tokens: n_tokens as u32,
+            _pad: 0,
+        };
+        let params_buf = self.gpu.create_params_buffer(&params);
+
+        let pipeline = &self.gpu.pipelines.matmul_shared;
+        let bind = self.gpu.make_bind_group(
+            pipeline,
+            &[float.weight_buffer(), in_buf, out_buf, &params_buf],
+        );
+
+        // Workgroup grid: (rows / BM, n_tokens / BN). Round up.
+        let rows = float.out_features();
+        let dx = ((rows + BM - 1) / BM) as u32;
+        let dy = ((n_tokens + BN - 1) / BN) as u32;
+
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(dx, dy, 1);
     }
 
     /// Tiled matmul. 16×16 workgroup × 8×8 register tile per thread.
@@ -5120,6 +5172,80 @@ mod tests {
                 (l - t).abs() < 1e-4,
                 "elem {i} (tok={}, row={}): legacy={l} tiled={t} diff={}",
                 i / rows, i % rows, (l - t).abs(),
+            );
+        }
+    }
+
+    /// Parity test for the shared-memory tiled matmul: with the same
+    /// weights + input, the shared path must match the legacy
+    /// tree-reduction matmul within float tolerance. Exercises both
+    /// the cooperative shared-memory load and the hand-unrolled 4×4
+    /// register accumulator.
+    #[test]
+    fn matmul_shared_matches_legacy() {
+        use crate::layers::gpu_floatlinear::GpuFloatLinear;
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        // Pick non-aligned dims to exercise the bounds-check paths
+        // (rows not multiple of BM=64, n_tokens not multiple of BN=64,
+        // cols not multiple of BK=16).
+        let rows = 70usize;
+        let cols = 80usize;
+        let n_tokens = 24usize;
+        let mut rng: u64 = 0xAABBCCDD;
+        let weights: Vec<f32> = (0..rows * cols).map(|_| {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng >> 33) as i32 % 1000 - 500) as f32 * 0.001
+        }).collect();
+        let input: Vec<f32> = (0..n_tokens * cols).map(|_| {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng >> 33) as i32 % 1000 - 500) as f32 * 0.001
+        }).collect();
+
+        let tensor = FloatTensor::new(weights, vec![rows, cols]);
+        let layer = GpuFloatLinear::from_float_tensor(gpu.clone(), tensor);
+
+        let in_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("test.in"),
+            contents: bytemuck::cast_slice(&input),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let out_bytes = (n_tokens * rows * std::mem::size_of::<f32>()) as u64;
+        let make_out = || gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test.out"),
+            size: out_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let out_legacy = make_out();
+        let out_shared = make_out();
+        let staging_legacy = gpu.create_staging_buffer(out_bytes);
+        let staging_shared = gpu.create_staging_buffer(out_bytes);
+
+        let engine = GpuEngine::from_cpu_model(toy_model(), gpu.clone());
+
+        let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+            engine.dispatch_matmul_legacy_inner_in_pass(&mut pass, &layer, &in_buf, &out_legacy, n_tokens);
+        }
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+            engine.dispatch_matmul_shared_inner_in_pass(&mut pass, &layer, &in_buf, &out_shared, n_tokens);
+        }
+        enc.copy_buffer_to_buffer(&out_legacy, 0, &staging_legacy, 0, out_bytes);
+        enc.copy_buffer_to_buffer(&out_shared, 0, &staging_shared, 0, out_bytes);
+        gpu.queue.submit(Some(enc.finish()));
+
+        let r_legacy = read_back_buffer(&gpu, &staging_legacy, out_bytes as usize);
+        let r_shared = read_back_buffer(&gpu, &staging_shared, out_bytes as usize);
+
+        for (i, (l, s)) in r_legacy.iter().zip(&r_shared).enumerate() {
+            assert!(
+                (l - s).abs() < 1e-4,
+                "elem {i} (tok={}, row={}): legacy={l} shared={s} diff={}",
+                i / rows, i % rows, (l - s).abs(),
             );
         }
     }

@@ -216,6 +216,12 @@ pub struct Pipelines {
     /// pipeline above which is one-output-per-workgroup with tree
     /// reduction (better fit when there's nothing to amortize).
     pub matmul_tiled: wgpu::ComputePipeline,
+    /// Shared-memory tiled GEMM (16×16 workgroup, BM=BN=64 block,
+    /// BK=16 K-tile, 4×4 per-thread register accumulator with
+    /// hand-unrolled inner outer-product). Classical SGEMM, the
+    /// expected fast-path for prefill on naga/Vulkan. Beats
+    /// `matmul_tiled` (which spills) and `matmul` (no register reuse).
+    pub matmul_shared: wgpu::ComputePipeline,
     pub matmul_bias: wgpu::ComputePipeline,
     pub rmsnorm_batch: wgpu::ComputePipeline,
     pub rope_batch: wgpu::ComputePipeline,
@@ -295,6 +301,7 @@ impl Pipelines {
             // Batch
             matmul: make(include_str!("shaders/matmul.wgsl"), "matmul"),
             matmul_tiled: make(include_str!("shaders/matmul_tiled.wgsl"), "matmul_tiled"),
+            matmul_shared: make(include_str!("shaders/matmul_shared.wgsl"), "matmul_shared"),
             matmul_bias: make(include_str!("shaders/matmul_bias.wgsl"), "matmul_bias"),
             rmsnorm_batch: make(include_str!("shaders/rmsnorm_batch.wgsl"), "rmsnorm_batch"),
             rope_batch: make(include_str!("shaders/rope_batch.wgsl"), "rope_batch"),

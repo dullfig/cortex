@@ -1258,13 +1258,17 @@ fn generate_stateless_gpu(
         let last_logits = engine.cpu().finalize_logits(last_slice, 1);
         sampler.sample(&last_logits)
     } else {
-        // Inject-only: forward already projects logits internally.
-        let prefill_logits = engine.forward_full_gpu_with_cache_inject(
+        // Read hidden, project only the LAST token's slice through the
+        // LM head. The previous version called forward_full_gpu_with_cache_inject
+        // which runs finalize_logits on ALL n_tokens of prefill hidden
+        // — wasteful since only the last token feeds the sampler.
+        let prefill_hidden = engine.forward_full_gpu_with_cache_inject_returning_hidden(
             prompt_tokens, &mut cache, inject_deltas,
         );
-        let vocab = engine.vocab_size();
-        let last_off = (prompt_tokens.len() - 1) * vocab;
-        sampler.sample(&prefill_logits[last_off..last_off + vocab])
+        let last_off = (prompt_tokens.len() - 1) * embed_dim;
+        let last_slice = &prefill_hidden[last_off..last_off + embed_dim];
+        let last_logits = engine.cpu().finalize_logits(last_slice, 1);
+        sampler.sample(&last_logits)
     };
 
     let mut out: Vec<u32> = Vec::new();
@@ -1281,6 +1285,9 @@ fn generate_stateless_gpu(
             apply_steers_inplace(steers, &mut hidden);
             engine.cpu().finalize_logits(&hidden, 1)
         } else {
+            // Decode: n_tokens=1, so forward_full_gpu_with_cache_inject's
+            // internal finalize_logits is already only one token — no
+            // wasted projection here. Keep the simple direct-logits path.
             engine.forward_full_gpu_with_cache_inject(
                 &[next_token], &mut cache, inject_deltas,
             )
@@ -2130,12 +2137,20 @@ async fn chat_completions_stream(
             let logits = state_for_gen.engine.cpu().finalize_logits(last_slice, 1);
             sampler.sample(&logits)
         } else {
-            let prefill_logits = state_for_gen.engine.forward_full_gpu_with_cache_inject(
+            // Read hidden, only project the LAST token's slice through
+            // the LM head. The previous version called
+            // forward_full_gpu_with_cache_inject which runs
+            // finalize_logits on ALL n_tokens of prefill hidden — for
+            // a 1525-token prompt × 152k vocab × 2048 embed that's
+            // ~475B CPU ops (~30 seconds on this hardware), and the
+            // first-token sampler only ever reads the last vocab slot.
+            let prefill_hidden = state_for_gen.engine.forward_full_gpu_with_cache_inject_returning_hidden(
                 &prompt_tokens, &mut cache, &inject_for_gen,
             );
-            let vocab = state_for_gen.engine.vocab_size();
-            let last_off = (prompt_tokens.len() - 1) * vocab;
-            sampler.sample(&prefill_logits[last_off..last_off + vocab])
+            let last_off = (prompt_tokens.len() - 1) * embed_dim;
+            let last_slice = &prefill_hidden[last_off..last_off + embed_dim];
+            let last_logits = state_for_gen.engine.cpu().finalize_logits(last_slice, 1);
+            sampler.sample(&last_logits)
         };
 
         let mut generated: Vec<u32> = Vec::new();
