@@ -52,15 +52,6 @@ struct RmsNormBatchParams {
     _pad: u32,
 }
 
-/// Params struct for the matvec shader. Layout must match
-/// `compute/shaders/matvec.wgsl`.
-#[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct MatvecParams {
-    rows: u32,
-    cols: u32,
-}
-
 /// Params struct for the rope_batch shader. Layout must match
 /// `compute/shaders/rope_batch.wgsl` exactly — eight u32s.
 #[repr(C)]
@@ -496,42 +487,9 @@ impl GpuEngine {
                 )
             });
 
-        // Three available backends for batched matmul:
-        //   - "legacy" → matmul.wgsl (one workgroup per output element,
-        //     tree reduction). The original baseline. Selected by
-        //     default; A/B testing on Qwen-3B long prefill (4080 Laptop
-        //     / Vulkan) shows all three backends within 1-2s of each
-        //     other on real workloads — matmul shader speed is NOT the
-        //     bottleneck. Real bottlenecks are bandwidth / driver
-        //     overhead / non-matmul shaders.
-        //   - "shared" → matmul_shared.wgsl (workgroup-shared-mem
-        //     tiled SGEMM, 16×16 wg, BM=BN=64, BK=16, TM=TN=4,
-        //     hand-unrolled inner 4×4 outer product). Textbook fast
-        //     path; measured equivalent to legacy on this hardware.
-        //   - "tiled" → matmul_tiled.wgsl (16×16 wg, 8×8 register tile,
-        //     nested loops). Measured ~30% slower than legacy on naga
-        //     (likely scratch spills); experimental.
-        //
-        // Override via CORTEX_MATMUL_BACKEND={legacy|shared|tiled}.
-        let backend = std::env::var("CORTEX_MATMUL_BACKEND").ok();
-        let backend = backend.as_deref();
-        match backend {
-            Some("shared") if n_tokens >= 4 => {
-                self.dispatch_matmul_shared_inner_in_pass(pass, float, in_buf, out_buf, n_tokens);
-            }
-            Some("tiled") if n_tokens >= 8 => {
-                self.dispatch_matmul_tiled_inner_in_pass(pass, float, in_buf, out_buf, n_tokens);
-            }
-            _ => {
-                self.dispatch_matmul_legacy_inner_in_pass(pass, float, in_buf, out_buf, n_tokens);
-            }
-        }
+        self.dispatch_matmul_legacy_inner_in_pass(pass, float, in_buf, out_buf, n_tokens);
     }
 
-    /// Legacy per-output-element matmul. One workgroup per (row, token);
-    /// 256 threads do a tree reduction over `cols`. Used for n_tokens < 8
-    /// (decode). Kept as an internal in_pass helper so the public dispatch
-    /// API can pick at the boundary.
     fn dispatch_matmul_legacy_inner_in_pass(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
@@ -565,94 +523,6 @@ impl GpuEngine {
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(dx, dy, dz);
-    }
-
-    /// Shared-memory tiled SGEMM. 16×16 workgroup, BM=BN=64 output
-    /// block, BK=16 K-tile in workgroup-shared memory, TM=TN=4
-    /// per-thread register accumulator (hand-unrolled outer product).
-    /// Textbook fast path on naga/Vulkan when matmul is the bottleneck.
-    fn dispatch_matmul_shared_inner_in_pass(
-        &self,
-        pass: &mut wgpu::ComputePass<'_>,
-        float: &crate::layers::gpu_floatlinear::GpuFloatLinear,
-        in_buf: &wgpu::Buffer,
-        out_buf: &wgpu::Buffer,
-        n_tokens: usize,
-    ) {
-        const BM: usize = 64;
-        const BN: usize = 64;
-
-        #[repr(C)]
-        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-        struct MatmulParams { rows: u32, cols: u32, n_tokens: u32, _pad: u32 }
-        let params = MatmulParams {
-            rows: float.out_features() as u32,
-            cols: float.in_features() as u32,
-            n_tokens: n_tokens as u32,
-            _pad: 0,
-        };
-        let params_buf = self.gpu.create_params_buffer(&params);
-
-        let pipeline = &self.gpu.pipelines.matmul_shared;
-        let bind = self.gpu.make_bind_group(
-            pipeline,
-            &[float.weight_buffer(), in_buf, out_buf, &params_buf],
-        );
-
-        // Workgroup grid: (rows / BM, n_tokens / BN). Round up.
-        let rows = float.out_features();
-        let dx = ((rows + BM - 1) / BM) as u32;
-        let dy = ((n_tokens + BN - 1) / BN) as u32;
-
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &bind, &[]);
-        pass.dispatch_workgroups(dx, dy, 1);
-    }
-
-    /// Tiled matmul. 16×16 workgroup × 8×8 register tile per thread.
-    /// Each workgroup produces a 128×128 block of output. Dispatch is
-    /// 2D over (rows / TILE_N, n_tokens / TILE_M) with the workgroup-
-    /// size shader-side. See `matmul_tiled.wgsl` for the inner loop
-    /// structure. Hardcoded BLOCKSIZE / TILE constants — autotune is
-    /// follow-up work.
-    fn dispatch_matmul_tiled_inner_in_pass(
-        &self,
-        pass: &mut wgpu::ComputePass<'_>,
-        float: &crate::layers::gpu_floatlinear::GpuFloatLinear,
-        in_buf: &wgpu::Buffer,
-        out_buf: &wgpu::Buffer,
-        n_tokens: usize,
-    ) {
-        const BLOCKSIZE: usize = 16;
-        const TILE_M: usize = 8;
-        const TILE_N: usize = 8;
-
-        #[repr(C)]
-        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-        struct MatmulParams { rows: u32, cols: u32, n_tokens: u32, _pad: u32 }
-        let params = MatmulParams {
-            rows: float.out_features() as u32,
-            cols: float.in_features() as u32,
-            n_tokens: n_tokens as u32,
-            _pad: 0,
-        };
-        let params_buf = self.gpu.create_params_buffer(&params);
-
-        let pipeline = &self.gpu.pipelines.matmul_tiled;
-        let bind = self.gpu.make_bind_group(
-            pipeline,
-            &[float.weight_buffer(), in_buf, out_buf, &params_buf],
-        );
-
-        // Workgroup grid: each workgroup produces (BLOCKSIZE*TILE_N)
-        // output rows × (BLOCKSIZE*TILE_M) output tokens. Round up.
-        let rows = float.out_features();
-        let dx = ((rows + BLOCKSIZE * TILE_N - 1) / (BLOCKSIZE * TILE_N)) as u32;
-        let dy = ((n_tokens + BLOCKSIZE * TILE_M - 1) / (BLOCKSIZE * TILE_M)) as u32;
-
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &bind, &[]);
-        pass.dispatch_workgroups(dx, dy, 1);
     }
 
     /// Per-token absmax quantization of f32 hidden → packed i8 activations
@@ -1632,24 +1502,43 @@ impl GpuEngine {
             .intermediate_size();
 
         let attn_max_seq = start_pos + n_tokens;
+        let t_alloc_start = std::time::Instant::now();
         let scratch = BlockScratch::allocate(
             &self.gpu, n_tokens, self.embed_dim,
             attn0.n_heads(), attn0.n_kv_heads(), attn0.head_dim(),
             intermediate, attn_max_seq,
         );
+        let t_alloc = t_alloc_start.elapsed();
 
+        let t_record_start = std::time::Instant::now();
         let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("forward_advance_only.encoder"),
         });
-        for i in 0..n_layers {
-            let target = (cache.k_layer(i), cache.v_layer(i));
-            self.forward_block_gpu_inner(
-                &mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch,
-                None, Some(target), None, None,
-            );
+        let skip_block_forward = std::env::var("CORTEX_SKIP_BLOCK_FORWARD").as_deref() == Ok("1");
+        if !skip_block_forward {
+            for i in 0..n_layers {
+                let target = (cache.k_layer(i), cache.v_layer(i));
+                self.forward_block_gpu_inner(
+                    &mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch,
+                    None, Some(target), None, None,
+                );
+            }
         }
+        let t_record = t_record_start.elapsed();
+
         // No final RMSNorm, no copy_buffer_to_buffer, no readback.
+        let t_submit_start = std::time::Instant::now();
         self.gpu.queue.submit(Some(encoder.finish()));
+        let t_submit = t_submit_start.elapsed();
+
+        // Force a sync so the per-call wall time actually reflects GPU work
+        // (otherwise the next call's submit blocks behind ours). Gated:
+        // CORTEX_SYNC_AFTER_ADVANCE=1 to enable. Default off (back-compat).
+        let t_poll_start = std::time::Instant::now();
+        if std::env::var("CORTEX_SYNC_AFTER_ADVANCE").as_deref() == Ok("1") {
+            self.gpu.device.poll(wgpu::Maintain::Wait);
+        }
+        let t_poll = t_poll_start.elapsed();
 
         // Advance cache cursor (CPU). Subsequent submits will see ordered
         // K/V writes via the wgpu queue's in-order guarantee.
@@ -1657,6 +1546,10 @@ impl GpuEngine {
         let t_total = t_start.elapsed();
         tracing::info!(
             n_tokens, start_pos, attn_max_seq,
+            alloc_us = t_alloc.as_micros() as u64,
+            record_us = t_record.as_micros() as u64,
+            submit_us = t_submit.as_micros() as u64,
+            poll_us = t_poll.as_micros() as u64,
             total_us = t_total.as_micros() as u64,
             "fwd_advance_only stage timings",
         );
@@ -2044,6 +1937,12 @@ impl GpuEngine {
             Some((kc, vc)) => (kc, vc, start_pos + n_tokens),
             None => (&scratch.k, &scratch.v, n_tokens),
         };
+        // Perf-bisect: see CORTEX_SKIP_SCORE / SOFTMAX / VALUE inside
+        // `dispatch_attention_inner` — per-stage skip flags that bypass
+        // individual attention dispatches. (The previous CORTEX_SKIP_ATTENTION
+        // gate that called `encoder.clear_buffer` here panicked at runtime
+        // because `scratch.attn_out` lacks the COPY_DST usage; the per-stage
+        // flags are the correct path.)
         self.dispatch_attention_inner(
             encoder,
             &scratch.q, k_for_attn, v_for_attn,
@@ -2340,58 +2239,6 @@ impl GpuEngine {
         }
     }
 
-    /// Dispatch a single-vector matvec on GPU using the given layer's
-    /// resident weight buffer. Records the dispatch into the supplied
-    /// `encoder` so the caller can chain multiple ops without per-op submit.
-    ///
-    /// Currently supports `GpuFloatLinear` only — the ternary path needs an
-    /// f32→i8 quantize-on-GPU step that doesn't exist yet (deferred to a
-    /// later phase). Layers that aren't GpuFloatLinear panic.
-    ///
-    /// `in_buf` must be f32, `cols` elements long. `out_buf` must be f32,
-    /// `rows` elements long.
-    pub fn dispatch_matvec_into(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        layer: &dyn crate::layers::linear::LinearLayer,
-        in_buf: &wgpu::Buffer,
-        out_buf: &wgpu::Buffer,
-    ) {
-        let float = layer
-            .as_any()
-            .downcast_ref::<crate::layers::gpu_floatlinear::GpuFloatLinear>()
-            .unwrap_or_else(|| {
-                panic!(
-                    "GpuEngine.dispatch_matvec_into: layer is not GpuFloatLinear \
-                     (concrete type: {:?}); ternary fused-matvec is not implemented yet",
-                    layer
-                )
-            });
-
-        let params = MatvecParams {
-            rows: float.out_features() as u32,
-            cols: float.in_features() as u32,
-        };
-        let params_buf = self.gpu.create_params_buffer(&params);
-
-        let pipeline = &self.gpu.pipelines.matvec;
-        let bind_group = self.gpu.make_bind_group(
-            pipeline,
-            &[float.weight_buffer(), in_buf, out_buf, &params_buf],
-        );
-
-        let dispatch_x = (float.out_features().min(65535)) as u32;
-        let dispatch_y = ((float.out_features() + 65534) / 65535) as u32;
-
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("gpu_engine.matvec.pass"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
-    }
-
     /// Build cos/sin lookup tables for the `rope_batch` shader, sized to
     /// `max_seq` positions. Layout matches `rope_batch.wgsl`:
     /// `cos_table[pos * half_dim + i]`, same for sin. Half_dim = inv_freq.len().
@@ -2555,6 +2402,15 @@ impl GpuEngine {
         let kv_dim = n_kv_heads * head_dim;
         let scale = 1.0 / (head_dim as f32).sqrt();
 
+        // Bisect within attention (attn-3 followup): env-gated skip of
+        // individual stages, to identify which of score/softmax/value
+        // actually dominates wall time. Stage that, when skipped, gives
+        // back the most time is the next optimization target.
+        // Values: CORTEX_SKIP_SCORE / SOFTMAX / VALUE = 1 to skip.
+        let skip_score = std::env::var("CORTEX_SKIP_SCORE").as_deref() == Ok("1");
+        let skip_softmax = std::env::var("CORTEX_SKIP_SOFTMAX").as_deref() == Ok("1");
+        let skip_value = std::env::var("CORTEX_SKIP_VALUE").as_deref() == Ok("1");
+
         // ---- 1. attn_score: Q · K^T * scale, with causal mask ----
         let score_params = AttnScoreBatchParams {
             n_heads: n_heads as u32,
@@ -2574,13 +2430,12 @@ impl GpuEngine {
             score_pipeline,
             &[q_buf, k_buf, scores_buf, &score_params_buf],
         );
-        // 2D dispatch matches the updated attn_score_batch shader:
-        // gid.x covers (head, t), gid.y covers tok. 1D would exceed the
-        // 65535-per-dim limit for big corpora.
+        // 256-thread workgroups over (head*max_seq, tok); gid.x covers
+        // (head, t), gid.y covers tok.
         let inner_threads = (n_heads * max_seq) as u32;
         let score_groups_x = (inner_threads + 255) / 256;
         let score_groups_y = n_tokens as u32;
-        {
+        if !skip_score {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("gpu_engine.attn_score.pass"),
                 timestamp_writes: None,
@@ -2611,7 +2466,7 @@ impl GpuEngine {
         );
         // One workgroup per (tok, head) pair.
         let softmax_groups = (n_tokens * n_heads) as u32;
-        {
+        if !skip_softmax {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("gpu_engine.softmax.pass"),
                 timestamp_writes: None,
@@ -2641,7 +2496,7 @@ impl GpuEngine {
         // One thread per (tok, head, d); workgroup_size=256.
         let total_value_threads = (n_tokens * n_heads * head_dim) as u32;
         let value_groups = (total_value_threads + 255) / 256;
-        {
+        if !skip_value {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("gpu_engine.attn_value.pass"),
                 timestamp_writes: None,
@@ -2930,56 +2785,6 @@ impl GpuEngine {
         })
     }
 
-    /// Convenience wrapper around `dispatch_matvec_into`: allocates input
-    /// from a slice, runs the dispatch, reads back. Useful for testing the
-    /// primitive in isolation; production callers should chain dispatches
-    /// via `dispatch_matvec_into` directly.
-    pub fn matvec_oneshot(
-        &self,
-        layer: &dyn crate::layers::linear::LinearLayer,
-        input: &[f32],
-    ) -> Vec<f32> {
-        assert_eq!(input.len(), layer.in_features(), "input len mismatch");
-        let out_bytes = (layer.out_features() * std::mem::size_of::<f32>()) as u64;
-
-        let in_buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("gpu_engine.matvec.input"),
-            contents: bytemuck::cast_slice(input),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let out_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("gpu_engine.matvec.output"),
-            size: out_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let staging_buf = self.gpu.create_staging_buffer(out_bytes);
-
-        let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("gpu_engine.matvec.encoder"),
-        });
-        self.dispatch_matvec_into(&mut encoder, layer, &in_buf, &out_buf);
-        encoder.copy_buffer_to_buffer(&out_buf, 0, &staging_buf, 0, out_bytes);
-        self.gpu.queue.submit(Some(encoder.finish()));
-
-        let slice = staging_buf.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            tx.send(result).ok();
-        });
-        self.gpu.device.poll(wgpu::Maintain::Wait);
-        rx.recv().expect("readback failed").expect("buffer map failed");
-
-        let data = slice.get_mapped_range();
-        let out: Vec<f32> = data
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        drop(data);
-        staging_buf.unmap();
-        out
-    }
-
     /// Borrow the underlying CPU model (for delegation in tests / debug).
     pub fn cpu(&self) -> &TransformerModel {
         &self.cpu
@@ -3225,51 +3030,6 @@ mod tests {
 
         for (i, (a, b)) in cpu_logits.iter().zip(&gpu_logits).enumerate() {
             assert!((a - b).abs() < 1e-4, "logit {i}: cpu={a} gpu={b}");
-        }
-    }
-
-    #[test]
-    fn dispatch_matvec_matches_gpu_floatlinear_forward() {
-        use crate::layers::gpu_floatlinear::GpuFloatLinear;
-        use crate::layers::linear::LinearLayer;
-
-        let Some(gpu) = GpuDevice::try_new() else { return };
-        let gpu = Arc::new(gpu);
-
-        // Random-ish 32x16 weight matrix.
-        let rows = 32;
-        let cols = 16;
-        let mut weights = Vec::with_capacity(rows * cols);
-        let mut rng: u64 = 0xDEADBEEF;
-        for _ in 0..(rows * cols) {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-            weights.push(((rng >> 33) as i32 % 1000 - 500) as f32 * 0.001);
-        }
-        let tensor = FloatTensor::new(weights, vec![rows, cols]);
-
-        let mut input = Vec::with_capacity(cols);
-        for _ in 0..cols {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-            input.push(((rng >> 33) as i32 % 1000 - 500) as f32 * 0.001);
-        }
-
-        let gpu_layer = GpuFloatLinear::from_float_tensor(gpu.clone(), tensor);
-        // The reference path also runs through GpuFloatLinear (which packs
-        // weights to f16). We're verifying that going via GpuEngine's
-        // dispatch_matvec_into yields the same answer as calling
-        // GpuFloatLinear::forward directly.
-        let reference = gpu_layer.forward(&input);
-
-        // GpuEngine needs a TransformerModel to construct; build a trivial
-        // one and reuse the engine just for its matvec helper.
-        let engine = GpuEngine::from_cpu_model(toy_model(), gpu);
-        let layer_ref: &dyn LinearLayer = &gpu_layer;
-        let gpu_out = engine.matvec_oneshot(layer_ref, &input);
-
-        assert_eq!(reference.len(), gpu_out.len());
-        // Identical pipeline + identical resident buffer; should be bit-equal.
-        for (i, (r, g)) in reference.iter().zip(&gpu_out).enumerate() {
-            assert!((r - g).abs() < 1e-6, "row {i}: ref={r} gpu={g}");
         }
     }
 
@@ -5077,176 +4837,6 @@ mod tests {
         let _ = a; // silence unused-mut warning in case of future refactor
         for (i, (c, g)) in cpu_a.iter().zip(&gpu_a).enumerate() {
             assert!((c - g).abs() < 1e-6, "elem {i}: cpu={c} gpu={g}");
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "not GpuFloatLinear")]
-    fn dispatch_matvec_panics_on_cpu_layer() {
-        // CPU BitLinear in the path → should panic with a clear message,
-        // not produce silent garbage. Real loaders use the GPU layers when
-        // the GPU is available.
-        let Some(gpu) = GpuDevice::try_new() else {
-            panic!("not GpuFloatLinear (skipping with the expected message so the test still asserts)");
-        };
-        let gpu = Arc::new(gpu);
-        let cpu_layer = bitlinear(&[1, 0, 0, 1], 2, 2, 0.1);
-        let layer_ref: &dyn crate::layers::linear::LinearLayer = &cpu_layer;
-        let engine = GpuEngine::from_cpu_model(toy_model(), gpu);
-        let _ = engine.matvec_oneshot(layer_ref, &[1.0, 0.0]);
-    }
-
-    /// Parity test for the tiled matmul shader (mm-4): with the same
-    /// weights + input, the tiled path must produce numerically-identical
-    /// output to the legacy per-output-element matmul. Uses n_tokens=16
-    /// so the router actually selects tiled (threshold is n_tokens >= 8).
-    #[test]
-    fn matmul_tiled_matches_legacy() {
-        use crate::layers::gpu_floatlinear::GpuFloatLinear;
-        let Some(gpu) = GpuDevice::try_new() else { return };
-        let gpu = Arc::new(gpu);
-
-        let rows = 32usize;
-        let cols = 64usize;
-        let n_tokens = 16usize;
-        let mut rng: u64 = 0x12345678ABCDEF;
-        let weights: Vec<f32> = (0..rows * cols).map(|_| {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-            ((rng >> 33) as i32 % 1000 - 500) as f32 * 0.001
-        }).collect();
-        let input: Vec<f32> = (0..n_tokens * cols).map(|_| {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-            ((rng >> 33) as i32 % 1000 - 500) as f32 * 0.001
-        }).collect();
-
-        let tensor = FloatTensor::new(weights, vec![rows, cols]);
-        let layer = GpuFloatLinear::from_float_tensor(gpu.clone(), tensor);
-
-        let in_bytes = (input.len() * std::mem::size_of::<f32>()) as u64;
-        let in_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("test.in"),
-            contents: bytemuck::cast_slice(&input),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let out_bytes = (n_tokens * rows * std::mem::size_of::<f32>()) as u64;
-
-        let make_out_buf = || gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("test.out"),
-            size: out_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let out_legacy = make_out_buf();
-        let out_tiled = make_out_buf();
-        let staging_legacy = gpu.create_staging_buffer(out_bytes);
-        let staging_tiled = gpu.create_staging_buffer(out_bytes);
-
-        let engine = GpuEngine::from_cpu_model(toy_model(), gpu.clone());
-
-        // Run both paths. The router would pick tiled for n_tokens=16
-        // automatically; here we explicitly call each inner helper to
-        // guarantee the comparison.
-        let _ = in_bytes;
-        let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
-            engine.dispatch_matmul_legacy_inner_in_pass(&mut pass, &layer, &in_buf, &out_legacy, n_tokens);
-        }
-        {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
-            engine.dispatch_matmul_tiled_inner_in_pass(&mut pass, &layer, &in_buf, &out_tiled, n_tokens);
-        }
-        enc.copy_buffer_to_buffer(&out_legacy, 0, &staging_legacy, 0, out_bytes);
-        enc.copy_buffer_to_buffer(&out_tiled, 0, &staging_tiled, 0, out_bytes);
-        gpu.queue.submit(Some(enc.finish()));
-
-        let r_legacy = read_back_buffer(&gpu, &staging_legacy, out_bytes as usize);
-        let r_tiled = read_back_buffer(&gpu, &staging_tiled, out_bytes as usize);
-
-        assert_eq!(r_legacy.len(), r_tiled.len());
-        // Both unpack the same f16 weights and do the same K-accumulation,
-        // differing only in summation order (tree reduction vs straight loop).
-        // 1e-4 absolute is comfortable for these magnitudes (~0.5 max).
-        for (i, (l, t)) in r_legacy.iter().zip(&r_tiled).enumerate() {
-            assert!(
-                (l - t).abs() < 1e-4,
-                "elem {i} (tok={}, row={}): legacy={l} tiled={t} diff={}",
-                i / rows, i % rows, (l - t).abs(),
-            );
-        }
-    }
-
-    /// Parity test for the shared-memory tiled matmul: with the same
-    /// weights + input, the shared path must match the legacy
-    /// tree-reduction matmul within float tolerance. Exercises both
-    /// the cooperative shared-memory load and the hand-unrolled 4×4
-    /// register accumulator.
-    #[test]
-    fn matmul_shared_matches_legacy() {
-        use crate::layers::gpu_floatlinear::GpuFloatLinear;
-        let Some(gpu) = GpuDevice::try_new() else { return };
-        let gpu = Arc::new(gpu);
-
-        // Pick non-aligned dims to exercise the bounds-check paths
-        // (rows not multiple of BM=64, n_tokens not multiple of BN=64,
-        // cols not multiple of BK=16).
-        let rows = 70usize;
-        let cols = 80usize;
-        let n_tokens = 24usize;
-        let mut rng: u64 = 0xAABBCCDD;
-        let weights: Vec<f32> = (0..rows * cols).map(|_| {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-            ((rng >> 33) as i32 % 1000 - 500) as f32 * 0.001
-        }).collect();
-        let input: Vec<f32> = (0..n_tokens * cols).map(|_| {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-            ((rng >> 33) as i32 % 1000 - 500) as f32 * 0.001
-        }).collect();
-
-        let tensor = FloatTensor::new(weights, vec![rows, cols]);
-        let layer = GpuFloatLinear::from_float_tensor(gpu.clone(), tensor);
-
-        let in_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("test.in"),
-            contents: bytemuck::cast_slice(&input),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let out_bytes = (n_tokens * rows * std::mem::size_of::<f32>()) as u64;
-        let make_out = || gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("test.out"),
-            size: out_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let out_legacy = make_out();
-        let out_shared = make_out();
-        let staging_legacy = gpu.create_staging_buffer(out_bytes);
-        let staging_shared = gpu.create_staging_buffer(out_bytes);
-
-        let engine = GpuEngine::from_cpu_model(toy_model(), gpu.clone());
-
-        let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
-            engine.dispatch_matmul_legacy_inner_in_pass(&mut pass, &layer, &in_buf, &out_legacy, n_tokens);
-        }
-        {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
-            engine.dispatch_matmul_shared_inner_in_pass(&mut pass, &layer, &in_buf, &out_shared, n_tokens);
-        }
-        enc.copy_buffer_to_buffer(&out_legacy, 0, &staging_legacy, 0, out_bytes);
-        enc.copy_buffer_to_buffer(&out_shared, 0, &staging_shared, 0, out_bytes);
-        gpu.queue.submit(Some(enc.finish()));
-
-        let r_legacy = read_back_buffer(&gpu, &staging_legacy, out_bytes as usize);
-        let r_shared = read_back_buffer(&gpu, &staging_shared, out_bytes as usize);
-
-        for (i, (l, s)) in r_legacy.iter().zip(&r_shared).enumerate() {
-            assert!(
-                (l - s).abs() < 1e-4,
-                "elem {i} (tok={}, row={}): legacy={l} shared={s} diff={}",
-                i / rows, i % rows, (l - s).abs(),
-            );
         }
     }
 

@@ -188,41 +188,18 @@ pub struct AttnValueBatchParams {
 
 /// All compiled compute pipelines for GPU inference.
 pub struct Pipelines {
-    // Single-token (decode)
+    // Single-token (decode). Only matvec + the polar oneshots survive —
+    // others are dispatched only via *_batch variants in production.
     pub matvec: wgpu::ComputePipeline,
-    pub matvec_bias: wgpu::ComputePipeline,
-    pub matvec_q4k: wgpu::ComputePipeline,
-    pub rmsnorm: wgpu::ComputePipeline,
-    pub rope: wgpu::ComputePipeline,
-    pub silu_mul: wgpu::ComputePipeline,
-    pub add_inplace: wgpu::ComputePipeline,
-    pub kv_write: wgpu::ComputePipeline,
-    pub attn_score: wgpu::ComputePipeline,
     pub attn_score_polar: wgpu::ComputePipeline,
-    pub softmax: wgpu::ComputePipeline,
-    pub attn_value: wgpu::ComputePipeline,
     pub attn_value_polar: wgpu::ComputePipeline,
     pub derotate: wgpu::ComputePipeline,
     pub kv_compress_polar: wgpu::ComputePipeline,
     pub rotate_q: wgpu::ComputePipeline,
     pub attn_score_polar_batch: wgpu::ComputePipeline,
     pub attn_value_polar_batch: wgpu::ComputePipeline,
-    pub argmax: wgpu::ComputePipeline,
     // Batch (prefill)
     pub matmul: wgpu::ComputePipeline,
-    /// Tiled batched matmul (16×16 workgroup × 8×8 register tile per
-    /// thread). Used for n_tokens >= TILE_M=8 — large prefill batches.
-    /// Decode (n_tokens < 8) still routes through the legacy `matmul`
-    /// pipeline above which is one-output-per-workgroup with tree
-    /// reduction (better fit when there's nothing to amortize).
-    pub matmul_tiled: wgpu::ComputePipeline,
-    /// Shared-memory tiled GEMM (16×16 workgroup, BM=BN=64 block,
-    /// BK=16 K-tile, 4×4 per-thread register accumulator with
-    /// hand-unrolled inner outer-product). Classical SGEMM, the
-    /// expected fast-path for prefill on naga/Vulkan. Beats
-    /// `matmul_tiled` (which spills) and `matmul` (no register reuse).
-    pub matmul_shared: wgpu::ComputePipeline,
-    pub matmul_bias: wgpu::ComputePipeline,
     pub rmsnorm_batch: wgpu::ComputePipeline,
     pub rope_batch: wgpu::ComputePipeline,
     pub silu_mul_batch: wgpu::ComputePipeline,
@@ -280,29 +257,15 @@ impl Pipelines {
         Self {
             // Single-token
             matvec: make(include_str!("shaders/matvec.wgsl"), "matvec"),
-            matvec_bias: make(include_str!("shaders/matvec_bias.wgsl"), "matvec_bias"),
-            matvec_q4k: make(include_str!("shaders/matvec_q4k.wgsl"), "matvec_q4k"),
-            rmsnorm: make(include_str!("shaders/rmsnorm.wgsl"), "rmsnorm"),
-            rope: make(include_str!("shaders/rope.wgsl"), "rope"),
-            silu_mul: make(include_str!("shaders/silu_mul.wgsl"), "silu_mul"),
-            add_inplace: make(include_str!("shaders/add_inplace.wgsl"), "add_inplace"),
-            kv_write: make(include_str!("shaders/kv_write.wgsl"), "kv_write"),
-            attn_score: make(include_str!("shaders/attn_score.wgsl"), "attn_score"),
             attn_score_polar: make(include_str!("shaders/attn_score_polar.wgsl"), "attn_score_polar"),
-            softmax: make(include_str!("shaders/softmax.wgsl"), "softmax"),
-            attn_value: make(include_str!("shaders/attn_value.wgsl"), "attn_value"),
             attn_value_polar: make(include_str!("shaders/attn_value_polar.wgsl"), "attn_value_polar"),
             derotate: make(include_str!("shaders/derotate.wgsl"), "derotate"),
             kv_compress_polar: make(include_str!("shaders/kv_compress_polar.wgsl"), "kv_compress_polar"),
             rotate_q: make(include_str!("shaders/rotate_q.wgsl"), "rotate_q"),
             attn_score_polar_batch: make(include_str!("shaders/attn_score_polar_batch.wgsl"), "attn_score_polar_batch"),
             attn_value_polar_batch: make(include_str!("shaders/attn_value_polar_batch.wgsl"), "attn_value_polar_batch"),
-            argmax: make(include_str!("shaders/argmax.wgsl"), "argmax"),
             // Batch
             matmul: make(include_str!("shaders/matmul.wgsl"), "matmul"),
-            matmul_tiled: make(include_str!("shaders/matmul_tiled.wgsl"), "matmul_tiled"),
-            matmul_shared: make(include_str!("shaders/matmul_shared.wgsl"), "matmul_shared"),
-            matmul_bias: make(include_str!("shaders/matmul_bias.wgsl"), "matmul_bias"),
             rmsnorm_batch: make(include_str!("shaders/rmsnorm_batch.wgsl"), "rmsnorm_batch"),
             rope_batch: make(include_str!("shaders/rope_batch.wgsl"), "rope_batch"),
             silu_mul_batch: make(include_str!("shaders/silu_mul_batch.wgsl"), "silu_mul_batch"),
