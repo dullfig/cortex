@@ -1,6 +1,6 @@
 # cortex — Status Board
 
-**Last updated:** 2026-05-17
+**Last updated:** 2026-05-17 (late session)
 
 ## Legend
 
@@ -35,7 +35,7 @@ the assumption they exist.
 - [x] GPU polar attention chain — rotate_q → score_polar_batch → softmax → value_polar_batch → derotate; entered via single-shard `/v1/retrieve` when `entry.polar.is_some()`
 - [x] Cache_append chunking with `safe_chunk_size` — fixed the wedge at ~9.7K cumulative seq_len; ~5x ingest speedup
 - [?] `VK_NV_cooperative_matrix` / WMMA path — discussed today as the H100 ceiling; matmul is confirmed the bottleneck (per attn-3 bisect) but no investigation yet
-- [?] CubeCL evaluation — Daniel re-raised today after matmul confirmed as ceiling; planning conversation only
+- [~] **CubeCL evaluation as 2-for-1 (GPU memory pool + matmul)** — late-session strategic pivot. Both walls we hit today (matmul ceiling AND wgpu/NVIDIA `vkFreeMemory` cliff) point to "replace the abstraction below us with one that does its own device memory management." Half-day reading spike in progress; Go/No-Go report pending. If go: ~2 week migration with cooperative_matrix on CUDA backend as the matmul win
 - [?] Flash-attention kernel — referenced in design discussions, no code; would be the path forward if attention ever becomes the bottleneck (today it's <10% per per-stage skip bisect)
 
 ## 2. Quantization & weights
@@ -93,6 +93,8 @@ the assumption they exist.
 - [x] Debug-bisect env flags — `CORTEX_SKIP_SCORE/SOFTMAX/VALUE/BLOCK_FORWARD/SYNC_AFTER_ADVANCE`; documented as perf bisect tools, off by default
 - [x] Baseline TTFT + decode bench — `pinky/tools/bench_baseline.py` (commit 1133550); current Qwen 3B Q4_K_M numbers: ~21 t/s decode, 2.8s TTFT short / 22s TTFT long; ~3-4x slower than llama.cpp on same hardware
 - [x] cache_append wedge reproducer — `pinky/tools/reproduce_append_wedge.py`
+- [x] TTFT cliff repro + per-stage diagnostic — `pinky/tools/probe_ttft_stages.sh` (3 sequential chat curls + server-side stage timings localize the cliff)
+- [~] **Known issue: chat_completions TTFT cliff** — every chat request 2+ pays ~17s in wgpu buffer drops (`vkFreeMemory` accumulated-state cost on NVIDIA Vulkan). Proven NOT to be GPU work (explicit `device.poll(Wait)` = 19µs after readback). Pooling `BlockScratch` alone moves the cost to other buffers (hidden/normed/staging) — same 17s, different drop site. Real fix needs allocator-pool-everything OR replace wgpu's allocator. `cache_append` workflow does NOT hit this (uses pooled cache, different drop pattern); only chat_completions hits it. Tracking under "mini-OS for GPU memory" investigation (CubeCL spike in progress)
 - [~] Concurrency gauge — third of three threshold metrics in `project_cortex_v1_perf_threshold.md`; TTFT + decode rate are `[x]`, concurrency isn't emitted yet
 - [ ] Per-endpoint metrics on `/v1/tokenize`, `/v1/detokenize`, `/v1/shims/*`, `/v1/models`, `/health`, `/v1/retrieve` — phantom-strict rule says each lands when handler + render line ship together
 - [ ] Per-stage attention timing breakdown in /metrics — would expose which of score/softmax/value dominates at any given shape
