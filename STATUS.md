@@ -35,7 +35,7 @@ the assumption they exist.
 - [x] GPU polar attention chain — rotate_q → score_polar_batch → softmax → value_polar_batch → derotate; entered via single-shard `/v1/retrieve` when `entry.polar.is_some()`
 - [x] Cache_append chunking with `safe_chunk_size` — fixed the wedge at ~9.7K cumulative seq_len; ~5x ingest speedup
 - [?] `VK_NV_cooperative_matrix` / WMMA path — discussed today as the H100 ceiling; matmul is confirmed the bottleneck (per attn-3 bisect) but no investigation yet
-- [~] **CubeCL evaluation as 2-for-1 (GPU memory pool + matmul)** — late-session strategic pivot. Both walls we hit today (matmul ceiling AND wgpu/NVIDIA `vkFreeMemory` cliff) point to "replace the abstraction below us with one that does its own device memory management." Half-day reading spike in progress; Go/No-Go report pending. If go: ~2 week migration with cooperative_matrix on CUDA backend as the matmul win
+- [~] **CubeCL evaluation as 2-for-1 (GPU memory pool + matmul)** — late-session strategic pivot. Both walls we hit today (matmul ceiling AND wgpu/NVIDIA `vkFreeMemory` cliff) point to "replace the abstraction below us with one that does its own device memory management." Reading-only Go/No-Go spike complete (`pinky/cubecl-spike-2026-05-17.md`): recommendation is GO on CUDA backend, ~5-7 week migration, but 3 unanswered risks (Windows CUDA toolchain, `Persistent` mode actually kills the cliff, f16×f32 mixed-precision in `cubecl-matmul`) warrant a 1-day technical spike before committing. Decision deferred for fresh-mind review
 - [?] Flash-attention kernel — referenced in design discussions, no code; would be the path forward if attention ever becomes the bottleneck (today it's <10% per per-stage skip bisect)
 
 ## 2. Quantization & weights
