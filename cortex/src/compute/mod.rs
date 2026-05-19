@@ -19,6 +19,12 @@ pub mod device;
 pub mod avx2;
 #[cfg(feature = "gpu")]
 pub mod wgpu_backend;
+/// CubeCL migration scaffold (M1). Empty during M1; M2 wires
+/// `MemoryManagement` to replace the wgpu/NVIDIA `vkFreeMemory`
+/// cliff in cortex's per-request BlockScratch allocation.
+/// See `pinky/cubecl-migration-plan-2026-05-18.md`.
+#[cfg(feature = "cubecl-backend")]
+pub mod cubecl_backend;
 
 use crate::tensor::TernaryTensor;
 

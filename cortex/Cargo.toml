@@ -11,6 +11,9 @@ categories = ["science", "mathematics"]
 default = ["gpu"]
 gpu = ["wgpu", "pollster", "bytemuck", "half"]
 # memory = ["engram"]  # disabled until engram lands on this machine
+# CubeCL migration (M1 scaffold). Only cubecl-core depends — see note
+# on dep lines below. M2 will add the runtime + cubek crates.
+cubecl-backend = ["dep:cubecl-core"]
 
 [dependencies]
 thiserror = "2"
@@ -22,6 +25,19 @@ bytemuck = { version = "1", features = ["derive"], optional = true }
 half = { version = "2", optional = true }
 # engram lives on the old machine; temporarily disabled until it's copied over or absorbed into cortex per the roadmap.
 # engram = { path = "../../engram", default-features = false, optional = true }
+
+# CubeCL migration deps (M1 scaffold). Pinned to a specific rev so
+# API churn during the port doesn't surprise us mid-flight. Spike
+# validated rev 84d719b (v0.11.0-pre.1).
+#
+# **M1 deliberately depends on cubecl-core only** (DSL macros, IR,
+# no runtime). Adding cubecl's `wgpu` feature pulls wgpu 29; cortex
+# already uses wgpu 24; the two collide in wgpu-hal's DX12 backend
+# on Windows (windows-rs subcrate incompatibility). M2 will add the
+# runtime via a separate workspace exclusion or vendored fork to
+# avoid the version conflict. Until then, scaffolding compiles on
+# core alone — no runtime calls yet.
+cubecl-core = { git = "https://github.com/tracel-ai/cubecl", rev = "84d719b0bff308cda7db4b4fb1412ff1f069a022", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
