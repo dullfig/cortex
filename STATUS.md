@@ -125,6 +125,8 @@ the assumption they exist.
 
 ## Footer
 
-- This board supersedes `cortex/ROADMAP.md` (last updated 2026-04-12; now ~5 weeks stale, predates all shim phase work + polar backend + BitNet GPU + telemetry MVP).
-- The `## Roadmap` section in `CLAUDE.md` is current as of 2026-05-17 but is shaped as a chronological checklist, not a state board — it answers "what did we do?" not "what does cortex provide?". Use this board for the latter, CLAUDE.md for the former.
+- `STATUS.md` (this doc) = "what does cortex provide today?" snapshot.
+- `ROADMAP.md` = "where is cortex going?" — sequential capacity stages with concurrent planning/research lanes. Updated 2026-05-18.
+- The `## Roadmap` section in `CLAUDE.md` is a chronological "what did we ship" checklist — useful for git-archeology but not a planning surface.
+- `pinky/cubecl-migration-plan-2026-05-18.md` is Stage 1's file-by-file detail.
 - When a row changes state, update the row and bump the `Last updated` date at the top. When in doubt about whether a capability deserves `[x]`, re-apply the diagnostic: *which production request exercises it?* If the answer is "a test does", it's not `[x]`.

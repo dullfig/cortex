@@ -1,226 +1,135 @@
-# Cortex / Memex / RingHub Roadmap
+# Cortex Roadmap — Stages
 
-**Date**: 2026-04-12
-**Status**: Living document. Updated as decisions are made.
+**Date:** 2026-05-18
+**Status:** Living document. Replaces the 2026-04-12 stack-overview roadmap (archived in git history at commit before this one).
 
-## The stack
+## How to use this doc
 
-```
-RingHub (web platform, members, posts, events)
-     │
-     ▼
-Memex (orchestration: ingestion, shard management, position-to-source mapping)
-     │                              │
-     ▼                              ▼
-Librarian (cortex-server)     Bob (cortex-server)
-1B/7B model, 4090             32B model, A100/rented
---enable-cache --enable-retrieve    (stateless, default flags)
-Port 8081                     Port 8080
-```
+**Stages are sequential capacity tiers.** Each stage exits when its target user-load is sustained at a defined quality bar.
 
-## What's done
+**Concurrent work principle:** while Stage N is SHIPPING (focused human + Claude execution), Stage N+1 is PLANNING (design decisions, sketches), Stage N+2 is RESEARCHING (read-only, can be delegated to a separate Claude session without coordination — different files, different concerns).
 
-| Component | Status | Location |
-|---|---|---|
-| cortex inference engine | ✓ Complete | `cortex/` |
-| forward_traced (attention capture) | ✓ Complete | `cortex/src/layers/trace.rs` |
-| Pre-softmax Q·K^T capture | ✓ Complete | `cortex/src/layers/attention.rs` |
-| Q5_1 / Q4_1 dequantization | ✓ Complete | `cortex/src/ops/dequant.rs` |
-| cortex-cloud HTTP server | ✓ Complete | `cortex-cloud/src/main.rs` |
-| Cache pool + 4 endpoints | ✓ Complete | `cortex-cloud/src/main.rs` |
-| Multi-shard composition | ✓ Complete | `cortex-cloud/src/main.rs` |
-| Retrieval mode | ✓ Complete | `cortex-cloud/src/main.rs` |
-| Sink token padding | ✓ Complete | `cortex-cloud/src/main.rs` |
-| Startup flags (--enable-cache/retrieve) | ✓ Complete | `cortex-cloud/src/main.rs` |
-| cortex-local (in-process provider) | ✓ Complete | `cortex-local/` |
-| Boundary classifier (f1=0.824) | ✓ Validated | `pinky/concept-boundaries*` |
-| Morsel retrieval (3/3 connections) | ✓ Validated | `pinky/morsel-retrieval/` |
+The pattern: when Stage N exits, Stage N+1's planning has already converged and shipping starts immediately. No "what do we do now" gap.
 
-## What's left — in dependency order
+See `STATUS.md` for the snapshot of what cortex provides today. See `pinky/cubecl-migration-plan-2026-05-18.md` for Stage 1's detailed file-by-file plan.
 
-### Tier 0: The single-model experiment (could change everything)
+---
 
-- [ ] **Field-programmable LLM test.** Take a 7B base model, build
-  three NeuralKV databases targeting different layer ranges, inject
-  them via the existing FfnInjector hook, and test whether the output
-  is a functional domain-specific instruction-following assistant
-  without any fine-tuning.
+## Stage 0 — Foundation (DONE 2026-05-17/18)
 
-  The three shims:
-  - **Early layers (0-8)**: domain facts (barbershop glossary, BHS
-    history, event data). Teaches the model *what exists*.
-  - **Middle layers (8-16)**: semantic associations (tag→afterglow→
-    convention, quartet→contest→coaching). Teaches the model *what
-    relates to what*.
-  - **Late layers (16-24)**: instruction-following behavior. Teaches
-    the model *how to behave* as a concierge.
+- Phantom-work audit: deleted ~15 unused shaders / pipelines / dispatchers / tests
+- Telemetry MVP: Prometheus `GET /metrics` (request counts, tokens, TTFT histogram)
+- Status board (`STATUS.md`) in cortex-claude / agentos-claude / memex-claude format
+- TTFT cliff diagnosed (wgpu/NVIDIA `vkFreeMemory` accumulated-state cost, not GPU work)
+- Baseline bench harness (`pinky/tools/bench_baseline.py`, `pinky/tools/probe_ttft_stages.sh`)
+- CubeCL spike: reading + technical Go/No-Go, both GREEN. Migration sequenced.
+- M1 scaffold on `cubecl-migration` branch: dep added, feature flag wired, 394/394 tests green
+- **Exit:** CubeCL migration planned + branch live + Go decision committed
 
-  If this works, the entire deployment topology simplifies:
-  - No separate 32B instruct model (no A100 rental)
-  - One 7B base model on one 4090 serves both librarian and thinker
-  - Different behaviors via different NeuralKV shim configurations
-  - Domain expertise added by loading databases, not retraining
-  - Reprogrammable in the field: swap shims → different specialist
+## Stage 1 — Engine (SHIPPING, ~3-5 weeks)
 
-  This is an FPGA for LLMs: frozen weights (the fabric) +
-  loaded NeuralKV databases (the bitstream) = programmable behavior
-  on fixed hardware. Ringhub is the first configuration. The
-  platform is what scales.
+**Goal:** ~100 concurrent users sustained with competitive single-stream perf on commodity GPU.
 
-  **Effort**: ~1 evening for the experiment. The FfnInjector hook
-  already fires at exactly the position Gemini's analysis recommends
-  (post-FFN, pre-residual-add). The infrastructure is built.
+**Work items (in flight on `cubecl-migration` branch):**
+- M2: resolve wgpu 24→29 version collision, wrap `BlockScratch::allocate` via CubeCL `MemoryManagement` → TTFT cliff dies
+- M3: swap `dispatch_attention_inner` for `cubek-attention::launch_ref` → 3 kernels become 1, scores scratch goes away
+- M4: swap float matmul for `cubek-matmul` + custom `MatmulPrecision` impl for (f16 weight, f32 activation)
+- M5: port RMSNorm / RoPE / SiLU / ReLU² / KV-write / bias-add to `#[cube]` macro DSL
+- M6: install CUDA Toolkit + MSVC → flip runtime to `CudaRuntime` → tensor cores (cmma) → decode 21 → 40-60+ t/s
+- M7: port BitNet ternary path (custom — `cubek-quant` has 2-bit but not ternary semantics)
+- M-final: merge `cubecl-migration` → `master`, delete legacy wgpu paths, tag release
 
-  **If it works**: collapse the two-model stack to single-model,
-  eliminate A100 rental, and the roadmap below simplifies dramatically.
-  **If it doesn't**: keep the two-model stack as planned, no work wasted.
+**Production hardening (parallel with M2-M7):**
+- Panic recovery: cortex panics on wgpu device-loss today (observed twice on 2026-05-17). Need graceful restart-on-failure, request retry.
+- Concurrency gauge in `/metrics` (closes the 3-of-3 threshold-metric gap from `project_cortex_v1_perf_threshold.md`)
+- `cortex_local::CortexLocal::complete()` over GpuEngine (currently slow CPU `model.generate()` path — direct AgentOS integration win)
 
-### Tier 0.5: Blocking decisions (Daniel)
+**Exit:** 100 concurrent users sustained on a single beefy GPU (24 GB+ VRAM), TTFT <5s for typical prompts, decode ≥40 t/s on CUDA backend, no panics under sustained load.
 
-- [ ] **Choose the librarian model**. Softmax Qwen 1.5B (available now,
-  sink padding handles the artifact) vs sigmoid-attention model (cleaner
-  retrieval, need to find GGUF, cortex needs ~20 lines of sigmoid
-  support). Everything downstream of this decision depends on it because
-  KV vectors are model-specific and re-ingestion is required on model
-  switch.
+**Concurrent research-in-parallel for Stage 2** (can be a separate Claude session):
+- Read `vllm/core/scheduler.py` — how do they pick which requests to batch each iteration?
+- Read flash-attention's variable-length API + `cubek-attention`'s strategy enum — can we batch sequences of different lengths in one kernel call?
+- Sketch cortex's request-batching API surface — what does `chat_completions` look like internally when 8 requests share a forward pass?
+- Decide consistent-hashing scheme for multi-instance sharding (Karger? Rendezvous? Jump?)
 
-- [ ] **Buy or rent GPU**. 4090 ($1,600 buy) or A4000/A5000 ($87-160/mo
-  rent). The librarian needs a GPU for real-time retrieval; CPU at 5
-  tok/s is fine for development but not for production. This unblocks
-  all deployment work.
+## Stage 2 — Batched serving (PLANNING, ~4-6 weeks after Stage 1)
 
-### Tier 1: Cortex work (this Claude)
+**Goal:** ~1000 concurrent users via continuous batching + multi-instance sharding.
 
-- [ ] **Sigmoid attention support** (if sigmoid model chosen). Add
-  `sigmoid_inplace` alongside `softmax_inplace` in `attention.rs`,
-  gated by a model-config flag read from GGUF metadata. ~20 lines,
-  ~1 hour. Only needed if a sigmoid model is selected.
+**Work items:**
+- Continuous batching scheduler in cortex-cloud — pack N requests into one forward pass, each at their own position in their own KV cache
+- Variable-length attention via `cubek-attention` (or custom variant if cubek doesn't expose it)
+- Multi-instance: cortex-cloud runs as a fleet of N processes, user_id consistent-hashed to one instance
+- Load balancer in front (could be nginx, could be a tiny Rust router — TBD during Stage 2 planning)
+- Auth + per-user rate limiting (was a `[?]` in STATUS.md)
+- Multi-tenant isolation: per-tenant cache pool keys, per-tenant rate limits
 
-- [ ] **Grammar-constrained tool calling** on the 32B Bob deployment.
-  Force valid JSON output when the model invokes tools. This is the
-  gate between "demo" and "deployable" for the concierge. Larger
-  effort — needs research into grammar-guided decoding techniques
-  compatible with cortex's sampler. ~2-3 evenings.
+**Exit:** 1000 concurrent users sustained across 2-4 cortex-cloud instances, p99 TTFT <10s, p95 decode rate >30 t/s.
 
-### Tier 2: Memex (new project, needs a new Claude session)
+**Concurrent research-in-parallel for Stage 3:**
+- Tiered cache designs — Redis LFU eviction, PostgreSQL buffer pool clock-sweep
+- Reawaken latency budget — what's an acceptable UX for a returning user? 1s? 5s? Affects tier promotion/demotion policy
+- Cache placement strategies — replication vs sharding vs hierarchical
+- Read PagedAttention paper for what NOT to do (cortex's persistent-cache + reawaken is the alternative)
 
-- [ ] **Create C:\src\memex** project. Depends on cortex (inference
-  engine) and engram (memory engine). The orchestration layer that
-  makes the librarian useful.
+## Stage 3 — Capacity-tiered (RESEARCHING, ~4-6 weeks after Stage 2)
 
-- [ ] **Ingestion pipeline**. New content published on ringhub →
-  tokenize → forward pass through librarian model → cache/append to
-  the appropriate shard. Runs in background. Records position-to-source
-  mapping in sled.
+**Goal:** ~5000 concurrent users via hot/warm/cold cache tiers.
 
-- [ ] **Shard management**. Create/manage shared shards (platform
-  knowledge, events, wiki) and per-user shards. Load/evict based on
-  usage. The lifecycle semantics from CACHE-LIFECYCLE.md.
+**Work items:**
+- Hot tier: VRAM, currently-active conversations (within last few minutes)
+- Warm tier: system RAM, recently-active (within last hour)
+- Cold tier: disk, dormant — rebuild via existing `cache_load` from token history when user returns
+- Tier promotion/demotion engine + policy tuning
+- Cache size auto-tuning per instance based on observed working-set
 
-- [ ] **Query routing**. @Bob in a conversation → determine which
-  shards to compose (shared + participant caches) → call librarian
-  retrieval → fetch original text → call 32B Bob with retrieved context.
+**Exit:** 5000 concurrent across the fleet, p95 reawaken latency <5s for returning warm users, cold-tier reawaken <30s.
 
-- [ ] **Position-to-source sidecar**. The lookup table that maps
-  (shard, offset) → source-id. Binary search over sorted spans.
-  Memex owns this, cortex returns raw positions.
+**Concurrent research-in-parallel for Stage 4:**
+- Fleet ops patterns (Kubernetes vs Nomad vs systemd, blue/green deploy strategies)
+- Backup/restore for the persistent cache pool
+- Multi-region replication patterns
 
-### Tier 3: Bootstrap corpus (Daniel + Memex)
+## Stage 4 — Production fleet (PARKED until Stage 3, ongoing thereafter)
 
-- [ ] **Curate barbershop knowledge**. The Harmonizer archives, BHS
-  glossary, coaching material, famous quartet history, contest results.
-  This is Daniel's domain expertise applied to content curation.
-  Bob's personality comes from what he's been fed.
+**Goal:** RingHub-scale operations (20k members → 1-3k concurrent at peak).
 
-- [ ] **Ingest bootstrap corpus** through the librarian model into
-  shared shards. First real test of the ingestion pipeline at scale.
+**Work items:**
+- Multi-region deployment
+- Zero-downtime config reload, blue/green deploys
+- Backup/restore for cache pool (currently in-memory only; restart loses everything)
+- On-call playbook, alerting hooks beyond `/metrics`
+- Capacity planning automation
+- Cost monitoring (per-tenant compute attribution)
 
-### Tier 4: AgentOS integration (agentos Claude)
+**Exit:** Cortex runs as a real production service, not a research engine.
 
-- [ ] **Lifecycle manager** in AgentOS. Spawn, route to, and tear down
-  per-user Bob instances with the right context. This is the multi-user
-  gate. Daniel is working on this with agentos-Claude.
+## Stage 5+ — Exploratory (LOW-PRIORITY PARALLEL, anytime)
 
-- [ ] **models.yaml config** for cortex. Already defined by
-  agentos-Claude (see `cortex-cloud/models-example.yaml`). Wire it
-  into the AgentOS startup.
+These are real possibilities, not roadmap commitments. Pick up when there's slack or when a use case forces the issue.
 
-- [ ] **Tool definitions** for the concierge. search_events,
-  get_calendar, get_member_profile, etc. These are ringhub-specific
-  and live in AgentOS.
+- **BitNet + FPGA pipeline** — the Zynqberry play. Pipeline-parallel BitNet across one-FPGA-per-layer. Genuinely elegant algorithm-hardware fit; multi-quarter hardware project. Cortex's BitNet kernels already exist (shipped 2026-05-10); missing piece is FPGA toolchain. Likely 6-12 months dedicated work IF it becomes a priority.
+- **Tensor parallelism** — split a single model across N GPUs. Only needed if cortex grows toward 70B+ models on consumer hardware. ~6-8 weeks when needed.
+- **Polar/QJL on V dequant** (currently K-only) — closes the cosine-similarity gap on retrieval attention. Was a `[ ]` in STATUS.md. Small work, ~1 week.
+- **Flash-attention variants for polar cache path** — cubek-attention may not natively handle the compressed-K shape. If retrieval path needs more perf, custom kernel.
+- **Bit-packed 3-bit angle representation** for PolarQuant — u8 → 3-bits, ~12× compression vs current ~7.5×. Listed in STATUS.md as `[ ]`.
 
-### Tier 5: Deployment
+---
 
-- [ ] **Deploy librarian** on rented GPU (or local 4090). Run
-  cortex-server with `--enable-cache --enable-retrieve`. Load the
-  librarian model. Verify retrieval works at production latency.
+## What this roadmap deliberately does NOT include
 
-- [ ] **Deploy Bob** on rented A100 (or second GPU). Run cortex-server
-  with default flags (stateless). Load the 32B model. Verify generation
-  quality.
+- **High-throughput public serving** (vLLM-style, millions of users, thousands of concurrent). Different design point. Cortex is optimized for stateful conversations with curated context — Bob/Librarian shape. If RingHub explodes to a public service, the architecture stays the same up through Stage 4 and we lean on horizontal scaling. We don't try to match vLLM's continuous-batching+PagedAttention combo because our shim/cache primitives don't fit that abstraction.
+- **PagedAttention** — wrong cost/benefit for our access pattern.
+- **Training** — cortex is inference-only. Training-related shim work (e.g., training a "should-I-reply" classifier) happens outside cortex.
 
-- [ ] **End-to-end test**. Member posts on ringhub → ingested by memex
-  → @Bob in a conversation → librarian retrieves relevant content →
-  Bob responds with context. The first time the full stack works.
+---
 
-## What can happen in parallel
+## How a Claude session uses this doc
 
-```
-Daniel: curate bootstrap corpus ──────────────────────┐
-Daniel: research sigmoid models ─────────────────┐    │
-                                                 │    │
-cortex-Claude: sigmoid support (if chosen) ──────┤    │
-cortex-Claude: grammar-constrained decoding ─────┤    │
-                                                 │    │
-agentos-Claude: lifecycle manager ───────────────┤    │
-                                                 │    │
-memex-Claude (new session): ingestion pipeline ──┼────┘
-                            shard management     │
-                            query routing        │
-                            position-to-source   │
-                                                 │
-                           ALL CONVERGE HERE ────┘
-                                 │
-                           End-to-end test
-                                 │
-                              SHIP IT
-```
+> "I'm picking up cortex work for a session. Where do I start?"
 
-## Timeline estimate (evening-sized chunks)
-
-| Work | Evenings | Who |
-|---|---|---|
-| Sigmoid attention in cortex (if needed) | 1 | cortex-Claude |
-| Grammar-constrained tool calling | 2-3 | cortex-Claude |
-| Memex ingestion pipeline | 2-3 | memex-Claude |
-| Memex shard management | 1-2 | memex-Claude |
-| Memex query routing | 1-2 | memex-Claude |
-| Position-to-source sidecar | 1 | memex-Claude |
-| Bootstrap corpus curation | 3-5 | Daniel |
-| Bootstrap corpus ingestion | 1 | memex-Claude + Daniel |
-| AgentOS lifecycle manager | 2-3 | agentos-Claude |
-| AgentOS tool definitions | 1-2 | agentos-Claude |
-| Deploy + end-to-end test | 1-2 | all |
-| **Total** | **~15-25 evenings** | |
-
-At 4-5 evenings per week with parallel work across Claude instances:
-**~3-5 weeks to ship.** The critical path runs through memex (the new
-project that doesn't exist yet) and the bootstrap corpus (Daniel's
-curation work that no one else can do).
-
-## The decisions that shorten the timeline
-
-1. **Pick softmax Qwen 1.5B now** instead of waiting for sigmoid.
-   Saves ~1 week of research + validation. Accept re-ingestion later
-   if sigmoid is worth it. Cost of switching: ~1 hour of GPU time
-   for re-ingestion at launch scale.
-
-2. **Start memex tomorrow** rather than building more cortex features.
-   Cortex is feature-complete for v0. The bottleneck moved to memex
-   and AgentOS weeks ago and every cortex refinement since then
-   (while valuable) has been off the critical path.
-
-3. **Curate the bootstrap corpus in parallel** while memex is being
-   built. Daniel's domain expertise is the one resource that can't
-   be parallelized with Claude instances. Starting the curation now
-   means it's ready when the ingestion pipeline lands.
+1. Read `STATUS.md` for what cortex provides today.
+2. Find which Stage is currently SHIPPING in this doc.
+3. Open the linked plan doc (e.g. `pinky/cubecl-migration-plan-2026-05-18.md` for Stage 1) for file-by-file detail.
+4. If the user wants help on the SHIPPING stage → focus implementation work.
+5. If the user wants to free your time for parallel research → pick a "research-in-parallel" bullet from the next stage and produce a structured report.
