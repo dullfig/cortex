@@ -1,0 +1,39 @@
+# Regression sentinel for the CubeCL spike result: confirms that the
+# allocator pool keeps memory reserved across allocate+drop cycles
+# (avoiding the wgpu/NVIDIA vkFreeMemory cliff cortex hits today on
+# request 2+). See pinky/cubecl-spike-results-2026-05-18.md for context.
+#
+# Usage:
+#   cargo run --release -- auto 30      # default mode, 30 iters
+#   cargo run --release -- persistent 30 # explicit persistent mode
+#
+# Expected on a fresh CubeCL version: bytes_reserved stays steady at
+# ~500 MB across iters; per-iter cost ≈ 500 ms (the actual 500 MB
+# upload). If reserved grows or per-iter cost blows up to seconds,
+# the cliff has returned and we should investigate.
+#
+# NOTE: not in the workspace — depends on a sibling cubecl checkout
+# at ../../cubecl. Adjust paths or pin to a published version before
+# running. (Reproducing the spike from scratch:
+#   git clone https://github.com/tracel-ai/cubecl /tmp/cubecl
+#   then run this with path = "/tmp/cubecl/crates/cubecl" )
+
+[package]
+name = "cubecl-poolbench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# When rerunning the spike, clone tracel-ai/cubecl alongside this dir
+# and adjust the paths below, OR switch to crates.io once the version
+# we care about is published. The spike used tracel-ai/cubecl@84d719b
+# (v0.11.0-pre.1).
+cubecl = { path = "../../../cubecl/crates/cubecl", features = ["wgpu"] }
+cubecl-runtime = { path = "../../../cubecl/crates/cubecl-runtime" }
+
+[[bin]]
+name = "cubecl-poolbench"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
