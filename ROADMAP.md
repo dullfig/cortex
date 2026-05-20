@@ -72,23 +72,44 @@ See `STATUS.md` for the snapshot of what cortex provides today. See `pinky/cubec
 - Cache placement strategies — replication vs sharding vs hierarchical
 - Read PagedAttention paper for what NOT to do (cortex's persistent-cache + reawaken is the alternative)
 
-## Stage 3 — Capacity-tiered (RESEARCHING, ~4-6 weeks after Stage 2)
+## Stage 3 — Cortex + AgentOS cache coordination (RESEARCHING, ~3-5 weeks after Stage 2)
 
-**Goal:** ~5000 concurrent users via hot/warm/cold cache tiers.
+**Reframed 2026-05-19** from "cortex internal tiering" to "cortex + AgentOS coordination." Daniel observed that AgentOS already has the semantic knowledge (which Bob, which user, what's likely next) that cortex doesn't have. Letting cortex invent its own LRU heuristics + disk store is reinventing what AgentOS already does well. The cleaner separation:
 
-**Work items:**
-- Hot tier: VRAM, currently-active conversations (within last few minutes)
-- Warm tier: system RAM, recently-active (within last hour)
-- Cold tier: disk, dormant — rebuild via existing `cache_load` from token history when user returns
-- Tier promotion/demotion engine + policy tuning
-- Cache size auto-tuning per instance based on observed working-set
+- **Cortex** = hot VRAM cache + eviction policy + notification hooks (the *mechanism*)
+- **AgentOS** = cold-tier owner + prefetch policy + working-set knowledge (the *policy*)
 
-**Exit:** 5000 concurrent across the fleet, p95 reawaken latency <5s for returning warm users, cold-tier reawaken <30s.
+This makes cortex *smaller* than the original Stage 3 plan, not bigger.
+
+**Goal:** ~5000 concurrent users via cortex/AgentOS protocol. Cortex stays hot-only with a sane default LRU; AgentOS owns warm and cold tiers (system RAM + memex/byte-store + disk).
+
+**Cortex-side work items (small):**
+- Configurable per-instance cache size budget (cap VRAM by total bytes or shard count)
+- Default LRU eviction policy when budget exceeded
+- **Eviction notification hook**: when cortex self-evicts shard X, notify AgentOS so its shadow doesn't drift (webhook or SSE channel — TBD)
+- Bulk inspect endpoint: `GET /v1/cache/` already lists; may add timing/access metadata
+- Tests for eviction-under-pressure + notification delivery
+
+**AgentOS-side work items** (lives in agentos repo, not cortex):
+- Cortex cache shadow — AgentOS tracks which shards cortex currently holds
+- Eviction policy — when to evict from cortex (idle Bob, day boundary, etc.)
+- Prefetch heuristics — warm a shard *before* it's needed based on Bob's planned action
+- Token persistence per shard (probably already exists via memex/agentos-byte-store)
+
+**Exit:** 5000 concurrent across the fleet. AgentOS handles cache-miss reawaken in <5s p95 (push tokens to cortex via `cache_load`, cortex prefills, ready for chat_completions). Cortex never OOMs — eviction kicks in before VRAM exhausted.
+
+**Why this is cleaner than internal tiering:**
+- Cortex doesn't need a disk-tier subsystem (AgentOS already persists tokens)
+- Cortex doesn't need a warm-RAM tier subsystem (AgentOS can re-feed quickly enough)
+- AgentOS's semantic knowledge beats cortex's blind LRU
+- The protocol becomes a stable contract both projects can iterate against
+- vLLM does this internally because it serves anonymous users and has no upper-layer with intent knowledge; AgentOS has that knowledge, so we exploit it
 
 **Concurrent research-in-parallel for Stage 4:**
 - Fleet ops patterns (Kubernetes vs Nomad vs systemd, blue/green deploy strategies)
-- Backup/restore for the persistent cache pool
+- Backup/restore for the persistent cache pool (or: skip — AgentOS persists tokens; cortex cache is purely an acceleration layer that can be rebuilt)
 - Multi-region replication patterns
+- Cortex-AgentOS protocol spec (would have to be designed in Stage 3 anyway; refining for cross-region is a Stage 4 task)
 
 ## Stage 4 — Production fleet (PARKED until Stage 3, ongoing thereafter)
 
