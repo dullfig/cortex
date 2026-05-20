@@ -19,6 +19,13 @@ pub mod device;
 pub mod avx2;
 #[cfg(feature = "gpu")]
 pub mod wgpu_backend;
+/// GPU memory arena — owns wgpu::Buffer slabs, sub-allocates ArenaSlice
+/// handles. The substrate that today's ScratchPool and a future
+/// KvBlockPool (PagedAttention) both sit on top of. Solves the TTFT
+/// cliff (vkFreeMemory cost) by never returning memory to the wgpu
+/// driver during normal operation.
+#[cfg(feature = "gpu")]
+pub mod arena;
 
 use crate::tensor::TernaryTensor;
 
