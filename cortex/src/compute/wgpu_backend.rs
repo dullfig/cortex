@@ -302,16 +302,18 @@ impl GpuDevice {
     /// Try to create a GPU device with all pipelines compiled.
     /// Returns `None` if no suitable adapter is found.
     pub fn try_new() -> Option<Self> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            ..Default::default()
-        });
+        // wgpu 29: InstanceDescriptor no Default; use new_without_display_handle.
+        // Instance::new takes desc by value.
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = wgpu::Backends::all();
+        let instance = wgpu::Instance::new(desc);
 
+        // wgpu 29: request_adapter returns Future<Result>, not Future<Option>.
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
-        }))?;
+        })).ok()?;
 
         let info = adapter.get_info();
         tracing::info!(
@@ -327,14 +329,18 @@ impl GpuDevice {
         // The 4080 reports 4 GB+; requesting adapter limits keeps resident
         // weights practical for vocab-sized tensors.
         let adapter_limits = adapter.limits();
+        // wgpu 29: request_device takes 1 arg (desc only — trace param moved
+        // INTO DeviceDescriptor as the `trace` field). DeviceDescriptor also
+        // gained `experimental_features`.
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("cortex"),
                 required_features: wgpu::Features::empty(),
                 required_limits: adapter_limits,
                 memory_hints: wgpu::MemoryHints::Performance,
+                experimental_features: wgpu::ExperimentalFeatures::default(),
+                trace: wgpu::Trace::Off,
             },
-            None,
         ))
         .ok()?;
 
@@ -617,16 +623,17 @@ impl TernaryParams {
 impl WgpuBackend {
     /// Try to create a wgpu backend. Returns `None` if no suitable GPU is found.
     pub fn try_new() -> Option<Self> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            ..Default::default()
-        });
+        // wgpu 29: InstanceDescriptor no Default; request_adapter returns Result
+        // not Option; request_device takes 1 arg with trace moved into desc.
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = wgpu::Backends::all();
+        let instance = wgpu::Instance::new(desc);
 
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
-        }))?;
+        })).ok()?;
 
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
@@ -634,8 +641,9 @@ impl WgpuBackend {
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits::default(),
                 memory_hints: wgpu::MemoryHints::Performance,
+                experimental_features: wgpu::ExperimentalFeatures::default(),
+                trace: wgpu::Trace::Off,
             },
-            None,
         ))
         .ok()?;
 
@@ -690,10 +698,12 @@ impl WgpuBackend {
             ],
         });
 
+        // wgpu 29: push_constant_ranges field renamed to immediate_size;
+        // bind_group_layouts entries are now Option<&BindGroupLayout>.
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("ternary_matvec_pipeline_layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -818,7 +828,7 @@ impl ComputeBackend for WgpuBackend {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).ok();
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
         rx.recv().expect("GPU readback failed").expect("buffer map failed");
 
         let data = slice.get_mapped_range();
@@ -942,7 +952,7 @@ mod tests {
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| { tx.send(result).ok(); });
-        gpu.device.poll(wgpu::Maintain::Wait);
+        gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
         rx.recv().unwrap().unwrap();
         let data = slice.get_mapped_range();
         let out: Vec<u32> = data[..n * 4].chunks_exact(4)

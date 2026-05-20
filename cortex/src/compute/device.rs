@@ -190,14 +190,15 @@ fn get_cpu_brand_string() -> Option<String> {
 /// Detect GPU adapters using wgpu (if the `gpu` feature is enabled).
 #[cfg(feature = "gpu")]
 fn detect_gpus() -> Vec<GpuInfo> {
-    // wgpu instance creation and adapter enumeration is async,
-    // but we use pollster to block on it since this runs once at startup.
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::all(),
-        ..Default::default()
-    });
+    // wgpu 29: InstanceDescriptor no longer implements Default; use the
+    // `new_without_display_handle` constructor and override `backends`.
+    // enumerate_adapters became async in wgpu 28 — block on it via pollster
+    // since this runs once at startup.
+    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+    desc.backends = wgpu::Backends::all();
+    let instance = wgpu::Instance::new(desc);
 
-    let adapters = instance.enumerate_adapters(wgpu::Backends::all());
+    let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
     let mut gpus = Vec::new();
 
     for adapter in adapters {

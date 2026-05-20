@@ -11,32 +11,38 @@ categories = ["science", "mathematics"]
 default = ["gpu"]
 gpu = ["wgpu", "pollster", "bytemuck", "half"]
 # memory = ["engram"]  # disabled until engram lands on this machine
-# CubeCL migration (M1 scaffold). Only cubecl-core depends — see note
-# on dep lines below. M2 will add the runtime + cubek crates.
+# CubeCL migration (M2): wgpu upgraded to 29 (was the cubecl prereq).
+# Runtime addition (cubecl + cubek-attention + cubek-matmul) still
+# blocked: cubecl-wgpu transitively enables wgpu's dx12 backend, which
+# fails to compile on Windows due to a windows-rs version conflict
+# inside wgpu 29's transient deps. Cargo's feature unification means
+# cortex setting `default-features = false` on its own wgpu dep doesn't
+# override cubecl-wgpu's request. Resolution requires either a fork of
+# cubecl-wgpu with backend selectors, an upstream PR, or pivoting to
+# the CUDA backend (which doesn't pull wgpu-hal). See migration plan.
 cubecl-backend = ["dep:cubecl-core"]
 
 [dependencies]
 thiserror = "2"
 tracing = "0.1"
 rayon = "1"
-wgpu = { version = "24", optional = true }
+# wgpu upgraded 24 → 29 in M2 to align with cubecl-wgpu's wgpu.
+# default-features = false drops the DX12 + GLES backends (which pull
+# a windows-rs version conflict in wgpu 29 on Windows); cortex uses
+# Vulkan on the dev box. DX12/GLES support is a post-migration concern
+# for AMD-on-Windows users.
+wgpu = { version = "29", default-features = false, features = ["vulkan", "wgsl"], optional = true }
 pollster = { version = "0.4", optional = true }
 bytemuck = { version = "1", features = ["derive"], optional = true }
 half = { version = "2", optional = true }
 # engram lives on the old machine; temporarily disabled until it's copied over or absorbed into cortex per the roadmap.
 # engram = { path = "../../engram", default-features = false, optional = true }
 
-# CubeCL migration deps (M1 scaffold). Pinned to a specific rev so
-# API churn during the port doesn't surprise us mid-flight. Spike
-# validated rev 84d719b (v0.11.0-pre.1).
-#
-# **M1 deliberately depends on cubecl-core only** (DSL macros, IR,
-# no runtime). Adding cubecl's `wgpu` feature pulls wgpu 29; cortex
-# already uses wgpu 24; the two collide in wgpu-hal's DX12 backend
-# on Windows (windows-rs subcrate incompatibility). M2 will add the
-# runtime via a separate workspace exclusion or vendored fork to
-# avoid the version conflict. Until then, scaffolding compiles on
-# core alone — no runtime calls yet.
+# CubeCL migration deps. Pinned to a specific git rev so API churn
+# during the port doesn't surprise us mid-flight. Spike validated
+# rev 84d719b (v0.11.0-pre.1). M1 scaffold ships cubecl-core only;
+# adding cubecl + cubecl-runtime with wgpu feature blocked on the
+# dx12 transitive feature collision (see cubecl-backend feature note).
 cubecl-core = { git = "https://github.com/tracel-ai/cubecl", rev = "84d719b0bff308cda7db4b4fb1412ff1f069a022", optional = true }
 
 [dev-dependencies]
