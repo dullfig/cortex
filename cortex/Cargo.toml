@@ -11,16 +11,13 @@ categories = ["science", "mathematics"]
 default = ["gpu"]
 gpu = ["wgpu", "pollster", "bytemuck", "half"]
 # memory = ["engram"]  # disabled until engram lands on this machine
-# CubeCL migration (M2): wgpu upgraded to 29 (was the cubecl prereq).
-# Runtime addition (cubecl + cubek-attention + cubek-matmul) still
-# blocked: cubecl-wgpu transitively enables wgpu's dx12 backend, which
-# fails to compile on Windows due to a windows-rs version conflict
-# inside wgpu 29's transient deps. Cargo's feature unification means
-# cortex setting `default-features = false` on its own wgpu dep doesn't
-# override cubecl-wgpu's request. Resolution requires either a fork of
-# cubecl-wgpu with backend selectors, an upstream PR, or pivoting to
-# the CUDA backend (which doesn't pull wgpu-hal). See migration plan.
-cubecl-backend = ["dep:cubecl-core"]
+# CubeCL migration (M2 step 2): pivoted to CUDA backend after the
+# cubecl-wgpu route hit a Cargo feature-union problem (cubecl-wgpu
+# transitively enabled wgpu's DX12 backend which collides with wgpu 29's
+# windows-rs deps on Windows). cubecl-cuda doesn't pull wgpu-hal so the
+# whole class of problem disappears. Also aligns with M6's planned
+# matmul win via cooperative_matrix on CUDA.
+cubecl-backend = ["dep:cubecl", "dep:cubecl-runtime"]
 
 [dependencies]
 thiserror = "2"
@@ -40,10 +37,10 @@ half = { version = "2", optional = true }
 
 # CubeCL migration deps. Pinned to a specific git rev so API churn
 # during the port doesn't surprise us mid-flight. Spike validated
-# rev 84d719b (v0.11.0-pre.1). M1 scaffold ships cubecl-core only;
-# adding cubecl + cubecl-runtime with wgpu feature blocked on the
-# dx12 transitive feature collision (see cubecl-backend feature note).
-cubecl-core = { git = "https://github.com/tracel-ai/cubecl", rev = "84d719b0bff308cda7db4b4fb1412ff1f069a022", optional = true }
+# rev 84d719b (v0.11.0-pre.1). Using `cuda` feature (was `wgpu`, which
+# hit a dx12 transitive feature collision on Windows).
+cubecl = { git = "https://github.com/tracel-ai/cubecl", rev = "84d719b0bff308cda7db4b4fb1412ff1f069a022", features = ["cuda"], optional = true }
+cubecl-runtime = { git = "https://github.com/tracel-ai/cubecl", rev = "84d719b0bff308cda7db4b4fb1412ff1f069a022", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
