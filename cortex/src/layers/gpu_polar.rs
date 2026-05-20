@@ -183,7 +183,7 @@ pub fn attn_score_polar_oneshot(
     let slice = staging.slice(..);
     let (sender, receiver) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |r| { let _ = sender.send(r); });
-    gpu.device.poll(wgpu::Maintain::Wait);
+    gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
     receiver.recv().unwrap().unwrap();
 
     let mapped = slice.get_mapped_range();
@@ -376,7 +376,7 @@ pub fn attn_value_polar_oneshot(
     let slice = staging.slice(..);
     let (sender, receiver) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |r| { let _ = sender.send(r); });
-    gpu.device.poll(wgpu::Maintain::Wait);
+    gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
     receiver.recv().unwrap().unwrap();
 
     let mapped = slice.get_mapped_range();
@@ -1165,7 +1165,7 @@ mod tests {
         let slice = staging.slice(..);
         let (s, r) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| { let _ = s.send(res); });
-        gpu.device.poll(wgpu::Maintain::Wait);
+        gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
         r.recv().unwrap().unwrap();
         let mapped = slice.get_mapped_range();
         let out: Vec<f32> = bytemuck::cast_slice(&mapped).to_vec();
@@ -1242,7 +1242,7 @@ mod tests {
             &k_in_buf, &v_in_buf, n_tokens, /*start_pos*/ 0,
         );
         gpu.queue.submit(Some(encoder.finish()));
-        gpu.device.poll(wgpu::Maintain::Wait);
+        gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
 
         // Read back GPU compressed buffers.
         let n_pairs = head_dim / 2;
@@ -1260,7 +1260,7 @@ mod tests {
             let slice = staging.slice(..);
             let (s, r) = std::sync::mpsc::channel();
             slice.map_async(wgpu::MapMode::Read, move |res| { let _ = s.send(res); });
-            gpu.device.poll(wgpu::Maintain::Wait);
+            gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
             r.recv().unwrap().unwrap();
             let mapped = slice.get_mapped_range();
             let out = mapped.to_vec();
@@ -1361,7 +1361,7 @@ mod tests {
             &k_buf, &v_buf, n_tokens, start_pos,
         );
         gpu.queue.submit(Some(encoder.finish()));
-        gpu.device.poll(wgpu::Maintain::Wait);
+        gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
 
         // The radius buffer at indices [start_pos*n_kv_heads ..
         // (start_pos+n_tokens)*n_kv_heads] should be non-zero; the
@@ -1376,7 +1376,7 @@ mod tests {
         let slice = staging.slice(..);
         let (s, r) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| { let _ = s.send(res); });
-        gpu.device.poll(wgpu::Maintain::Wait);
+        gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
         r.recv().unwrap().unwrap();
         let mapped = slice.get_mapped_range();
         let radius: Vec<f32> = bytemuck::cast_slice(&mapped).to_vec();
@@ -1465,7 +1465,7 @@ mod tests {
             &rq_buf, &scores_buf_resident, n_query_heads, /*max_seq*/ seq_len,
         );
         gpu.queue.submit(Some(encoder.finish()));
-        gpu.device.poll(wgpu::Maintain::Wait);
+        gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
 
         let scores_resident = readback_f32(&gpu, &scores_buf_resident, scores_len);
 
@@ -1516,7 +1516,7 @@ mod tests {
             n_query_heads, /*max_seq*/ seq_len,
         );
         gpu.queue.submit(Some(encoder.finish()));
-        gpu.device.poll(wgpu::Maintain::Wait);
+        gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
 
         let out_resident = readback_f32(&gpu, &out_buf_resident, out_len);
 
@@ -1595,7 +1595,7 @@ mod tests {
             &k_in_buf, &v_in_buf, total, /*start_pos*/ 0,
         );
         gpu.queue.submit(Some(encoder.finish()));
-        gpu.device.poll(wgpu::Maintain::Wait);
+        gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
         polar_kv.set_len(total);
 
         // Per-query-token Q in original space. n_tokens queries, n_heads each.
@@ -1732,7 +1732,7 @@ mod tests {
         );
 
         gpu.queue.submit(Some(encoder.finish()));
-        gpu.device.poll(wgpu::Maintain::Wait);
+        gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
 
         let gpu_out = readback_f32(&gpu, &final_buf, n_tokens * n_query_heads * head_dim);
 
@@ -1790,7 +1790,7 @@ mod tests {
         });
         compress_layer_into_polar(&gpu, &mut e, &polar_kv, layer, &k_in, &v_in, max_seq, 0);
         gpu.queue.submit(Some(e.finish()));
-        gpu.device.poll(wgpu::Maintain::Wait);
+        gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
         polar_kv.set_len(max_seq);
 
         // Q for the single query token.
@@ -1842,7 +1842,7 @@ mod tests {
             n_query_heads, n_kv_heads, head_dim, start_pos, n_tokens, max_seq,
         );
         gpu.queue.submit(Some(e.finish()));
-        gpu.device.poll(wgpu::Maintain::Wait);
+        gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
 
         let batch_scores = readback_f32(&gpu, &scores_buf, n_query_heads * max_seq);
 

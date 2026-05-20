@@ -16,7 +16,11 @@ gpu = ["wgpu", "pollster", "bytemuck", "half"]
 thiserror = "2"
 tracing = "0.1"
 rayon = "1"
-wgpu = { version = "24", optional = true }
+# wgpu upgraded 24 → 29. default-features = false drops the DX12 + GLES
+# backends (which pull a windows-rs version conflict in wgpu 29 on
+# Windows); cortex uses Vulkan on the dev box. DX12/GLES support is a
+# post-migration concern for AMD-on-Windows users.
+wgpu = { version = "29", default-features = false, features = ["vulkan", "wgsl"], optional = true }
 pollster = { version = "0.4", optional = true }
 bytemuck = { version = "1", features = ["derive"], optional = true }
 half = { version = "2", optional = true }

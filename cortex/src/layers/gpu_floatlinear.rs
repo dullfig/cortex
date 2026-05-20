@@ -124,7 +124,7 @@ impl LinearLayer for GpuFloatLinear {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).ok();
         });
-        self.gpu.device.poll(wgpu::Maintain::Wait);
+        self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
         rx.recv().expect("GPU readback failed").expect("buffer map failed");
 
         let data = slice.get_mapped_range();

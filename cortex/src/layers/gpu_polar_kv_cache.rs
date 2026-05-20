@@ -269,7 +269,7 @@ impl GpuPolarKvCache {
             );
         }
         self.gpu.queue.submit(Some(encoder.finish()));
-        self.gpu.device.poll(wgpu::Maintain::Wait);
+        self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
 
         self.len = n_tokens;
     }
@@ -363,7 +363,7 @@ mod tests {
         let slice = staging.slice(..);
         let (s, r) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| { let _ = s.send(res); });
-        gpu.device.poll(wgpu::Maintain::Wait);
+        gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
         r.recv().unwrap().unwrap();
         let mapped = slice.get_mapped_range();
         let out = mapped.to_vec();

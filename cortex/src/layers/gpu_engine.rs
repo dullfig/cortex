@@ -746,7 +746,7 @@ impl GpuEngine {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).ok();
         });
-        self.gpu.device.poll(wgpu::Maintain::Wait);
+        self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
         rx.recv().expect("GPU readback failed").expect("buffer map failed");
 
         let data = slice.get_mapped_range();
@@ -917,7 +917,7 @@ impl GpuEngine {
             slice
         }).collect();
 
-        self.gpu.device.poll(wgpu::Maintain::Wait);
+        self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
         for rx in &receivers {
             rx.recv().expect("readback channel closed").expect("buffer map failed");
         }
@@ -1069,7 +1069,7 @@ impl GpuEngine {
             slice
         }).collect();
 
-        self.gpu.device.poll(wgpu::Maintain::Wait);
+        self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
         for rx in &receivers {
             rx.recv().expect("readback channel closed").expect("buffer map failed");
         }
@@ -1220,7 +1220,7 @@ impl GpuEngine {
             receivers.push(rx);
             slice
         }).collect();
-        self.gpu.device.poll(wgpu::Maintain::Wait);
+        self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
         for rx in &receivers {
             rx.recv().expect("readback channel closed").expect("buffer map failed");
         }
@@ -1362,7 +1362,7 @@ impl GpuEngine {
             receivers.push(rx);
             slice
         }).collect();
-        self.gpu.device.poll(wgpu::Maintain::Wait);
+        self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
         for rx in &receivers {
             rx.recv().expect("readback channel closed").expect("buffer map failed");
         }
@@ -1536,7 +1536,7 @@ impl GpuEngine {
         // CORTEX_SYNC_AFTER_ADVANCE=1 to enable. Default off (back-compat).
         let t_poll_start = std::time::Instant::now();
         if std::env::var("CORTEX_SYNC_AFTER_ADVANCE").as_deref() == Ok("1") {
-            self.gpu.device.poll(wgpu::Maintain::Wait);
+            self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
         }
         let t_poll = t_poll_start.elapsed();
 
@@ -1761,7 +1761,7 @@ impl GpuEngine {
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
-        self.gpu.device.poll(wgpu::Maintain::Wait);
+        self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
         rx.recv().expect("readback failed").expect("buffer map failed");
         let data = slice.get_mapped_range();
         let normed: Vec<f32> = data.chunks_exact(4)
@@ -2886,7 +2886,7 @@ fn read_back_buffer(gpu: &GpuDevice, staging: &wgpu::Buffer, bytes: usize) -> Ve
     slice.map_async(wgpu::MapMode::Read, move |result| {
         tx.send(result).ok();
     });
-    gpu.device.poll(wgpu::Maintain::Wait);
+    gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
     rx.recv().expect("readback failed").expect("buffer map failed");
     let data = slice.get_mapped_range();
     let out: Vec<f32> = data[..bytes].chunks_exact(4)
@@ -3089,7 +3089,7 @@ mod tests {
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
-        gpu.device.poll(wgpu::Maintain::Wait);
+        gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
         rx.recv().unwrap().unwrap();
         let data = slice.get_mapped_range();
         let gpu_out: Vec<f32> = data
@@ -3157,7 +3157,7 @@ mod tests {
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
-        gpu.device.poll(wgpu::Maintain::Wait);
+        gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
         rx.recv().unwrap().unwrap();
         let data = slice.get_mapped_range();
         let gpu_out: Vec<f32> = data.chunks_exact(4)
@@ -3285,7 +3285,7 @@ mod tests {
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
-        gpu.device.poll(wgpu::Maintain::Wait);
+        gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
         rx.recv().unwrap().unwrap();
         let data = slice.get_mapped_range();
         let gpu_out: Vec<f32> = data.chunks_exact(4)
@@ -3364,7 +3364,7 @@ mod tests {
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
-        gpu.device.poll(wgpu::Maintain::Wait);
+        gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
         rx.recv().unwrap().unwrap();
         let data = slice.get_mapped_range();
         let gpu_out: Vec<f32> = data.chunks_exact(4)
@@ -4539,7 +4539,7 @@ mod tests {
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
-        gpu.device.poll(wgpu::Maintain::Wait);
+        gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
         rx.recv().unwrap().unwrap();
         let data = slice.get_mapped_range();
         let gpu_out: Vec<f32> = data.chunks_exact(4)
@@ -4711,7 +4711,7 @@ mod tests {
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
-        gpu.device.poll(wgpu::Maintain::Wait);
+        gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
         rx.recv().unwrap().unwrap();
         let data = slice.get_mapped_range();
         let gpu_out: Vec<f32> = data.chunks_exact(4)
@@ -4780,7 +4780,7 @@ mod tests {
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
-        gpu.device.poll(wgpu::Maintain::Wait);
+        gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
         rx.recv().unwrap().unwrap();
         let data = slice.get_mapped_range();
         let gpu_out: Vec<f32> = data.chunks_exact(4)
@@ -4827,7 +4827,7 @@ mod tests {
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
-        gpu.device.poll(wgpu::Maintain::Wait);
+        gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
         rx.recv().unwrap().unwrap();
         let data = slice.get_mapped_range();
         let gpu_a: Vec<f32> = data.chunks_exact(4)
