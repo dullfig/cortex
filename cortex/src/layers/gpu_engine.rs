@@ -34,6 +34,7 @@ use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
 use crate::compute::wgpu_backend::GpuDevice;
+use crate::compute::pool::PooledBuffer;
 use crate::layers::kv_cache::ModelKvCache;
 use crate::layers::linear::LinearLayer;
 use crate::layers::model::TransformerModel;
@@ -197,17 +198,29 @@ impl HiddenCaptures {
     }
 }
 
+/// Per-forward scratch buffers.
+///
+/// **TTFT cliff fix (M2 via wgpu-pool branch):** these used to be raw
+/// `wgpu::Buffer` allocated + dropped per forward, which triggered the
+/// NVIDIA driver's ~1-2 sec/call `vkFreeMemory` cost on request 2+
+/// (cumulative ~17 sec drop). Now they're `PooledBuffer`s sourced from
+/// a `ScratchPool` held on `GpuEngine` — on drop they return to the
+/// pool's freelist instead of the driver, so the cliff never fires.
+///
+/// `PooledBuffer` implements `Deref<Target = wgpu::Buffer>` so every
+/// `&scratch.q` style call site that previously took `&wgpu::Buffer`
+/// works unchanged via Rust's deref coercion in argument positions.
 pub struct BlockScratch {
-    pub normed: wgpu::Buffer,    // [n_tokens, embed_dim] post-rmsnorm scratch
-    pub q: wgpu::Buffer,         // [n_tokens, n_heads * head_dim]
-    pub k: wgpu::Buffer,         // [n_tokens, n_kv_heads * head_dim]
-    pub v: wgpu::Buffer,         // [n_tokens, n_kv_heads * head_dim]
-    pub attn_out: wgpu::Buffer,  // [n_tokens, n_heads * head_dim]
-    pub scores: wgpu::Buffer,    // [n_tokens, n_heads, max_seq] attention scores
-    pub gate: wgpu::Buffer,      // [n_tokens, intermediate]
-    pub up: wgpu::Buffer,        // [n_tokens, intermediate]
-    pub activated: wgpu::Buffer, // [n_tokens, intermediate] SiLU(gate)*up
-    pub projected: wgpu::Buffer, // [n_tokens, embed_dim] both attn-out-proj and FFN-down output reuse this
+    pub normed: PooledBuffer,    // [n_tokens, embed_dim] post-rmsnorm scratch
+    pub q: PooledBuffer,         // [n_tokens, n_heads * head_dim]
+    pub k: PooledBuffer,         // [n_tokens, n_kv_heads * head_dim]
+    pub v: PooledBuffer,         // [n_tokens, n_kv_heads * head_dim]
+    pub attn_out: PooledBuffer,  // [n_tokens, n_heads * head_dim]
+    pub scores: PooledBuffer,    // [n_tokens, n_heads, max_seq] attention scores
+    pub gate: PooledBuffer,      // [n_tokens, intermediate]
+    pub up: PooledBuffer,        // [n_tokens, intermediate]
+    pub activated: PooledBuffer, // [n_tokens, intermediate] SiLU(gate)*up
+    pub projected: PooledBuffer, // [n_tokens, embed_dim] both attn-out-proj and FFN-down output reuse this
     /// Scratch for the bitnet batch matmul path (#bn-5). Sized for the
     /// widest input dim across Q/K/V projections (embed_dim) and FFN
     /// (intermediate, for the gate/up projection in_features = embed_dim;
@@ -223,14 +236,18 @@ pub struct BlockScratch {
 /// token. Both sized so that any of the six linear-call sites in a
 /// block fits.
 pub struct TernaryScratch {
-    pub activations_i8: wgpu::Buffer,
-    pub scales: wgpu::Buffer,
+    pub activations_i8: PooledBuffer,
+    pub scales: PooledBuffer,
 }
 
 impl BlockScratch {
     /// Allocate scratch buffers sized for a single forward of `n_tokens`.
+    ///
+    /// `pool` is the engine's shared `ScratchPool`. After this call returns
+    /// the BlockScratch holds `PooledBuffer` handles; on drop they return
+    /// to the pool's freelist (no driver-side vkFreeMemory call).
     pub fn allocate(
-        gpu: &GpuDevice,
+        pool: &Arc<crate::compute::pool::ScratchPool>,
         n_tokens: usize,
         embed_dim: usize,
         n_heads: usize,
@@ -239,14 +256,6 @@ impl BlockScratch {
         intermediate: usize,
         max_seq: usize,
     ) -> Self {
-        let mk = |size: u64, label: &str| -> wgpu::Buffer {
-            gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            })
-        };
         let f32_bytes = std::mem::size_of::<f32>() as u64;
         let u32_bytes = std::mem::size_of::<u32>() as u64;
         // Ternary scratch sizing: largest in_features across all linear
@@ -255,20 +264,20 @@ impl BlockScratch {
         let max_in = embed_dim.max(intermediate);
         let act_q_u32_count = (n_tokens * ((max_in + 3) / 4)) as u64;
         let ternary = TernaryScratch {
-            activations_i8: mk(act_q_u32_count * u32_bytes, "scratch.ternary.activations_i8"),
-            scales:         mk((n_tokens as u64) * f32_bytes, "scratch.ternary.scales"),
+            activations_i8: pool.acquire(act_q_u32_count * u32_bytes),
+            scales:         pool.acquire((n_tokens as u64) * f32_bytes),
         };
         Self {
-            normed:    mk((n_tokens * embed_dim) as u64 * f32_bytes, "scratch.normed"),
-            q:         mk((n_tokens * n_heads * head_dim) as u64 * f32_bytes, "scratch.q"),
-            k:         mk((n_tokens * n_kv_heads * head_dim) as u64 * f32_bytes, "scratch.k"),
-            v:         mk((n_tokens * n_kv_heads * head_dim) as u64 * f32_bytes, "scratch.v"),
-            attn_out:  mk((n_tokens * n_heads * head_dim) as u64 * f32_bytes, "scratch.attn_out"),
-            scores:    mk((n_tokens * n_heads * max_seq) as u64 * f32_bytes, "scratch.scores"),
-            gate:      mk((n_tokens * intermediate) as u64 * f32_bytes, "scratch.gate"),
-            up:        mk((n_tokens * intermediate) as u64 * f32_bytes, "scratch.up"),
-            activated: mk((n_tokens * intermediate) as u64 * f32_bytes, "scratch.activated"),
-            projected: mk((n_tokens * embed_dim) as u64 * f32_bytes, "scratch.projected"),
+            normed:    pool.acquire((n_tokens * embed_dim) as u64 * f32_bytes),
+            q:         pool.acquire((n_tokens * n_heads * head_dim) as u64 * f32_bytes),
+            k:         pool.acquire((n_tokens * n_kv_heads * head_dim) as u64 * f32_bytes),
+            v:         pool.acquire((n_tokens * n_kv_heads * head_dim) as u64 * f32_bytes),
+            attn_out:  pool.acquire((n_tokens * n_heads * head_dim) as u64 * f32_bytes),
+            scores:    pool.acquire((n_tokens * n_heads * max_seq) as u64 * f32_bytes),
+            gate:      pool.acquire((n_tokens * intermediate) as u64 * f32_bytes),
+            up:        pool.acquire((n_tokens * intermediate) as u64 * f32_bytes),
+            activated: pool.acquire((n_tokens * intermediate) as u64 * f32_bytes),
+            projected: pool.acquire((n_tokens * embed_dim) as u64 * f32_bytes),
             ternary,
         }
     }
@@ -301,6 +310,11 @@ pub struct GpuEngine {
     /// `start_pos + n_tokens > rope_max_seq` would index out of range, so
     /// they assert.
     rope_max_seq: usize,
+    /// ScratchPool for BlockScratch buffers. Eliminates the TTFT cliff
+    /// (`vkFreeMemory` 1-2 sec/call on NVIDIA after request 1) by
+    /// recycling whole wgpu::Buffer instances by size class instead of
+    /// allocating + dropping per forward. See `cortex/src/compute/pool.rs`.
+    scratch_pool: Arc<crate::compute::pool::ScratchPool>,
 }
 
 impl GpuEngine {
@@ -381,6 +395,15 @@ impl GpuEngine {
         let (rope_cos_buf, rope_sin_buf) =
             Self::build_rope_tables(&gpu, attn0.rope().inv_freq(), max_seq);
 
+        // ScratchPool: one per engine, used by every BlockScratch::allocate.
+        // STORAGE | COPY_SRC matches what all scratch buffers used to
+        // request directly. The pool recycles whole wgpu::Buffer instances
+        // by size class, eliminating the per-request vkFreeMemory cliff.
+        let scratch_pool = crate::compute::pool::ScratchPool::new(
+            Arc::clone(&gpu),
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+
         Self {
             cpu,
             gpu,
@@ -391,6 +414,7 @@ impl GpuEngine {
             rope_cos_buf,
             rope_sin_buf,
             rope_max_seq: max_seq,
+            scratch_pool,
         }
     }
 
@@ -854,7 +878,7 @@ impl GpuEngine {
             .intermediate_size();
         let n_heads = attn0.n_heads();
         let scratch = BlockScratch::allocate(
-            &self.gpu, n_tokens, self.embed_dim,
+            &self.scratch_pool, n_tokens, self.embed_dim,
             n_heads, attn0.n_kv_heads(), attn0.head_dim(),
             intermediate, n_tokens,
         );
@@ -1008,7 +1032,7 @@ impl GpuEngine {
             .intermediate_size();
         let n_heads = attn0.n_heads();
         let scratch = BlockScratch::allocate(
-            &self.gpu, n_tokens, self.embed_dim,
+            &self.scratch_pool, n_tokens, self.embed_dim,
             n_heads, attn0.n_kv_heads(), attn0.head_dim(),
             intermediate, n_tokens,
         );
@@ -1167,7 +1191,7 @@ impl GpuEngine {
             .intermediate_size();
         let n_heads = attn0.n_heads();
         let scratch = BlockScratch::allocate(
-            &self.gpu, n_tokens, self.embed_dim,
+            &self.scratch_pool, n_tokens, self.embed_dim,
             n_heads, attn0.n_kv_heads(), attn0.head_dim(),
             intermediate, attn_max_seq,
         );
@@ -1300,7 +1324,7 @@ impl GpuEngine {
         let n_heads = attn0.n_heads();
         let head_dim = attn0.head_dim();
         let scratch = BlockScratch::allocate(
-            &self.gpu, n_tokens, self.embed_dim,
+            &self.scratch_pool, n_tokens, self.embed_dim,
             n_heads, attn0.n_kv_heads(), head_dim,
             intermediate, attn_max_seq,
         );
@@ -1504,7 +1528,7 @@ impl GpuEngine {
         let attn_max_seq = start_pos + n_tokens;
         let t_alloc_start = std::time::Instant::now();
         let scratch = BlockScratch::allocate(
-            &self.gpu, n_tokens, self.embed_dim,
+            &self.scratch_pool, n_tokens, self.embed_dim,
             attn0.n_heads(), attn0.n_kv_heads(), attn0.head_dim(),
             intermediate, attn_max_seq,
         );
@@ -1628,7 +1652,7 @@ impl GpuEngine {
         let attn_max_seq = start_pos + n_tokens;
         let t_pre_scratch = t_start.elapsed();
         let scratch = BlockScratch::allocate(
-            &self.gpu, n_tokens, self.embed_dim,
+            &self.scratch_pool, n_tokens, self.embed_dim,
             attn0.n_heads(), attn0.n_kv_heads(), attn0.head_dim(),
             intermediate, attn_max_seq,
         );
@@ -1737,7 +1761,7 @@ impl GpuEngine {
             .unwrap_or_else(|| panic!("forward_full_gpu requires SwiGLU FFN"))
             .intermediate_size();
         let scratch = BlockScratch::allocate(
-            &self.gpu, n_tokens, self.embed_dim,
+            &self.scratch_pool, n_tokens, self.embed_dim,
             attn0.n_heads(), attn0.n_kv_heads(), attn0.head_dim(),
             intermediate, n_tokens,
         );
@@ -1935,7 +1959,10 @@ impl GpuEngine {
         // splits inside `dispatch_attention_inner`.
         let (k_for_attn, v_for_attn, attn_max_seq) = match kv_cache_target {
             Some((kc, vc)) => (kc, vc, start_pos + n_tokens),
-            None => (&scratch.k, &scratch.v, n_tokens),
+            // Explicit deref needed: match arms must agree on type,
+            // and the `Some` arm has `&wgpu::Buffer`. Deref coercion
+            // fires in function-arg positions but NOT across match arms.
+            None => (&*scratch.k, &*scratch.v, n_tokens),
         };
         // Perf-bisect: see CORTEX_SKIP_SCORE / SOFTMAX / VALUE inside
         // `dispatch_attention_inner` — per-stage skip flags that bypass
@@ -4523,8 +4550,14 @@ mod tests {
             .downcast_ref::<crate::layers::swiglu::SwiGLU>().unwrap()
             .intermediate_size();
 
+        // Test: create a local ScratchPool. Production code uses the
+        // engine's `scratch_pool` field.
+        let pool = crate::compute::pool::ScratchPool::new(
+            Arc::clone(&gpu),
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
         let scratch = BlockScratch::allocate(
-            &gpu, n_tokens, embed_dim,
+            &pool, n_tokens, embed_dim,
             attn0.n_heads(), attn0.n_kv_heads(), attn0.head_dim(),
             intermediate, /*max_seq*/ n_tokens,
         );
@@ -4695,8 +4728,14 @@ mod tests {
         let intermediate = engine.cpu().blocks()[0].ffn().as_any()
             .downcast_ref::<crate::layers::swiglu::SwiGLU>().unwrap()
             .intermediate_size();
+        // Test: create a local ScratchPool. Production code uses the
+        // engine's `scratch_pool` field.
+        let pool = crate::compute::pool::ScratchPool::new(
+            Arc::clone(&gpu),
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
         let scratch = BlockScratch::allocate(
-            &gpu, n_tokens, embed_dim,
+            &pool, n_tokens, embed_dim,
             attn0.n_heads(), attn0.n_kv_heads(), attn0.head_dim(),
             intermediate, /*max_seq*/ n_tokens,
         );
