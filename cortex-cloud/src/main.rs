@@ -1246,22 +1246,41 @@ fn generate_stateless_gpu(
     steers: &[Arc<RegisteredShim>],
     inject_deltas: &[Option<wgpu::Buffer>],
 ) -> Vec<u32> {
+    let t_fn_start = std::time::Instant::now();
+
+    let t_pre_cache = std::time::Instant::now();
     let mut cache = engine.create_gpu_kv_cache(max_seq_len);
+    let t_create_cache = t_pre_cache.elapsed();
+
     let mut sampler = Sampler::new(sampler_config, seed);
     let embed_dim = engine.embed_dim();
     let has_steers = !steers.is_empty();
 
     // Prefill: get [n_prompt * embed_dim] hidden (with inject), take
     // last token's slice, apply steers (if any), project, sample.
+    let t_pre_prefill = std::time::Instant::now();
     let mut next_token = if has_steers {
         let mut prefill_hidden = engine.forward_full_gpu_with_cache_inject_returning_hidden(
             prompt_tokens, &mut cache, inject_deltas,
         );
+        let t_after_fwd = t_pre_prefill.elapsed();
         let last_off = (prompt_tokens.len() - 1) * embed_dim;
         let last_slice = &mut prefill_hidden[last_off..last_off + embed_dim];
         apply_steers_inplace(steers, last_slice);
+        let t_pre_finalize = std::time::Instant::now();
         let last_logits = engine.cpu().finalize_logits(last_slice, 1);
-        sampler.sample(&last_logits)
+        let t_finalize = t_pre_finalize.elapsed();
+        let t_pre_sample = std::time::Instant::now();
+        let tok = sampler.sample(&last_logits);
+        let t_sample = t_pre_sample.elapsed();
+        tracing::info!(
+            target: "cortex_cloud::gen",
+            prefill_fwd_us = t_after_fwd.as_micros() as u64,
+            prefill_finalize_us = t_finalize.as_micros() as u64,
+            prefill_sample_us = t_sample.as_micros() as u64,
+            "gen.prefill (with steers)"
+        );
+        tok
     } else {
         // Read hidden, project only the LAST token's slice through the
         // LM head. The previous version called forward_full_gpu_with_cache_inject
@@ -1270,10 +1289,32 @@ fn generate_stateless_gpu(
         let prefill_hidden = engine.forward_full_gpu_with_cache_inject_returning_hidden(
             prompt_tokens, &mut cache, inject_deltas,
         );
+        let t_after_fwd = t_pre_prefill.elapsed();
+        let t_pre_slice = std::time::Instant::now();
         let last_off = (prompt_tokens.len() - 1) * embed_dim;
         let last_slice = &prefill_hidden[last_off..last_off + embed_dim];
+        let t_slice = t_pre_slice.elapsed();
+        let t_pre_finalize = std::time::Instant::now();
         let last_logits = engine.cpu().finalize_logits(last_slice, 1);
-        sampler.sample(&last_logits)
+        let t_finalize = t_pre_finalize.elapsed();
+        let t_pre_sample = std::time::Instant::now();
+        let tok = sampler.sample(&last_logits);
+        let t_sample = t_pre_sample.elapsed();
+        // The hidden vec is about to drop here too.
+        let t_pre_drop = std::time::Instant::now();
+        drop(prefill_hidden);
+        let t_drop_hidden = t_pre_drop.elapsed();
+        tracing::info!(
+            target: "cortex_cloud::gen",
+            n_prompt = prompt_tokens.len() as u64,
+            prefill_fwd_us = t_after_fwd.as_micros() as u64,
+            slice_us = t_slice.as_micros() as u64,
+            prefill_finalize_us = t_finalize.as_micros() as u64,
+            prefill_sample_us = t_sample.as_micros() as u64,
+            prefill_drop_hidden_us = t_drop_hidden.as_micros() as u64,
+            "gen.prefill"
+        );
+        tok
     };
 
     let mut out: Vec<u32> = Vec::new();
@@ -1282,7 +1323,8 @@ fn generate_stateless_gpu(
     }
     out.push(next_token);
 
-    for _ in 1..max_tokens {
+    for it in 1..max_tokens {
+        let t_iter_start = std::time::Instant::now();
         let logits = if has_steers {
             let mut hidden = engine.forward_full_gpu_with_cache_inject_returning_hidden(
                 &[next_token], &mut cache, inject_deltas,
@@ -1297,12 +1339,33 @@ fn generate_stateless_gpu(
                 &[next_token], &mut cache, inject_deltas,
             )
         };
+        let t_after_fwd = t_iter_start.elapsed();
+        let t_pre_sample = std::time::Instant::now();
         next_token = sampler.sample(&logits);
+        let t_sample = t_pre_sample.elapsed();
+        tracing::info!(
+            target: "cortex_cloud::gen",
+            iter = it as u64,
+            decode_fwd_plus_finalize_us = t_after_fwd.as_micros() as u64,
+            decode_sample_us = t_sample.as_micros() as u64,
+            "gen.decode"
+        );
         if next_token == eos {
             break;
         }
         out.push(next_token);
     }
+
+    let t_pre_drop_cache = std::time::Instant::now();
+    drop(cache);
+    let t_drop_cache = t_pre_drop_cache.elapsed();
+    tracing::info!(
+        target: "cortex_cloud::gen",
+        create_cache_us = t_create_cache.as_micros() as u64,
+        drop_cache_us = t_drop_cache.as_micros() as u64,
+        total_us = t_fn_start.elapsed().as_micros() as u64,
+        "gen.totals"
+    );
     out
 }
 
