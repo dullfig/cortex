@@ -310,11 +310,25 @@ pub struct GpuEngine {
     /// `start_pos + n_tokens > rope_max_seq` would index out of range, so
     /// they assert.
     rope_max_seq: usize,
-    /// ScratchPool for BlockScratch buffers. Eliminates the TTFT cliff
-    /// (`vkFreeMemory` 1-2 sec/call on NVIDIA after request 1) by
-    /// recycling whole wgpu::Buffer instances by size class instead of
-    /// allocating + dropping per forward. See `cortex/src/compute/pool.rs`.
+    /// ScratchPool for BlockScratch buffers AND the per-forward
+    /// hidden_buf/normed_buf (STORAGE | COPY_SRC | COPY_DST).
+    /// Eliminates the TTFT cliff (`vkFreeMemory` 1-2 sec/call on NVIDIA
+    /// after request 1) by recycling whole wgpu::Buffer instances by
+    /// size class instead of allocating + dropping per forward. See
+    /// `cortex/src/compute/pool.rs`. COPY_DST is needed because
+    /// hidden_buf gets populated via `queue.write_buffer` (the
+    /// `create_buffer_init` shortcut doesn't work for pre-allocated
+    /// buffers).
     scratch_pool: Arc<crate::compute::pool::ScratchPool>,
+    /// Second pool for the readback staging buffer (MAP_READ |
+    /// COPY_DST). wgpu validates usage flags per binding, so this
+    /// class needs its own freelist.
+    staging_pool: Arc<crate::compute::pool::ScratchPool>,
+    /// ParamsArena for per-dispatch uniform buffers. ~600 dispatches per
+    /// forward × small tiny buffers used to be vkAllocate+vkFree pairs;
+    /// the arena bump-allocates from one slab and resets per forward.
+    /// See `cortex/src/compute/params_arena.rs`.
+    params_arena: Arc<crate::compute::params_arena::ParamsArena>,
 }
 
 impl GpuEngine {
@@ -395,13 +409,32 @@ impl GpuEngine {
         let (rope_cos_buf, rope_sin_buf) =
             Self::build_rope_tables(&gpu, attn0.rope().inv_freq(), max_seq);
 
-        // ScratchPool: one per engine, used by every BlockScratch::allocate.
-        // STORAGE | COPY_SRC matches what all scratch buffers used to
-        // request directly. The pool recycles whole wgpu::Buffer instances
-        // by size class, eliminating the per-request vkFreeMemory cliff.
+        // ScratchPool: one per engine, used by every BlockScratch::allocate
+        // and by the per-forward hidden/normed buffers. The pool recycles
+        // whole wgpu::Buffer instances by size class, eliminating the
+        // per-request vkFreeMemory cliff. COPY_DST is required because
+        // hidden_buf gets populated via queue.write_buffer (acquire returns
+        // a zero-init buffer; we then write the embedding data into it).
         let scratch_pool = crate::compute::pool::ScratchPool::new(
             Arc::clone(&gpu),
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+        );
+        // Staging buffer pool — different usage class (MAP_READ |
+        // COPY_DST) so it needs its own freelist; wgpu validates usage.
+        let staging_pool = crate::compute::pool::ScratchPool::new(
+            Arc::clone(&gpu),
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        );
+        // ParamsArena: frame allocator for per-dispatch uniform buffers.
+        // 64 KiB initial slab fits ~256 aligned 256-byte slots (each holds
+        // a ~16-32 byte params struct); grows on overflow. Reset at the
+        // top of each top-level forward entry point — by then any prior
+        // forward's submit has completed (the wrapper polled for readback).
+        let params_arena = crate::compute::params_arena::ParamsArena::new(
+            Arc::clone(&gpu),
+            64 * 1024,
         );
 
         Self {
@@ -415,7 +448,26 @@ impl GpuEngine {
             rope_sin_buf,
             rope_max_seq: max_seq,
             scratch_pool,
+            staging_pool,
+            params_arena,
         }
+    }
+
+    /// Acquire a params slot from `params_arena`, write the struct into
+    /// the slab, build a bind group with the supplied storage buffers as
+    /// `@binding(0..N)` and the params slot as `@binding(N)`. This is the
+    /// universal pattern for cortex's compute dispatches.
+    fn bind_with_params<T: bytemuck::Pod>(
+        &self,
+        pipeline: &wgpu::ComputePipeline,
+        storages: &[&wgpu::Buffer],
+        params: &T,
+    ) -> wgpu::BindGroup {
+        use crate::compute::wgpu_backend::BindEntry;
+        let handle = self.params_arena.acquire(params);
+        let mut entries: Vec<BindEntry> = storages.iter().map(|b| BindEntry::Whole(*b)).collect();
+        entries.push(BindEntry::Sub(handle.binding()));
+        self.gpu.make_bind_group_with_bindings(pipeline, &entries)
     }
 
     /// Dispatch RMSNorm into `out_buf` from `in_buf`, using `weight_buf` for
@@ -459,10 +511,9 @@ impl GpuEngine {
         let params = RmsNormBatchParams {
             n: n as u32, eps, n_tokens: n_tokens as u32, _pad: 0,
         };
-        let params_buf = self.gpu.create_params_buffer(&params);
         let pipeline = &self.gpu.pipelines.rmsnorm_batch;
-        let bind = self.gpu.make_bind_group(
-            pipeline, &[in_buf, weight_buf, out_buf, &params_buf],
+        let bind = self.bind_with_params(
+            pipeline, &[in_buf, weight_buf, out_buf], &params,
         );
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind, &[]);
@@ -531,12 +582,12 @@ impl GpuEngine {
             n_tokens: n_tokens as u32,
             _pad: 0,
         };
-        let params_buf = self.gpu.create_params_buffer(&params);
 
         let pipeline = &self.gpu.pipelines.matmul;
-        let bind = self.gpu.make_bind_group(
+        let bind = self.bind_with_params(
             pipeline,
-            &[float.weight_buffer(), in_buf, out_buf, &params_buf],
+            &[float.weight_buffer(), in_buf, out_buf],
+            &params,
         );
 
         let rows = float.out_features();
@@ -587,12 +638,12 @@ impl GpuEngine {
         #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
         struct QuantParams { cols: u32, n_tokens: u32 }
         let params = QuantParams { cols: cols as u32, n_tokens: n_tokens as u32 };
-        let params_buf = self.gpu.create_params_buffer(&params);
 
         let pipeline = &self.gpu.pipelines.quantize_absmax_batch;
-        let bind = self.gpu.make_bind_group(
+        let bind = self.bind_with_params(
             pipeline,
-            &[input_f32_buf, act_q_buf, act_scales_buf, &params_buf],
+            &[input_f32_buf, act_q_buf, act_scales_buf],
+            &params,
         );
 
         pass.set_pipeline(pipeline);
@@ -642,12 +693,12 @@ impl GpuEngine {
             n_tokens: n_tokens as u32,
             weight_scale_bits: layer.weight_scale().to_bits(),
         };
-        let params_buf = self.gpu.create_params_buffer(&params);
 
         let pipeline = &self.gpu.pipelines.ternary_matmul_batch;
-        let bind = self.gpu.make_bind_group(
+        let bind = self.bind_with_params(
             pipeline,
-            &[layer.weight_buffer(), act_q_buf, act_scales_buf, out_f32_buf, &params_buf],
+            &[layer.weight_buffer(), act_q_buf, act_scales_buf, out_f32_buf],
+            &params,
         );
 
         let rows = layer.out_features();
@@ -741,12 +792,12 @@ impl GpuEngine {
             n_tokens: seq_len as u32,
             _pad: 0,
         };
-        let params_buf = self.gpu.create_params_buffer(&params);
 
         let pipeline = &self.gpu.pipelines.rmsnorm_batch;
-        let bind_group = self.gpu.make_bind_group(
+        let bind_group = self.bind_with_params(
             pipeline,
-            &[&input_buf, &self.final_norm_weight_buf, &output_buf, &params_buf],
+            &[&input_buf, &self.final_norm_weight_buf, &output_buf],
+            &params,
         );
 
         let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -839,6 +890,8 @@ impl GpuEngine {
         capture_layers: &[usize],
         compute_logits: bool,
     ) -> (Vec<f32>, Vec<Vec<f32>>) {
+        self.params_arena.reset();
+
         let n_tokens = tokens.len();
         assert!(n_tokens > 0, "must have at least one token");
         let n_layers = self.cpu.n_layers();
@@ -994,6 +1047,8 @@ impl GpuEngine {
         tokens: &[u32],
         capture_layers: &[usize],
     ) -> HiddenCaptures {
+        self.params_arena.reset();
+
         let n_tokens = tokens.len();
         assert!(n_tokens > 0);
         let n_layers = self.cpu.n_layers();
@@ -1147,6 +1202,8 @@ impl GpuEngine {
         cache: &crate::layers::gpu_kv_cache::GpuKvCache,
         capture_layers: &[usize],
     ) -> Vec<Vec<f32>> {
+        self.params_arena.reset();
+
         let n_tokens = query_tokens.len();
         assert!(n_tokens > 0, "must have at least one query token");
 
@@ -1281,6 +1338,8 @@ impl GpuEngine {
         polar_cache: &crate::layers::gpu_polar_kv_cache::GpuPolarKvCache,
         capture_layers: &[usize],
     ) -> Vec<Vec<f32>> {
+        self.params_arena.reset();
+
         let n_tokens = query_tokens.len();
         assert!(n_tokens > 0, "must have at least one query token");
 
@@ -1485,6 +1544,8 @@ impl GpuEngine {
         tokens: &[u32],
         cache: &mut crate::layers::gpu_kv_cache::GpuKvCache,
     ) {
+        self.params_arena.reset();
+
         let n_tokens = tokens.len();
         assert!(n_tokens > 0, "must have at least one token");
 
@@ -1597,6 +1658,13 @@ impl GpuEngine {
         cache: &mut crate::layers::gpu_kv_cache::GpuKvCache,
         inject_deltas: &[Option<wgpu::Buffer>],
     ) -> Vec<f32> {
+        // Rewind the per-dispatch params arena. Safe because any prior
+        // forward's submit has completed by the time control returns to
+        // its caller (those entry points all poll for readback or hold
+        // until queue.submit returns), so no in-flight bind group still
+        // references a prior slab slot.
+        self.params_arena.reset();
+
         let n_tokens = tokens.len();
         assert!(n_tokens > 0, "must have at least one token");
 
@@ -1628,18 +1696,10 @@ impl GpuEngine {
         let t_embed = t_start.elapsed();
 
         let bytes = (hidden_init.len() * std::mem::size_of::<f32>()) as u64;
-        let hidden_buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("forward_with_cache.hidden"),
-            contents: bytemuck::cast_slice(&hidden_init),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
-        let normed_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("forward_with_cache.normed"),
-            size: bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let staging = self.gpu.create_staging_buffer(bytes);
+        let hidden_buf = self.scratch_pool.acquire(bytes);
+        self.gpu.queue.write_buffer(&hidden_buf, 0, bytemuck::cast_slice(&hidden_init));
+        let normed_buf = self.scratch_pool.acquire(bytes);
+        let staging = self.staging_pool.acquire(bytes);
         let t_io_alloc = t_start.elapsed() - t_embed;
 
         let intermediate = self.cpu.blocks()[0].ffn().as_any()
@@ -1726,6 +1786,8 @@ impl GpuEngine {
     /// + SiLU with no biases / sub-norms / non-1.0 residual scales, every
     /// matvec layer must be `GpuFloatLinear`. Asserts on violations.
     pub fn forward_full_gpu(&self, tokens: &[u32], start_pos: usize) -> Vec<f32> {
+        self.params_arena.reset();
+
         let n_tokens = tokens.len();
         assert!(n_tokens > 0, "must have at least one token");
 
@@ -1741,18 +1803,10 @@ impl GpuEngine {
 
         // ---- Allocate buffers ----
         let bytes = (hidden_init.len() * std::mem::size_of::<f32>()) as u64;
-        let hidden_buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("forward_full.hidden"),
-            contents: bytemuck::cast_slice(&hidden_init),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
-        let normed_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("forward_full.normed"),
-            size: bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let staging = self.gpu.create_staging_buffer(bytes);
+        let hidden_buf = self.scratch_pool.acquire(bytes);
+        self.gpu.queue.write_buffer(&hidden_buf, 0, bytemuck::cast_slice(&hidden_init));
+        let normed_buf = self.scratch_pool.acquire(bytes);
+        let staging = self.staging_pool.acquire(bytes);
 
         // Per-block sizing (consistent across blocks for non-MoE models).
         let attn0 = self.cpu.blocks()[0].attention();
@@ -1782,13 +1836,16 @@ impl GpuEngine {
         self.gpu.queue.submit(Some(encoder.finish()));
 
         // ---- Read back final-normed hidden state ----
+        // staging is a pooled buffer — actual size may be > `bytes`
+        // (rounded up to the size class). Slice / chunks must respect
+        // `bytes`, not the buffer's full extent.
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
         self.gpu.device.poll(wgpu::Maintain::Wait);
         rx.recv().expect("readback failed").expect("buffer map failed");
         let data = slice.get_mapped_range();
-        let normed: Vec<f32> = data.chunks_exact(4)
+        let normed: Vec<f32> = data[..bytes as usize].chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
         drop(data);
         staging.unmap();
@@ -2185,10 +2242,9 @@ impl GpuEngine {
             start_pos: start_pos as u32,
             n_tokens: n_tokens as u32,
         };
-        let sm_params_buf = self.gpu.create_params_buffer(&sm_params);
         let sm_pipeline = &self.gpu.pipelines.softmax_batch;
-        let sm_bind = self.gpu.make_bind_group(
-            sm_pipeline, &[&scratch.scores, &sm_params_buf],
+        let sm_bind = self.bind_with_params(
+            sm_pipeline, &[&scratch.scores], &sm_params,
         );
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -2349,12 +2405,12 @@ impl GpuEngine {
             n_tokens: n_tokens as u32,
             _p1: 0, _p2: 0, _p3: 0,
         };
-        let params_buf = self.gpu.create_params_buffer(&params);
 
         let pipeline = &self.gpu.pipelines.rope_batch;
-        let bind_group = self.gpu.make_bind_group(
+        let bind_group = self.bind_with_params(
             pipeline,
-            &[x_buf, cos_buf, sin_buf, &params_buf],
+            &[x_buf, cos_buf, sin_buf],
+            &params,
         );
 
         let total_threads = (n_tokens * n_heads * half_dim) as u32;
@@ -2451,11 +2507,11 @@ impl GpuEngine {
             n_tokens: n_tokens as u32,
             _p1: 0, _p2: 0, _p3: 0,
         };
-        let score_params_buf = self.gpu.create_params_buffer(&score_params);
         let score_pipeline = &self.gpu.pipelines.attn_score_batch;
-        let score_bind = self.gpu.make_bind_group(
+        let score_bind = self.bind_with_params(
             score_pipeline,
-            &[q_buf, k_buf, scores_buf, &score_params_buf],
+            &[q_buf, k_buf, scores_buf],
+            &score_params,
         );
         // 256-thread workgroups over (head*max_seq, tok); gid.x covers
         // (head, t), gid.y covers tok.
@@ -2485,11 +2541,11 @@ impl GpuEngine {
             start_pos: start_pos as u32,
             n_tokens: n_tokens as u32,
         };
-        let softmax_params_buf = self.gpu.create_params_buffer(&softmax_params);
         let softmax_pipeline = &self.gpu.pipelines.softmax_batch;
-        let softmax_bind = self.gpu.make_bind_group(
+        let softmax_bind = self.bind_with_params(
             softmax_pipeline,
-            &[scores_buf, &softmax_params_buf],
+            &[scores_buf],
+            &softmax_params,
         );
         // One workgroup per (tok, head) pair.
         let softmax_groups = (n_tokens * n_heads) as u32;
@@ -2514,11 +2570,11 @@ impl GpuEngine {
             kv_dim: kv_dim as u32,
             n_tokens: n_tokens as u32,
         };
-        let value_params_buf = self.gpu.create_params_buffer(&value_params);
         let value_pipeline = &self.gpu.pipelines.attn_value_batch;
-        let value_bind = self.gpu.make_bind_group(
+        let value_bind = self.bind_with_params(
             value_pipeline,
-            &[scores_buf, v_buf, out_buf, &value_params_buf],
+            &[scores_buf, v_buf, out_buf],
+            &value_params,
         );
         // One thread per (tok, head, d); workgroup_size=256.
         let total_value_threads = (n_tokens * n_heads * head_dim) as u32;
@@ -2587,15 +2643,15 @@ impl GpuEngine {
         activation: crate::layers::swiglu::GateActivation,
     ) {
         let params = SiluMulBatchParams { n: n as u32, n_tokens: n_tokens as u32 };
-        let params_buf = self.gpu.create_params_buffer(&params);
 
         let pipeline = match activation {
             crate::layers::swiglu::GateActivation::SiLU => &self.gpu.pipelines.silu_mul_batch,
             crate::layers::swiglu::GateActivation::ReLU2 => &self.gpu.pipelines.relu2_mul_batch,
         };
-        let bind = self.gpu.make_bind_group(
+        let bind = self.bind_with_params(
             pipeline,
-            &[gate_buf, up_buf, out_buf, &params_buf],
+            &[gate_buf, up_buf, out_buf],
+            &params,
         );
 
         let total = (n * n_tokens) as u32;
@@ -2649,12 +2705,12 @@ impl GpuEngine {
             n_tokens: n_tokens as u32,
             _pad: 0,
         };
-        let params_buf = self.gpu.create_params_buffer(&params);
 
         let pipeline = &self.gpu.pipelines.kv_write_batch;
-        let bind = self.gpu.make_bind_group(
+        let bind = self.bind_with_params(
             pipeline,
-            &[k_src, v_src, k_cache, v_cache, &params_buf],
+            &[k_src, v_src, k_cache, v_cache],
+            &params,
         );
 
         let total = (kv_dim * n_tokens) as u32;
@@ -2694,12 +2750,12 @@ impl GpuEngine {
         n_tokens: usize,
     ) {
         let params = AddInplaceBatchParams { n: n as u32, n_tokens: n_tokens as u32 };
-        let params_buf = self.gpu.create_params_buffer(&params);
 
         let pipeline = &self.gpu.pipelines.bias_add_batch;
-        let bind = self.gpu.make_bind_group(
+        let bind = self.bind_with_params(
             pipeline,
-            &[a_buf, bias_buf, &params_buf],
+            &[a_buf, bias_buf],
+            &params,
         );
 
         let total = (n * n_tokens) as u32;
@@ -2737,12 +2793,12 @@ impl GpuEngine {
         n_tokens: usize,
     ) {
         let params = AddInplaceBatchParams { n: n as u32, n_tokens: n_tokens as u32 };
-        let params_buf = self.gpu.create_params_buffer(&params);
 
         let pipeline = &self.gpu.pipelines.add_inplace_batch;
-        let bind = self.gpu.make_bind_group(
+        let bind = self.bind_with_params(
             pipeline,
-            &[a_buf, b_buf, &params_buf],
+            &[a_buf, b_buf],
+            &params,
         );
 
         let total = (n * n_tokens) as u32;
@@ -2783,12 +2839,12 @@ impl GpuEngine {
         n_tokens: usize,
     ) {
         let params = AddInplaceBatchParams { n: n as u32, n_tokens: n_tokens as u32 };
-        let params_buf = self.gpu.create_params_buffer(&params);
 
         let pipeline = &self.gpu.pipelines.add_broadcast_batch;
-        let bind = self.gpu.make_bind_group(
+        let bind = self.bind_with_params(
             pipeline,
-            &[a_buf, delta_buf, &params_buf],
+            &[a_buf, delta_buf],
+            &params,
         );
 
         let total = (n * n_tokens) as u32;

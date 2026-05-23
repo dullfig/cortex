@@ -31,6 +31,13 @@ pub mod arena;
 /// returns to the pool's freelist on drop, never to the wgpu driver.
 #[cfg(feature = "gpu")]
 pub mod pool;
+/// ParamsArena — frame-allocator for the per-dispatch uniform buffers
+/// that hold shader scalar args (rows, cols, n_tokens, ...). 600+ of
+/// these are created per forward; previously each was its own
+/// vkAllocate/vkFree pair, adding ~15-18 seconds of cliff on NVIDIA.
+/// One slab + bump cursor + reset-per-forward eliminates the churn.
+#[cfg(feature = "gpu")]
+pub mod params_arena;
 
 use crate::tensor::TernaryTensor;
 

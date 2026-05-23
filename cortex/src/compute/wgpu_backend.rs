@@ -286,6 +286,19 @@ impl Pipelines {
 }
 
 // ---------------------------------------------------------------------------
+// BindEntry — entry kind for `make_bind_group_with_bindings`
+// ---------------------------------------------------------------------------
+
+/// Either a whole-buffer binding or a sub-buffer (offset+size) binding.
+/// Used by `make_bind_group_with_bindings` to mix slab-resident params
+/// (`ParamsArena`) with whole-buffer weight/scratch resources in one
+/// bind group.
+pub enum BindEntry<'a> {
+    Whole(&'a wgpu::Buffer),
+    Sub(wgpu::BufferBinding<'a>),
+}
+
+// ---------------------------------------------------------------------------
 // GpuDevice — shared device + queue + pipelines
 // ---------------------------------------------------------------------------
 
@@ -344,6 +357,8 @@ impl GpuDevice {
         Some(Self { device, queue, pipelines })
     }
 
+    // (BindEntry is defined at module scope below.)
+
     /// Create a bind group from a pipeline and a list of buffers.
     ///
     /// Buffers are bound to `@binding(0)`, `@binding(1)`, etc.
@@ -365,6 +380,36 @@ impl GpuDevice {
             label: None,
             layout: &layout,
             entries: &entries,
+        })
+    }
+
+    /// Variant of `make_bind_group` that lets each entry be either a
+    /// whole-buffer binding (the common case for resident weights,
+    /// scratch, hidden, etc.) or a sub-buffer binding at an explicit
+    /// offset+size (used by `ParamsArena` to bind a slot inside the
+    /// shared params slab). Callers pass `BindEntry::Whole(&buf)` or
+    /// `BindEntry::Sub(BufferBinding {...})`.
+    pub fn make_bind_group_with_bindings(
+        &self,
+        pipeline: &wgpu::ComputePipeline,
+        entries: &[BindEntry<'_>],
+    ) -> wgpu::BindGroup {
+        let layout = pipeline.get_bind_group_layout(0);
+        let bind_entries: Vec<wgpu::BindGroupEntry> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: match e {
+                    BindEntry::Whole(buf) => buf.as_entire_binding(),
+                    BindEntry::Sub(b) => wgpu::BindingResource::Buffer(b.clone()),
+                },
+            })
+            .collect();
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &layout,
+            entries: &bind_entries,
         })
     }
 
