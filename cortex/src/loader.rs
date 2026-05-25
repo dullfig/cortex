@@ -296,6 +296,16 @@ pub fn load_model(path: &str) -> Result<LoadedModel, GgufError> {
         );
         blocks.push(block);
 
+        // wgpu 29 mitigation: queue.write_buffer enqueues to a staging
+        // belt that doesn't recycle until the device is polled. After
+        // ~200 weight uploads (5+ per block × 36 blocks for Qwen 3B),
+        // unrecycled staging accumulates enough to trip OOM on the next
+        // create_buffer. Poll between block loads to force recycling.
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = ctx.gpu.as_ref() {
+            let _ = gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        }
+
         info!(layer = i, "loaded transformer block {}/{}", i + 1, config.n_layers);
     }
 
