@@ -301,6 +301,25 @@ pub struct GpuEngine {
     /// `start_pos + n_tokens > rope_max_seq` would index out of range, so
     /// they assert.
     rope_max_seq: usize,
+    /// GPU-side timestamp infrastructure for per-block timing. `None` if
+    /// the adapter doesn't support TIMESTAMP_QUERY +
+    /// TIMESTAMP_QUERY_INSIDE_ENCODERS. When `Some`, the forward path
+    /// places encoder-level write_timestamp markers between blocks and
+    /// resolves them at end-of-forward to a per-block waterfall log.
+    timer: Option<TimestampTimer>,
+}
+
+/// GPU-side timestamp tracing. One QuerySet sized for the longest
+/// expected forward (37 markers = 36 blocks + final_norm boundary +
+/// some slack). Resolved into `resolve_buf` then copied to
+/// `readback_buf` for CPU mapping. The buffers are kept resident so we
+/// don't re-allocate per forward.
+pub struct TimestampTimer {
+    pub query_set: wgpu::QuerySet,
+    pub resolve_buf: wgpu::Buffer,
+    pub readback_buf: wgpu::Buffer,
+    pub capacity: u32,
+    pub period_ns: f32,
 }
 
 impl GpuEngine {
@@ -381,6 +400,42 @@ impl GpuEngine {
         let (rope_cos_buf, rope_sin_buf) =
             Self::build_rope_tables(&gpu, attn0.rope().inv_freq(), max_seq);
 
+        // Timestamp infrastructure — only allocated if the device
+        // supports the required features. Capacity 64 covers
+        // 36 blocks + final_norm + slack.
+        let timer = if gpu.device.features().contains(wgpu::Features::TIMESTAMP_QUERY)
+            && gpu.device.features().contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
+        {
+            let capacity: u32 = 64;
+            let bytes = (capacity as u64) * 8; // u64 per timestamp
+            let query_set = gpu.device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("gpu_engine.timer.query_set"),
+                ty: wgpu::QueryType::Timestamp,
+                count: capacity,
+            });
+            let resolve_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("gpu_engine.timer.resolve"),
+                size: bytes,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let readback_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("gpu_engine.timer.readback"),
+                size: bytes,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            Some(TimestampTimer {
+                query_set,
+                resolve_buf,
+                readback_buf,
+                capacity,
+                period_ns: gpu.queue.get_timestamp_period(),
+            })
+        } else {
+            None
+        };
+
         Self {
             cpu,
             gpu,
@@ -391,6 +446,7 @@ impl GpuEngine {
             rope_cos_buf,
             rope_sin_buf,
             rope_max_seq: max_seq,
+            timer,
         }
     }
 
@@ -491,7 +547,11 @@ impl GpuEngine {
         // TILE_N=16 tokens to amortize its workgroup-scoped loads;
         // for decode (n_tokens=1) the per-output legacy shader wins.
         // Threshold of 16 = TILE_N is the natural cutoff.
-        if n_tokens >= 16 {
+        // Overridable for A/B testing via CORTEX_MATMUL_SHARED_THRESHOLD
+        // (set to usize::MAX-equivalent like 999999 to force legacy).
+        let threshold: usize = std::env::var("CORTEX_MATMUL_SHARED_THRESHOLD")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+        if n_tokens >= threshold {
             self.dispatch_matmul_shared_inner_in_pass(pass, float, in_buf, out_buf, n_tokens);
         } else {
             self.dispatch_matmul_legacy_inner_in_pass(pass, float, in_buf, out_buf, n_tokens);
@@ -1695,7 +1755,15 @@ impl GpuEngine {
                 "inject_deltas must be empty or have length n_layers ({})", n_layers,
             );
         }
+        // Timestamp markers: one per block boundary + one final.
+        // n_markers = n_layers + 2 (start, after each block, after final_norm).
+        let n_markers: u32 = (n_layers as u32) + 2;
+        let timer_active = self.timer.as_ref().map(|t| n_markers <= t.capacity).unwrap_or(false);
+
         let t_pre_record = t_start.elapsed();
+        if let (true, Some(t)) = (timer_active, self.timer.as_ref()) {
+            encoder.write_timestamp(&t.query_set, 0);
+        }
         for i in 0..n_layers {
             let target = (cache.k_layer(i), cache.v_layer(i));
             let inject = inject_deltas.get(i).and_then(|opt| opt.as_ref());
@@ -1703,12 +1771,26 @@ impl GpuEngine {
                 &mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch,
                 None, Some(target), None, inject,
             );
+            if let (true, Some(t)) = (timer_active, self.timer.as_ref()) {
+                encoder.write_timestamp(&t.query_set, (i as u32) + 1);
+            }
         }
         self.dispatch_rmsnorm_into(
             &mut encoder, &hidden_buf, &self.final_norm_weight_buf, &normed_buf,
             self.embed_dim, n_tokens, self.final_norm_eps,
         );
+        if let (true, Some(t)) = (timer_active, self.timer.as_ref()) {
+            encoder.write_timestamp(&t.query_set, (n_layers as u32) + 1);
+        }
         encoder.copy_buffer_to_buffer(&normed_buf, 0, &staging, 0, bytes);
+        // Resolve all queries into the resolve buffer, then copy to the
+        // mappable readback buffer — both in the same encoder so it's
+        // one submit.
+        if let (true, Some(t)) = (timer_active, self.timer.as_ref()) {
+            encoder.resolve_query_set(&t.query_set, 0..n_markers, &t.resolve_buf, 0);
+            let resolve_bytes = (n_markers as u64) * 8;
+            encoder.copy_buffer_to_buffer(&t.resolve_buf, 0, &t.readback_buf, 0, resolve_bytes);
+        }
         let t_record = t_start.elapsed() - t_pre_record;
 
         let t_pre_submit = t_start.elapsed();
@@ -1718,6 +1800,47 @@ impl GpuEngine {
         let t_pre_readback = t_start.elapsed();
         let normed = read_back_buffer(&self.gpu, &staging, bytes as usize);
         let t_readback = t_start.elapsed() - t_pre_readback;
+
+        // Read back timestamp markers (if active) and log the per-block
+        // GPU waterfall.
+        if let (true, Some(t)) = (timer_active, self.timer.as_ref()) {
+            let resolve_bytes = (n_markers as usize) * 8;
+            let slice = t.readback_buf.slice(0..(resolve_bytes as u64));
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+            self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+            rx.recv().expect("timer readback failed").expect("timer map failed");
+            let data = slice.get_mapped_range();
+            let ticks: Vec<u64> = data[..resolve_bytes].chunks_exact(8)
+                .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+                .collect();
+            drop(data);
+            t.readback_buf.unmap();
+
+            // Convert per-block deltas to microseconds.
+            let mut per_block_us: Vec<u64> = Vec::with_capacity(n_layers);
+            for i in 0..n_layers {
+                let dt_ticks = ticks[i + 1].saturating_sub(ticks[i]);
+                let dt_ns = (dt_ticks as f32) * t.period_ns;
+                per_block_us.push((dt_ns / 1000.0) as u64);
+            }
+            let final_norm_us = {
+                let dt_ticks = ticks[n_layers + 1].saturating_sub(ticks[n_layers]);
+                let dt_ns = (dt_ticks as f32) * t.period_ns;
+                (dt_ns / 1000.0) as u64
+            };
+            let total_blocks_us: u64 = per_block_us.iter().sum();
+            let min_us = per_block_us.iter().min().copied().unwrap_or(0);
+            let max_us = per_block_us.iter().max().copied().unwrap_or(0);
+            let avg_us = if n_layers > 0 { total_blocks_us / (n_layers as u64) } else { 0 };
+
+            tracing::info!(
+                n_tokens, start_pos,
+                total_blocks_us, avg_us, min_us, max_us, final_norm_us,
+                "fwd_cache GPU waterfall (per-block timestamps)",
+            );
+            tracing::debug!(?per_block_us, "per-block GPU times");
+        }
 
         // Successful forward — bump the cache's write cursor. The caller
         // either runs `cpu().finalize_logits(&normed, n_tokens)` for plain

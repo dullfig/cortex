@@ -334,13 +334,26 @@ impl GpuDevice {
         // The 4080 reports 4 GB+; requesting adapter limits keeps resident
         // weights practical for vocab-sized tensors.
         let adapter_limits = adapter.limits();
+        // TIMESTAMP_QUERY + TIMESTAMP_QUERY_INSIDE_ENCODERS let us
+        // place encoder-level write_timestamp markers anywhere in the
+        // command stream. Both are widely supported on Vulkan; if the
+        // adapter doesn't expose them, we drop down to no timestamp
+        // tracing (the timestamp_us telemetry just stays zero).
+        let adapter_features = adapter.features();
+        let timestamp_supported = adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY)
+            && adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
+        let mut required_features = wgpu::Features::empty();
+        if timestamp_supported {
+            required_features |= wgpu::Features::TIMESTAMP_QUERY
+                | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        }
         // wgpu 29: request_device takes 1 arg (desc only — trace param moved
         // INTO DeviceDescriptor as the `trace` field). DeviceDescriptor also
         // gained `experimental_features`.
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("cortex"),
-                required_features: wgpu::Features::empty(),
+                required_features,
                 required_limits: adapter_limits,
                 memory_hints: wgpu::MemoryHints::Performance,
                 experimental_features: wgpu::ExperimentalFeatures::default(),
@@ -348,6 +361,14 @@ impl GpuDevice {
             },
         ))
         .ok()?;
+        if timestamp_supported {
+            tracing::info!(
+                period_ns = queue.get_timestamp_period(),
+                "GPU timestamp queries enabled",
+            );
+        } else {
+            tracing::info!("GPU timestamp queries NOT supported by adapter");
+        }
 
         let pipelines = Pipelines::compile(&device);
         tracing::info!("compiled 31 GPU compute pipelines");
