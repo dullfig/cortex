@@ -200,6 +200,10 @@ pub struct Pipelines {
     pub attn_value_polar_batch: wgpu::ComputePipeline,
     // Batch (prefill)
     pub matmul: wgpu::ComputePipeline,
+    /// Shared-memory tiled matmul (16×16 output tile, TILE_K=16). Used
+    /// for prefill (n_tokens >= 16); decode falls back to legacy matmul.
+    /// See `shaders/matmul_shared.wgsl`.
+    pub matmul_shared: wgpu::ComputePipeline,
     pub rmsnorm_batch: wgpu::ComputePipeline,
     pub rope_batch: wgpu::ComputePipeline,
     pub silu_mul_batch: wgpu::ComputePipeline,
@@ -266,6 +270,7 @@ impl Pipelines {
             attn_value_polar_batch: make(include_str!("shaders/attn_value_polar_batch.wgsl"), "attn_value_polar_batch"),
             // Batch
             matmul: make(include_str!("shaders/matmul.wgsl"), "matmul"),
+            matmul_shared: make(include_str!("shaders/matmul_shared.wgsl"), "matmul_shared"),
             rmsnorm_batch: make(include_str!("shaders/rmsnorm_batch.wgsl"), "rmsnorm_batch"),
             rope_batch: make(include_str!("shaders/rope_batch.wgsl"), "rope_batch"),
             silu_mul_batch: make(include_str!("shaders/silu_mul_batch.wgsl"), "silu_mul_batch"),

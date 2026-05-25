@@ -487,7 +487,55 @@ impl GpuEngine {
                 )
             });
 
-        self.dispatch_matmul_legacy_inner_in_pass(pass, float, in_buf, out_buf, n_tokens);
+        // Route by n_tokens. The shared-memory tiled shader needs
+        // TILE_N=16 tokens to amortize its workgroup-scoped loads;
+        // for decode (n_tokens=1) the per-output legacy shader wins.
+        // Threshold of 16 = TILE_N is the natural cutoff.
+        if n_tokens >= 16 {
+            self.dispatch_matmul_shared_inner_in_pass(pass, float, in_buf, out_buf, n_tokens);
+        } else {
+            self.dispatch_matmul_legacy_inner_in_pass(pass, float, in_buf, out_buf, n_tokens);
+        }
+    }
+
+    /// Shared-memory tiled matmul. See `shaders/matmul_shared.wgsl` for
+    /// the kernel design. Same Params struct as the legacy variant.
+    fn dispatch_matmul_shared_inner_in_pass(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        float: &crate::layers::gpu_floatlinear::GpuFloatLinear,
+        in_buf: &wgpu::Buffer,
+        out_buf: &wgpu::Buffer,
+        n_tokens: usize,
+    ) {
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct MatmulParams { rows: u32, cols: u32, n_tokens: u32, _pad: u32 }
+        let params = MatmulParams {
+            rows: float.out_features() as u32,
+            cols: float.in_features() as u32,
+            n_tokens: n_tokens as u32,
+            _pad: 0,
+        };
+        let params_buf = self.gpu.create_params_buffer(&params);
+
+        let pipeline = &self.gpu.pipelines.matmul_shared;
+        let bind = self.gpu.make_bind_group(
+            pipeline,
+            &[float.weight_buffer(), in_buf, out_buf, &params_buf],
+        );
+
+        // workgroup_id.x = row tile (one per TILE_M=16 output rows)
+        // workgroup_id.y = token tile (one per TILE_N=16 tokens)
+        let rows = float.out_features();
+        const TILE_M: usize = 16;
+        const TILE_N: usize = 16;
+        let dx = ((rows + TILE_M - 1) / TILE_M) as u32;
+        let dy = ((n_tokens + TILE_N - 1) / TILE_N) as u32;
+
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(dx, dy, 1);
     }
 
     fn dispatch_matmul_legacy_inner_in_pass(
@@ -4557,6 +4605,214 @@ mod tests {
                 (c - g).abs()
             );
         }
+    }
+
+    #[test]
+    fn matmul_shared_matches_legacy() {
+        // Numerical parity: shared-memory tiled matmul vs legacy matmul,
+        // n_tokens=16 (above threshold) on a non-trivial shape.
+        // Uses a single GpuFloatLinear's weight buffer, dispatches both
+        // shaders against the same inputs, compares outputs.
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let rows = 32usize;   // output features (must be small to keep test fast)
+        let cols = 64usize;   // input features (even for f16 packing)
+        let n_tokens = 16usize;
+
+        // Random weights + inputs.
+        let mut rng: u64 = 0xCAFE_F00D;
+        let mut roll = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng >> 33) as i32 % 1000 - 500) as f32 * 0.001
+        };
+        let weights_data: Vec<f32> = (0..rows * cols).map(|_| roll()).collect();
+        let input_data: Vec<f32> = (0..n_tokens * cols).map(|_| roll()).collect();
+
+        let weight_tensor = crate::tensor::FloatTensor::new(weights_data, vec![rows, cols]);
+        let layer = crate::layers::gpu_floatlinear::GpuFloatLinear::from_float_tensor(
+            gpu.clone(), weight_tensor,
+        );
+
+        // Upload input.
+        let in_bytes = (n_tokens * cols * 4) as u64;
+        let in_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("test.matmul.in"),
+            contents: bytemuck::cast_slice(&input_data),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let out_bytes = (n_tokens * rows * 4) as u64;
+        let mk_out = || gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test.matmul.out"),
+            size: out_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let out_legacy = mk_out();
+        let out_shared = mk_out();
+        let staging_legacy = gpu.create_staging_buffer(out_bytes);
+        let staging_shared = gpu.create_staging_buffer(out_bytes);
+
+        // We need a GpuEngine to dispatch through. Build a minimal one
+        // by wrapping a toy CPU model — we only use its dispatch helpers.
+        let cpu_model = toy_float_model_cpu_reference();
+        let engine = GpuEngine::with_max_seq(cpu_model, gpu.clone(), 16);
+
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test.matmul.enc"),
+        });
+
+        // Legacy: explicitly call the legacy dispatcher.
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("test.matmul.legacy.pass"),
+                timestamp_writes: None,
+            });
+            engine.dispatch_matmul_legacy_inner_in_pass(&mut pass, &layer, &in_buf, &out_legacy, n_tokens);
+        }
+        encoder.copy_buffer_to_buffer(&out_legacy, 0, &staging_legacy, 0, out_bytes);
+
+        // Shared: explicitly call the shared-memory tiled dispatcher.
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("test.matmul.shared.pass"),
+                timestamp_writes: None,
+            });
+            engine.dispatch_matmul_shared_inner_in_pass(&mut pass, &layer, &in_buf, &out_shared, n_tokens);
+        }
+        encoder.copy_buffer_to_buffer(&out_shared, 0, &staging_shared, 0, out_bytes);
+
+        gpu.queue.submit(Some(encoder.finish()));
+
+        let read = |staging: &wgpu::Buffer| -> Vec<f32> {
+            let slice = staging.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+            gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+            rx.recv().unwrap().unwrap();
+            let data = slice.get_mapped_range();
+            let out: Vec<f32> = data.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            drop(data); staging.unmap();
+            out
+        };
+        let v_legacy = read(&staging_legacy);
+        let v_shared = read(&staging_shared);
+
+        assert_eq!(v_legacy.len(), v_shared.len());
+        let mut max_diff = 0.0_f32;
+        for (i, (a, b)) in v_legacy.iter().zip(&v_shared).enumerate() {
+            let d = (a - b).abs();
+            if d > max_diff { max_diff = d; }
+            assert!(
+                d < 1e-3,
+                "elem {i}: legacy={a} shared={b} diff={d}",
+            );
+        }
+        eprintln!("matmul_shared_matches_legacy: rows={rows} cols={cols} n_tokens={n_tokens} max_diff={max_diff:.6e}");
+    }
+
+    #[test]
+    #[ignore = "benchmark; run with --ignored to compare matmul shaders at Qwen prefill size"]
+    fn matmul_shared_vs_legacy_bench_qwen_prefill() {
+        // Microbenchmark: dispatch the same matmul through both legacy
+        // and shared-memory shaders, time wall-clock. Shape chosen to
+        // match Qwen 3B Q_proj at 500w prompt: rows=2048, cols=2048,
+        // n_tokens=526. Each iteration submits + polls so total wall
+        // includes the actual GPU work for that single dispatch.
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let rows = 2048usize;
+        let cols = 2048usize;
+        let n_tokens = 526usize;
+        let iters = 5usize;
+
+        let mut rng: u64 = 0xBEEF_FACE;
+        let mut roll = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng >> 33) as i32 % 1000 - 500) as f32 * 0.001
+        };
+        let weights_data: Vec<f32> = (0..rows * cols).map(|_| roll()).collect();
+        let input_data: Vec<f32> = (0..n_tokens * cols).map(|_| roll()).collect();
+
+        let weight_tensor = crate::tensor::FloatTensor::new(weights_data, vec![rows, cols]);
+        let layer = crate::layers::gpu_floatlinear::GpuFloatLinear::from_float_tensor(
+            gpu.clone(), weight_tensor,
+        );
+
+        let in_bytes = (n_tokens * cols * 4) as u64;
+        let in_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("bench.in"),
+            contents: bytemuck::cast_slice(&input_data),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let out_bytes = (n_tokens * rows * 4) as u64;
+        let out_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bench.out"),
+            size: out_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let cpu_model = toy_float_model_cpu_reference();
+        let engine = GpuEngine::with_max_seq(cpu_model, gpu.clone(), 16);
+
+        let run = |use_shared: bool| -> std::time::Duration {
+            // Warmup
+            for _ in 0..2 {
+                let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("bench.warmup.enc"),
+                });
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("bench.warmup.pass"),
+                        timestamp_writes: None,
+                    });
+                    if use_shared {
+                        engine.dispatch_matmul_shared_inner_in_pass(&mut pass, &layer, &in_buf, &out_buf, n_tokens);
+                    } else {
+                        engine.dispatch_matmul_legacy_inner_in_pass(&mut pass, &layer, &in_buf, &out_buf, n_tokens);
+                    }
+                }
+                gpu.queue.submit(Some(encoder.finish()));
+                gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+            }
+
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("bench.enc"),
+                });
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("bench.pass"),
+                        timestamp_writes: None,
+                    });
+                    if use_shared {
+                        engine.dispatch_matmul_shared_inner_in_pass(&mut pass, &layer, &in_buf, &out_buf, n_tokens);
+                    } else {
+                        engine.dispatch_matmul_legacy_inner_in_pass(&mut pass, &layer, &in_buf, &out_buf, n_tokens);
+                    }
+                }
+                gpu.queue.submit(Some(encoder.finish()));
+                gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+            }
+            t0.elapsed()
+        };
+
+        let legacy_time = run(false);
+        let shared_time = run(true);
+        let per_legacy = legacy_time / iters as u32;
+        let per_shared = shared_time / iters as u32;
+        let speedup = legacy_time.as_secs_f64() / shared_time.as_secs_f64();
+
+        eprintln!(
+            "matmul bench (rows={rows}, cols={cols}, n_tokens={n_tokens}, iters={iters}):\n  \
+             legacy: {legacy_time:?} ({per_legacy:?}/iter)\n  \
+             shared: {shared_time:?} ({per_shared:?}/iter)\n  \
+             speedup: {speedup:.2}x"
+        );
     }
 
     /// Build a matched (CPU, GPU) toy block pair backed by ternary
