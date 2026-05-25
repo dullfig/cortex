@@ -204,6 +204,11 @@ pub struct Pipelines {
     /// for prefill (n_tokens >= 16); decode falls back to legacy matmul.
     /// See `shaders/matmul_shared.wgsl`.
     pub matmul_shared: wgpu::ComputePipeline,
+    /// Fused gate + up SwiGLU projection. One dispatch reads input once,
+    /// computes both gate and up outputs (2 rows × 2 projections per
+    /// thread). Halves the input HBM bandwidth for the gate/up pair.
+    /// See `shaders/matmul_gate_up_shared.wgsl`.
+    pub matmul_gate_up_shared: wgpu::ComputePipeline,
     pub rmsnorm_batch: wgpu::ComputePipeline,
     pub rope_batch: wgpu::ComputePipeline,
     pub silu_mul_batch: wgpu::ComputePipeline,
@@ -271,6 +276,7 @@ impl Pipelines {
             // Batch
             matmul: make(include_str!("shaders/matmul.wgsl"), "matmul"),
             matmul_shared: make(include_str!("shaders/matmul_shared.wgsl"), "matmul_shared"),
+            matmul_gate_up_shared: make(include_str!("shaders/matmul_gate_up_shared.wgsl"), "matmul_gate_up_shared"),
             rmsnorm_batch: make(include_str!("shaders/rmsnorm_batch.wgsl"), "rmsnorm_batch"),
             rope_batch: make(include_str!("shaders/rope_batch.wgsl"), "rope_batch"),
             silu_mul_batch: make(include_str!("shaders/silu_mul_batch.wgsl"), "silu_mul_batch"),

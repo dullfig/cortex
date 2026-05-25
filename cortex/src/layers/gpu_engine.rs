@@ -661,6 +661,78 @@ impl GpuEngine {
         pass.dispatch_workgroups(dx, dy, 1);
     }
 
+    /// Fused gate+up dispatch. Both projections must share the same
+    /// (rows, cols) shape (true for all SwiGLU FFNs we support). One
+    /// dispatch, one input load per K-step from shared memory,
+    /// computes both gate and up outputs.
+    ///
+    /// Returns false if shapes mismatch or if either layer isn't
+    /// `GpuFloatLinear`; caller falls back to two sequential
+    /// matmul_shared dispatches.
+    fn dispatch_gate_up_fused_in_pass(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        gate_layer: &dyn LinearLayer,
+        up_layer: &dyn LinearLayer,
+        in_buf: &wgpu::Buffer,
+        gate_out: &wgpu::Buffer,
+        up_out: &wgpu::Buffer,
+        n_tokens: usize,
+    ) -> bool {
+        let gate_float = match gate_layer.as_any()
+            .downcast_ref::<crate::layers::gpu_floatlinear::GpuFloatLinear>()
+        {
+            Some(l) => l,
+            None => return false,
+        };
+        let up_float = match up_layer.as_any()
+            .downcast_ref::<crate::layers::gpu_floatlinear::GpuFloatLinear>()
+        {
+            Some(l) => l,
+            None => return false,
+        };
+        if gate_float.out_features() != up_float.out_features()
+            || gate_float.in_features() != up_float.in_features()
+        {
+            return false;
+        }
+
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct Params { rows: u32, cols: u32, n_tokens: u32, _pad: u32 }
+        let params = Params {
+            rows: gate_float.out_features() as u32,
+            cols: gate_float.in_features() as u32,
+            n_tokens: n_tokens as u32,
+            _pad: 0,
+        };
+        let params_buf = self.gpu.create_params_buffer(&params);
+
+        let pipeline = &self.gpu.pipelines.matmul_gate_up_shared;
+        let bind = self.gpu.make_bind_group(
+            pipeline,
+            &[
+                gate_float.weight_buffer(),
+                up_float.weight_buffer(),
+                in_buf,
+                gate_out,
+                up_out,
+                &params_buf,
+            ],
+        );
+
+        let rows = gate_float.out_features();
+        const TILE_M: usize = 32;
+        const TILE_N: usize = 16;
+        let dx = ((rows + TILE_M - 1) / TILE_M) as u32;
+        let dy = ((n_tokens + TILE_N - 1) / TILE_N) as u32;
+
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(dx, dy, 1);
+        true
+    }
+
     fn dispatch_matmul_legacy_inner_in_pass(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
@@ -2267,9 +2339,20 @@ impl GpuEngine {
                 embed_dim, n_tokens, block_gpu.ffn_norm_eps,
             );
 
-            // 10-11. Gate / Up projections
-            self.dispatch_linear_batch_in_pass(&mut pass, swiglu.gate_proj(), &scratch.normed, &scratch.gate, n_tokens, &scratch.ternary);
-            self.dispatch_linear_batch_in_pass(&mut pass, swiglu.up_proj(),   &scratch.normed, &scratch.up,   n_tokens, &scratch.ternary);
+            // 10-11. Gate / Up projections.
+            // Try the fused gate+up dispatch first (one input load,
+            // both outputs). Falls back to two separate dispatches if
+            // the layers aren't both GpuFloatLinear or shapes mismatch.
+            // Both paths route through dispatch_linear_batch_in_pass /
+            // matmul_shared for bitnet / non-fused cases.
+            let fused_ok = n_tokens >= 16 && self.dispatch_gate_up_fused_in_pass(
+                &mut pass, swiglu.gate_proj(), swiglu.up_proj(),
+                &scratch.normed, &scratch.gate, &scratch.up, n_tokens,
+            );
+            if !fused_ok {
+                self.dispatch_linear_batch_in_pass(&mut pass, swiglu.gate_proj(), &scratch.normed, &scratch.gate, n_tokens, &scratch.ternary);
+                self.dispatch_linear_batch_in_pass(&mut pass, swiglu.up_proj(),   &scratch.normed, &scratch.up,   n_tokens, &scratch.ternary);
+            }
 
             // 12. silu(gate) * up
             self.dispatch_gate_mul_in_pass(&mut pass, &scratch.gate, &scratch.up, &scratch.activated, intermediate, n_tokens, swiglu.activation());
@@ -5037,6 +5120,136 @@ mod tests {
              shared: {shared_time:?} ({per_shared:?}/iter)\n  \
              speedup: {speedup:.2}x"
         );
+    }
+
+    #[test]
+    fn matmul_gate_up_fused_matches_two_dispatches() {
+        // Numerical parity: the fused gate+up shader should produce
+        // outputs byte-equivalent (within fp rounding) to running two
+        // separate matmul_shared dispatches against the same inputs.
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let rows = 64usize;     // FFN intermediate-shaped, kept small for speed
+        let cols = 32usize;     // embed-shaped
+        let n_tokens = 16usize;
+
+        let mut rng: u64 = 0xCAFE_BEEF;
+        let mut roll = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng >> 33) as i32 % 1000 - 500) as f32 * 0.001
+        };
+        let gate_w: Vec<f32> = (0..rows * cols).map(|_| roll()).collect();
+        let up_w:   Vec<f32> = (0..rows * cols).map(|_| roll()).collect();
+        let input:  Vec<f32> = (0..n_tokens * cols).map(|_| roll()).collect();
+
+        let gate_layer = crate::layers::gpu_floatlinear::GpuFloatLinear::from_float_tensor(
+            gpu.clone(),
+            crate::tensor::FloatTensor::new(gate_w, vec![rows, cols]),
+        );
+        let up_layer = crate::layers::gpu_floatlinear::GpuFloatLinear::from_float_tensor(
+            gpu.clone(),
+            crate::tensor::FloatTensor::new(up_w, vec![rows, cols]),
+        );
+
+        let in_bytes = (n_tokens * cols * 4) as u64;
+        let in_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("test.fused.in"),
+            contents: bytemuck::cast_slice(&input),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let out_bytes = (n_tokens * rows * 4) as u64;
+        let mk_out = |label: &'static str| gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: out_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let gate_ref = mk_out("test.fused.gate_ref");
+        let up_ref   = mk_out("test.fused.up_ref");
+        let gate_fused = mk_out("test.fused.gate_fused");
+        let up_fused   = mk_out("test.fused.up_fused");
+        let staging = |label: &'static str| gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: out_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let stg_gr = staging("test.fused.stg_gr");
+        let stg_ur = staging("test.fused.stg_ur");
+        let stg_gf = staging("test.fused.stg_gf");
+        let stg_uf = staging("test.fused.stg_uf");
+
+        let cpu_model = toy_float_model_cpu_reference();
+        let engine = GpuEngine::with_max_seq(cpu_model, gpu.clone(), 16);
+
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test.fused.enc"),
+        });
+
+        // Reference: two separate shared dispatches.
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("test.fused.ref_gate"),
+                timestamp_writes: None,
+            });
+            engine.dispatch_matmul_shared_inner_in_pass(&mut pass, &gate_layer, &in_buf, &gate_ref, n_tokens);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("test.fused.ref_up"),
+                timestamp_writes: None,
+            });
+            engine.dispatch_matmul_shared_inner_in_pass(&mut pass, &up_layer, &in_buf, &up_ref, n_tokens);
+        }
+        encoder.copy_buffer_to_buffer(&gate_ref, 0, &stg_gr, 0, out_bytes);
+        encoder.copy_buffer_to_buffer(&up_ref, 0, &stg_ur, 0, out_bytes);
+
+        // Fused.
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("test.fused.fused"),
+                timestamp_writes: None,
+            });
+            let ok = engine.dispatch_gate_up_fused_in_pass(
+                &mut pass, &gate_layer, &up_layer, &in_buf, &gate_fused, &up_fused, n_tokens,
+            );
+            assert!(ok, "fused dispatch should succeed on matching GpuFloatLinear pair");
+        }
+        encoder.copy_buffer_to_buffer(&gate_fused, 0, &stg_gf, 0, out_bytes);
+        encoder.copy_buffer_to_buffer(&up_fused, 0, &stg_uf, 0, out_bytes);
+
+        gpu.queue.submit(Some(encoder.finish()));
+
+        let read = |stg: &wgpu::Buffer| -> Vec<f32> {
+            let slice = stg.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+            gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+            rx.recv().unwrap().unwrap();
+            let data = slice.get_mapped_range();
+            let out: Vec<f32> = data.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            drop(data); stg.unmap();
+            out
+        };
+        let g_ref = read(&stg_gr);
+        let u_ref = read(&stg_ur);
+        let g_fused = read(&stg_gf);
+        let u_fused = read(&stg_uf);
+
+        let check = |label: &str, a: &[f32], b: &[f32]| {
+            assert_eq!(a.len(), b.len(), "{label} length mismatch");
+            let mut max_diff = 0.0_f32;
+            for (i, (x, y)) in a.iter().zip(b).enumerate() {
+                let d = (x - y).abs();
+                if d > max_diff { max_diff = d; }
+                assert!(d < 1e-3, "{label} elem {i}: ref={x} fused={y} diff={d}");
+            }
+            eprintln!("{label}: max_diff = {max_diff:.6e}");
+        };
+        check("gate", &g_ref, &g_fused);
+        check("up", &u_ref, &u_fused);
     }
 
     #[test]
