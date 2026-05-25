@@ -647,10 +647,11 @@ impl GpuEngine {
             &[float.weight_buffer(), in_buf, out_buf, &params_buf],
         );
 
-        // workgroup_id.x = row tile (one per TILE_M=16 output rows)
+        // workgroup_id.x = row tile (one per TILE_M=32 output rows;
+        // each thread of the 16×16 WG computes 2 outputs stride-16 apart)
         // workgroup_id.y = token tile (one per TILE_N=16 tokens)
         let rows = float.out_features();
-        const TILE_M: usize = 16;
+        const TILE_M: usize = 32;
         const TILE_N: usize = 16;
         let dx = ((rows + TILE_M - 1) / TILE_M) as u32;
         let dy = ((n_tokens + TILE_N - 1) / TILE_N) as u32;

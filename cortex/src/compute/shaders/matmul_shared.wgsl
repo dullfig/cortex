@@ -5,38 +5,31 @@
 // input:   f32 [n_tokens, cols] (row-major)
 // output:  f32 [n_tokens, rows] (row-major)
 //
-// Design (textbook shared-memory tiled GEMM with vec4/vec2 packed loads,
-// Phase 1 of giggly-chasing-melody's FFN matmul optimization). For each
-// 16×16 output tile, the workgroup cooperatively loads a 16×TILE_K
-// weight tile and a 16×TILE_K input tile into shared memory once per
-// K-step, then every thread reads from shared memory for its TILE_K
-// dot-product accumulation.
+// Design (textbook shared-memory tiled GEMM with vec4 cooperative loads,
+// 2-per-thread register block — Phases 1+2 of giggly-chasing-melody).
+// For each 32×16 output tile, the workgroup cooperatively loads a
+// 32×TILE_K weight tile and a 16×TILE_K input tile into shared
+// memory once per K-step, then every thread accumulates TWO output
+// elements (stride-16 apart in the M dimension) from shared memory.
 //
-// **Phase 1 difference vs the scalar-load version**: cooperative loads
-// now use `vec4<f32>` for input (one transaction = 16 bytes = 4 K
-// elements per token-row) and `vec2<u32>` for weights (one transaction
-// = 8 bytes = 4 packed f16 weights per weight-row). The L2 line on
-// NVIDIA is 128 bytes; one warp of 32 threads doing vec4 loads pulls
-// exactly one cache line per access. Scalar f32 loads under-fill the
-// line (32 × 4 = 128 bytes too — same! — BUT the L1 access cost is
-// per-instruction, so fewer instructions = less front-end pressure
-// regardless of which way the line math works out).
+// **Phase 2 vs Phase 1**: TILE_M doubled from 16 to 32. Each of the 256
+// threads now computes 2 output elements (sum_a + sum_b) instead of 1,
+// halving the number of dispatched workgroups (for Qwen 0.5B FFN at
+// 4864 rows × 526 tokens: 152 × 33 = 5016 WGs Phase-1 vs 76 × 33 =
+// 2508 WGs Phase-2). Each K-step still loads 512 weights + 256 inputs
+// into shared memory, but those serve 512 outputs instead of 256 —
+// 33% less memory traffic per output. Two scalar f32 accumulators
+// per thread stays well inside naga's register budget (the failed
+// earlier attempt at register blocking used an 8×8 array which naga
+// spilled; 2 scalars are fine).
 //
-// **Why fewer threads do the loading.** With TILE_M = TILE_N = TILE_K = 16
-// and vec4 chunks, the A tile has 16 × 16 / 4 = 64 vec4-sized weight
-// loads, and the B tile has 16 × 16 / 4 = 64 vec4 input loads. So only
-// 64 of the 256 threads do meaningful loading; the rest sit idle
-// during the load. That's fine — the MADD phase keeps all 256 threads
-// busy.
+// **Tile sizes.** TILE_M = 32, TILE_N = 16, TILE_K = 16. Workgroup is
+// 16×16 = 256 threads; each thread computes 2 output rows at
+// (row_base + li, row_base + 16 + li) for token (tok_base + lj).
 //
-// **Tile sizes.** TILE_M = TILE_N = 16, TILE_K = 16. Workgroup is
-// 16×16 = 256 threads, one per output element. Per K-step, the first
-// 64 threads cooperatively load 64 packed weight pairs + 64 input
-// vec4s; every thread does 16 MADDs against shared memory.
-//
-// **Dispatch shape.** workgroup_id.x = row tile (0..ceil(rows/16))
-//                    workgroup_id.y = token tile (0..ceil(n_tokens/16))
-// Caller dispatches ceil(rows/16) × ceil(n_tokens/16) workgroups.
+// **Dispatch shape.** workgroup_id.x = M tile (0..ceil(rows/32))
+//                    workgroup_id.y = N tile (0..ceil(n_tokens/16))
+// Caller dispatches ceil(rows/32) × ceil(n_tokens/16) workgroups.
 
 struct Params {
     rows: u32,
@@ -50,13 +43,13 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> output_mat: array<f32>;
 @group(0) @binding(3) var<uniform> params: Params;
 
-const TILE_M: u32 = 16u;
+const TILE_M: u32 = 32u;
 const TILE_N: u32 = 16u;
 const TILE_K: u32 = 16u;
 
 // Shared-memory tiles for the current K-step.
-//   a_tile[i][k] = weights[row_base + i, k_base + k]    (dequantized f32)
-//   b_tile[j][k] = input_mat[tok_base + j, k_base + k]  (f32)
+//   a_tile[i][k] = weights[row_base + i, k_base + k]    (dequantized f32, i in [0, 32))
+//   b_tile[j][k] = input_mat[tok_base + j, k_base + k]  (f32, j in [0, 16))
 var<workgroup> a_tile: array<array<f32, TILE_K>, TILE_M>;
 var<workgroup> b_tile: array<array<f32, TILE_K>, TILE_N>;
 
@@ -69,58 +62,51 @@ fn main(
     let row_base: u32 = wid.x * TILE_M;
     let tok_base: u32 = wid.y * TILE_N;
 
-    let li: u32 = lid.x;   // row within tile [0, TILE_M)
+    let li: u32 = lid.x;   // row offset within first half of tile [0, 16)
     let lj: u32 = lid.y;   // tok within tile [0, TILE_N)
 
     let rows = params.rows;
     let cols = params.cols;
     let n_tokens = params.n_tokens;
-    // Cols-in-packed-u32s (since weights are 2 f16s per u32, one u32
-    // = 1 weight value × 2 columns; vec2<u32> = 4 columns).
     let half_cols = cols / 2u;
 
-    // The output element this thread is computing.
-    let out_row: u32 = row_base + li;
-    let out_tok: u32 = tok_base + lj;
-    let out_in_bounds: bool = (out_row < rows) && (out_tok < n_tokens);
+    // This thread's TWO output elements (stride-16 in M).
+    let out_row_a: u32 = row_base + li;
+    let out_row_b: u32 = row_base + 16u + li;
+    let out_tok:   u32 = tok_base + lj;
+    let a_in_bounds: bool = (out_row_a < rows) && (out_tok < n_tokens);
+    let b_in_bounds: bool = (out_row_b < rows) && (out_tok < n_tokens);
 
-    var sum: f32 = 0.0;
+    var sum_a: f32 = 0.0;
+    var sum_b: f32 = 0.0;
 
-    // Number of K-steps to cover the inner dimension. Round up to
-    // include the partial tile at the end (we zero out-of-bounds
-    // entries during cooperative loading).
     let num_k_steps: u32 = (cols + TILE_K - 1u) / TILE_K;
 
     for (var ks: u32 = 0u; ks < num_k_steps; ks = ks + 1u) {
         let k_base: u32 = ks * TILE_K;
 
-        // ---- Cooperative load: A tile (weights) — vec2<u32> packed ----
-        // Each load reads 1 u32 (= 2 f16 weight values = 2 K-elements)
-        // but we issue them in pairs (vec2<u32> = 4 K-elements per
-        // instruction) for L2 transaction efficiency. With TILE_K=16
-        // and pairs of u32s, that's 16/4 = 4 vec2 loads per weight row,
-        // and 16 weight rows = 64 total vec2 loads. Distributed across
-        // the first 64 threads (lidx < 64).
-        if (lidx < 64u) {
-            let load_row: u32 = lidx / 4u;          // [0, 16)
+        // ---- Cooperative load: A tile (weights) ----
+        // 32 rows × 16 K-cols = 512 elements per K-step. Each load
+        // reads 2 packed u32s (= 4 f16 weights = 4 K-elements per
+        // packed pair). 32 rows × 4 chunks = 128 logical loads,
+        // distributed across the first 128 threads (lidx < 128).
+        if (lidx < 128u) {
+            let load_row: u32 = lidx / 4u;          // [0, 32)
             let load_k4:  u32 = lidx & 3u;          // [0, 4)
             let load_k_base: u32 = load_k4 * 4u;    // 0, 4, 8, 12
             let w_row = row_base + load_row;
             let w_col_lo = k_base + load_k_base;
 
-            // Default to zeros for out-of-bounds.
             var v0: f32 = 0.0;
             var v1: f32 = 0.0;
             var v2: f32 = 0.0;
             var v3: f32 = 0.0;
             if (w_row < rows && w_col_lo < cols) {
-                // First packed u32 covers columns [w_col_lo, w_col_lo+1].
                 let pair_idx = w_col_lo / 2u;
                 let w_off = w_row * half_cols + pair_idx;
                 let p0 = unpack2x16float(weights[w_off]);
                 v0 = p0.x;
                 v1 = p0.y;
-                // Second packed u32 covers columns [w_col_lo+2, w_col_lo+3].
                 if (w_col_lo + 2u < cols) {
                     let p1 = unpack2x16float(weights[w_off + 1u]);
                     v2 = p1.x;
@@ -133,10 +119,9 @@ fn main(
             a_tile[load_row][load_k_base + 3u] = v3;
         }
 
-        // ---- Cooperative load: B tile (input) — vec4<f32> packed ----
-        // Each load reads 4 f32 input values = 4 K-elements per
-        // instruction. 16 tokens × 16 K-cols / 4-per-load = 64 vec4
-        // loads. Distributed across the first 64 threads (lidx < 64).
+        // ---- Cooperative load: B tile (input) ----
+        // 16 tokens × 16 K-cols = 256 elements. 4 f32s per load = 64
+        // logical loads. Distributed across the first 64 threads.
         if (lidx < 64u) {
             let load_tok: u32 = lidx / 4u;          // [0, 16)
             let load_k4:  u32 = lidx & 3u;          // [0, 4)
@@ -150,12 +135,6 @@ fn main(
             var v3: f32 = 0.0;
             if (in_tok < n_tokens && in_col < cols) {
                 let base = in_tok * cols + in_col;
-                // Read 4 consecutive f32s. WGSL doesn't allow a literal
-                // vec4 load from array<f32>, so we read scalar; in
-                // practice naga emits these as adjacent loads which the
-                // driver typically coalesces into one wide load
-                // anyway. The intent (and the L2 access pattern) is the
-                // same as if we'd used vec4 explicitly.
                 v0 = input_mat[base + 0u];
                 if (in_col + 1u < cols) { v1 = input_mat[base + 1u]; }
                 if (in_col + 2u < cols) { v2 = input_mat[base + 2u]; }
@@ -170,20 +149,53 @@ fn main(
         workgroupBarrier();
 
         // ---- Per-thread MADDs against shared memory ----
-        // Each thread accumulates TILE_K multiply-adds for its
-        // output element. Single f32 accumulator stays in a register.
-        if (out_in_bounds) {
-            for (var k: u32 = 0u; k < TILE_K; k = k + 1u) {
-                sum = sum + a_tile[li][k] * b_tile[lj][k];
-            }
-        }
+        // 16 explicit MADD pairs (hand-unrolled to keep naga from
+        // generating a loop the driver may not unroll). Each iteration
+        // does 2 multiplies sharing one b_val and accumulates into two
+        // scalar f32 registers.
+        let li_b: u32 = 16u + li;
+        sum_a = sum_a + a_tile[li][0u]  * b_tile[lj][0u];
+        sum_b = sum_b + a_tile[li_b][0u] * b_tile[lj][0u];
+        sum_a = sum_a + a_tile[li][1u]  * b_tile[lj][1u];
+        sum_b = sum_b + a_tile[li_b][1u] * b_tile[lj][1u];
+        sum_a = sum_a + a_tile[li][2u]  * b_tile[lj][2u];
+        sum_b = sum_b + a_tile[li_b][2u] * b_tile[lj][2u];
+        sum_a = sum_a + a_tile[li][3u]  * b_tile[lj][3u];
+        sum_b = sum_b + a_tile[li_b][3u] * b_tile[lj][3u];
+        sum_a = sum_a + a_tile[li][4u]  * b_tile[lj][4u];
+        sum_b = sum_b + a_tile[li_b][4u] * b_tile[lj][4u];
+        sum_a = sum_a + a_tile[li][5u]  * b_tile[lj][5u];
+        sum_b = sum_b + a_tile[li_b][5u] * b_tile[lj][5u];
+        sum_a = sum_a + a_tile[li][6u]  * b_tile[lj][6u];
+        sum_b = sum_b + a_tile[li_b][6u] * b_tile[lj][6u];
+        sum_a = sum_a + a_tile[li][7u]  * b_tile[lj][7u];
+        sum_b = sum_b + a_tile[li_b][7u] * b_tile[lj][7u];
+        sum_a = sum_a + a_tile[li][8u]  * b_tile[lj][8u];
+        sum_b = sum_b + a_tile[li_b][8u] * b_tile[lj][8u];
+        sum_a = sum_a + a_tile[li][9u]  * b_tile[lj][9u];
+        sum_b = sum_b + a_tile[li_b][9u] * b_tile[lj][9u];
+        sum_a = sum_a + a_tile[li][10u] * b_tile[lj][10u];
+        sum_b = sum_b + a_tile[li_b][10u] * b_tile[lj][10u];
+        sum_a = sum_a + a_tile[li][11u] * b_tile[lj][11u];
+        sum_b = sum_b + a_tile[li_b][11u] * b_tile[lj][11u];
+        sum_a = sum_a + a_tile[li][12u] * b_tile[lj][12u];
+        sum_b = sum_b + a_tile[li_b][12u] * b_tile[lj][12u];
+        sum_a = sum_a + a_tile[li][13u] * b_tile[lj][13u];
+        sum_b = sum_b + a_tile[li_b][13u] * b_tile[lj][13u];
+        sum_a = sum_a + a_tile[li][14u] * b_tile[lj][14u];
+        sum_b = sum_b + a_tile[li_b][14u] * b_tile[lj][14u];
+        sum_a = sum_a + a_tile[li][15u] * b_tile[lj][15u];
+        sum_b = sum_b + a_tile[li_b][15u] * b_tile[lj][15u];
 
         workgroupBarrier();
     }
 
     // Writeback. Output is row-major [n_tokens, rows]:
     //   output_mat[out_tok * rows + out_row] = sum
-    if (out_in_bounds) {
-        output_mat[out_tok * rows + out_row] = sum;
+    if (a_in_bounds) {
+        output_mat[out_tok * rows + out_row_a] = sum_a;
+    }
+    if (b_in_bounds) {
+        output_mat[out_tok * rows + out_row_b] = sum_b;
     }
 }
