@@ -307,6 +307,12 @@ pub struct GpuEngine {
     /// places encoder-level write_timestamp markers between blocks and
     /// resolves them at end-of-forward to a per-block waterfall log.
     timer: Option<TimestampTimer>,
+    /// Per-pass timer state. When `Some`, `begin_timed_pass` (used by
+    /// the chat-completion prefill hot path) opens compute passes with
+    /// `ComputePassTimestampWrites` and increments next_idx. When
+    /// `None`, passes open as regular untimed passes — the prefill
+    /// resets this back to None at end-of-forward.
+    pass_timer: std::sync::Mutex<Option<PassTimerState>>,
 }
 
 /// GPU-side timestamp tracing. One QuerySet sized for the longest
@@ -320,6 +326,16 @@ pub struct TimestampTimer {
     pub readback_buf: wgpu::Buffer,
     pub capacity: u32,
     pub period_ns: f32,
+}
+
+/// Mutable state for `begin_timed_pass`. `next_idx` is the offset into
+/// the QuerySet for the next (begin, end) pair to allocate; `labels`
+/// records what each pair corresponds to so the readback log can
+/// aggregate by pass name. Stored under a Mutex on the engine so the
+/// helper can mutate it from `&self` methods.
+pub struct PassTimerState {
+    pub next_idx: u32,
+    pub labels: Vec<&'static str>,
 }
 
 impl GpuEngine {
@@ -406,7 +422,11 @@ impl GpuEngine {
         let timer = if gpu.device.features().contains(wgpu::Features::TIMESTAMP_QUERY)
             && gpu.device.features().contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
         {
-            let capacity: u32 = 64;
+            // Capacity bumped from 64 → 512 to fit both:
+            //  - per-block boundary markers (n_layers + 2, max ~64)
+            //  - per-pass timestamp_writes pairs (~5 passes/block × 36
+            //    blocks × 2 timestamps = 360)
+            let capacity: u32 = 512;
             let bytes = (capacity as u64) * 8; // u64 per timestamp
             let query_set = gpu.device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("gpu_engine.timer.query_set"),
@@ -447,7 +467,49 @@ impl GpuEngine {
             rope_sin_buf,
             rope_max_seq: max_seq,
             timer,
+            pass_timer: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Open a compute pass, attaching begin/end timestamp_writes if a
+    /// per-pass timer is currently active (and the pass timer + query
+    /// set both have capacity). Otherwise opens an untimed pass.
+    /// Helper for the chat-completion prefill hot path; other callers
+    /// can keep using `encoder.begin_compute_pass(...)` directly.
+    fn begin_timed_pass<'enc>(
+        &self,
+        encoder: &'enc mut wgpu::CommandEncoder,
+        label: &'static str,
+    ) -> wgpu::ComputePass<'enc> {
+        let writes = self.next_pass_timestamp_writes(label);
+        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some(label),
+            timestamp_writes: writes,
+        })
+    }
+
+    /// Allocate the next (begin, end) pair from `pass_timer` if active;
+    /// returns None if no per-pass timer is running or the QuerySet is
+    /// full. Pulled out so a caller that needs to construct a pass
+    /// descriptor inline can still get the timestamp_writes.
+    fn next_pass_timestamp_writes(
+        &self,
+        label: &'static str,
+    ) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+        let mut guard = self.pass_timer.lock().unwrap();
+        let state = guard.as_mut()?;
+        let timer = self.timer.as_ref()?;
+        if state.next_idx + 2 > timer.capacity {
+            return None;
+        }
+        let begin = state.next_idx;
+        state.next_idx += 2;
+        state.labels.push(label);
+        Some(wgpu::ComputePassTimestampWrites {
+            query_set: &timer.query_set,
+            beginning_of_pass_write_index: Some(begin),
+            end_of_pass_write_index: Some(begin + 1),
+        })
     }
 
     /// Dispatch RMSNorm into `out_buf` from `in_buf`, using `weight_buf` for
@@ -1758,7 +1820,21 @@ impl GpuEngine {
         // Timestamp markers: one per block boundary + one final.
         // n_markers = n_layers + 2 (start, after each block, after final_norm).
         let n_markers: u32 = (n_layers as u32) + 2;
-        let timer_active = self.timer.as_ref().map(|t| n_markers <= t.capacity).unwrap_or(false);
+        // Pass-level timestamps occupy QuerySet indices >= n_markers
+        // (per-block markers live at 0..n_markers). Each pass uses 2
+        // indices (begin + end), so an upper bound for the pass region
+        // is n_markers + 2 * (5 passes/block × n_layers + 1 for final_norm).
+        let pass_region_upper: u32 = n_markers + 2 * (5 * (n_layers as u32) + 1);
+        let timer_active = self.timer.as_ref().map(|t| pass_region_upper <= t.capacity).unwrap_or(false);
+
+        // Activate per-pass timer for the prefill, starting at index n_markers
+        // so we don't collide with the per-block markers.
+        if timer_active {
+            *self.pass_timer.lock().unwrap() = Some(PassTimerState {
+                next_idx: n_markers,
+                labels: Vec::with_capacity(pass_region_upper as usize / 2),
+            });
+        }
 
         let t_pre_record = t_start.elapsed();
         if let (true, Some(t)) = (timer_active, self.timer.as_ref()) {
@@ -1783,12 +1859,18 @@ impl GpuEngine {
             encoder.write_timestamp(&t.query_set, (n_layers as u32) + 1);
         }
         encoder.copy_buffer_to_buffer(&normed_buf, 0, &staging, 0, bytes);
+        // Capture the actual range used by the pass-level timer
+        // (begin_timed_pass advanced state.next_idx).
+        let pass_final_idx: u32 = self.pass_timer.lock().unwrap()
+            .as_ref().map(|s| s.next_idx).unwrap_or(n_markers);
         // Resolve all queries into the resolve buffer, then copy to the
         // mappable readback buffer — both in the same encoder so it's
         // one submit.
         if let (true, Some(t)) = (timer_active, self.timer.as_ref()) {
-            encoder.resolve_query_set(&t.query_set, 0..n_markers, &t.resolve_buf, 0);
-            let resolve_bytes = (n_markers as u64) * 8;
+            // Combined range: per-block markers 0..n_markers plus
+            // pass-level timestamps n_markers..pass_final_idx.
+            encoder.resolve_query_set(&t.query_set, 0..pass_final_idx, &t.resolve_buf, 0);
+            let resolve_bytes = (pass_final_idx as u64) * 8;
             encoder.copy_buffer_to_buffer(&t.resolve_buf, 0, &t.readback_buf, 0, resolve_bytes);
         }
         let t_record = t_start.elapsed() - t_pre_record;
@@ -1802,9 +1884,9 @@ impl GpuEngine {
         let t_readback = t_start.elapsed() - t_pre_readback;
 
         // Read back timestamp markers (if active) and log the per-block
-        // GPU waterfall.
+        // GPU waterfall + per-pass cumulative times.
         if let (true, Some(t)) = (timer_active, self.timer.as_ref()) {
-            let resolve_bytes = (n_markers as usize) * 8;
+            let resolve_bytes = (pass_final_idx as usize) * 8;
             let slice = t.readback_buf.slice(0..(resolve_bytes as u64));
             let (tx, rx) = std::sync::mpsc::channel();
             slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
@@ -1817,7 +1899,7 @@ impl GpuEngine {
             drop(data);
             t.readback_buf.unmap();
 
-            // Convert per-block deltas to microseconds.
+            // Per-block timing (from the n_markers boundary markers).
             let mut per_block_us: Vec<u64> = Vec::with_capacity(n_layers);
             for i in 0..n_layers {
                 let dt_ticks = ticks[i + 1].saturating_sub(ticks[i]);
@@ -1840,6 +1922,39 @@ impl GpuEngine {
                 "fwd_cache GPU waterfall (per-block timestamps)",
             );
             tracing::debug!(?per_block_us, "per-block GPU times");
+
+            // Per-pass timing: pull labels back out of the pass timer,
+            // each label corresponds to one (begin, end) pair starting
+            // at index n_markers. Aggregate cumulative µs per label.
+            let pass_state = self.pass_timer.lock().unwrap().take();
+            if let Some(state) = pass_state {
+                let mut by_label: std::collections::BTreeMap<&'static str, (u64, u64)>
+                    = std::collections::BTreeMap::new();
+                for (pass_i, label) in state.labels.iter().enumerate() {
+                    let begin_idx = (n_markers as usize) + pass_i * 2;
+                    let end_idx = begin_idx + 1;
+                    if end_idx >= ticks.len() { break; }
+                    let dt_ticks = ticks[end_idx].saturating_sub(ticks[begin_idx]);
+                    let dt_ns = (dt_ticks as f32) * t.period_ns;
+                    let entry = by_label.entry(*label).or_insert((0, 0));
+                    entry.0 += (dt_ns / 1000.0) as u64;
+                    entry.1 += 1;
+                }
+                let pass_summary: Vec<String> = by_label.iter()
+                    .map(|(lbl, (cum_us, cnt))| {
+                        let avg = if *cnt > 0 { cum_us / cnt } else { 0 };
+                        format!("{lbl}={cum_us}us ({cnt}x, avg={avg}us)")
+                    })
+                    .collect();
+                tracing::info!(
+                    pass_count = state.labels.len() as u64,
+                    summary = pass_summary.join(" "),
+                    "fwd_cache GPU per-pass cumulative",
+                );
+            }
+        } else if timer_active {
+            // Timer was active but timer somehow gone — clean up state.
+            *self.pass_timer.lock().unwrap() = None;
         }
 
         // Successful forward — bump the cache's write cursor. The caller
@@ -2047,10 +2162,7 @@ impl GpuEngine {
         // buffers with the implicit ordering wgpu enforces between dispatches
         // in a single pass on most drivers.
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("gpu_engine.block.pass1"),
-                timestamp_writes: None,
-            });
+            let mut pass = self.begin_timed_pass(encoder, "block.pass1");
 
             // Injection-phase hook (#6c). Broadcast-add a [embed_dim] delta
             // into every token's hidden BEFORE attn_norm.
@@ -2128,10 +2240,7 @@ impl GpuEngine {
         // All purely intra-block; ends at the optional post-block capture
         // (encoder copy outside any pass).
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("gpu_engine.block.pass2"),
-                timestamp_writes: None,
-            });
+            let mut pass = self.begin_timed_pass(encoder, "block.pass2");
 
             // 6.5 (BitNet) attention sub-norm before o_proj. Reuses
             // scratch.normed (free after Q/K/V consumed it in pass 1).
@@ -2607,10 +2716,7 @@ impl GpuEngine {
         let score_groups_x = (inner_threads + 255) / 256;
         let score_groups_y = n_tokens as u32;
         if !skip_score {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("gpu_engine.attn_score.pass"),
-                timestamp_writes: None,
-            });
+            let mut pass = self.begin_timed_pass(encoder, "attn_score");
             pass.set_pipeline(score_pipeline);
             pass.set_bind_group(0, &score_bind, &[]);
             pass.dispatch_workgroups(score_groups_x, score_groups_y, 1);
@@ -2638,10 +2744,7 @@ impl GpuEngine {
         // One workgroup per (tok, head) pair.
         let softmax_groups = (n_tokens * n_heads) as u32;
         if !skip_softmax {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("gpu_engine.softmax.pass"),
-                timestamp_writes: None,
-            });
+            let mut pass = self.begin_timed_pass(encoder, "softmax");
             pass.set_pipeline(softmax_pipeline);
             pass.set_bind_group(0, &softmax_bind, &[]);
             pass.dispatch_workgroups(softmax_groups, 1, 1);
@@ -2668,10 +2771,7 @@ impl GpuEngine {
         let total_value_threads = (n_tokens * n_heads * head_dim) as u32;
         let value_groups = (total_value_threads + 255) / 256;
         if !skip_value {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("gpu_engine.attn_value.pass"),
-                timestamp_writes: None,
-            });
+            let mut pass = self.begin_timed_pass(encoder, "attn_value");
             pass.set_pipeline(value_pipeline);
             pass.set_bind_group(0, &value_bind, &[]);
             pass.dispatch_workgroups(value_groups, 1, 1);
@@ -4932,6 +5032,109 @@ mod tests {
 
         eprintln!(
             "matmul bench (rows={rows}, cols={cols}, n_tokens={n_tokens}, iters={iters}):\n  \
+             legacy: {legacy_time:?} ({per_legacy:?}/iter)\n  \
+             shared: {shared_time:?} ({per_shared:?}/iter)\n  \
+             speedup: {speedup:.2}x"
+        );
+    }
+
+    #[test]
+    #[ignore = "benchmark; run with --ignored to compare matmul shaders at Qwen FFN gate/up shape"]
+    fn matmul_shared_vs_legacy_bench_ffn_shape() {
+        // FFN shape for Qwen 0.5B: gate_proj / up_proj are
+        // rows=4864 (intermediate), cols=896 (embed_dim), n_tokens=526
+        // for a 500w prompt. This is the dominant matmul cost in the
+        // forward (block.pass2 = 87% of prefill GPU time per per-pass
+        // timestamps). Speedup here matters MUCH more than at Q_proj
+        // shape because FFN matmuls run 3× per block.
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let rows = 4864usize;
+        let cols = 896usize;
+        let n_tokens = 526usize;
+        let iters = 5usize;
+
+        let mut rng: u64 = 0xFFFF_FACE;
+        let mut roll = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng >> 33) as i32 % 1000 - 500) as f32 * 0.001
+        };
+        let weights_data: Vec<f32> = (0..rows * cols).map(|_| roll()).collect();
+        let input_data: Vec<f32> = (0..n_tokens * cols).map(|_| roll()).collect();
+
+        let weight_tensor = crate::tensor::FloatTensor::new(weights_data, vec![rows, cols]);
+        let layer = crate::layers::gpu_floatlinear::GpuFloatLinear::from_float_tensor(
+            gpu.clone(), weight_tensor,
+        );
+
+        let in_bytes = (n_tokens * cols * 4) as u64;
+        let in_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("bench.ffn.in"),
+            contents: bytemuck::cast_slice(&input_data),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let out_bytes = (n_tokens * rows * 4) as u64;
+        let out_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bench.ffn.out"),
+            size: out_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let cpu_model = toy_float_model_cpu_reference();
+        let engine = GpuEngine::with_max_seq(cpu_model, gpu.clone(), 16);
+
+        let run = |use_shared: bool| -> std::time::Duration {
+            for _ in 0..2 {
+                let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("bench.ffn.warmup.enc"),
+                });
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("bench.ffn.warmup.pass"),
+                        timestamp_writes: None,
+                    });
+                    if use_shared {
+                        engine.dispatch_matmul_shared_inner_in_pass(&mut pass, &layer, &in_buf, &out_buf, n_tokens);
+                    } else {
+                        engine.dispatch_matmul_legacy_inner_in_pass(&mut pass, &layer, &in_buf, &out_buf, n_tokens);
+                    }
+                }
+                gpu.queue.submit(Some(encoder.finish()));
+                gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+            }
+
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("bench.ffn.enc"),
+                });
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("bench.ffn.pass"),
+                        timestamp_writes: None,
+                    });
+                    if use_shared {
+                        engine.dispatch_matmul_shared_inner_in_pass(&mut pass, &layer, &in_buf, &out_buf, n_tokens);
+                    } else {
+                        engine.dispatch_matmul_legacy_inner_in_pass(&mut pass, &layer, &in_buf, &out_buf, n_tokens);
+                    }
+                }
+                gpu.queue.submit(Some(encoder.finish()));
+                gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+            }
+            t0.elapsed()
+        };
+
+        let legacy_time = run(false);
+        let shared_time = run(true);
+        let per_legacy = legacy_time / iters as u32;
+        let per_shared = shared_time / iters as u32;
+        let speedup = legacy_time.as_secs_f64() / shared_time.as_secs_f64();
+
+        eprintln!(
+            "matmul FFN bench (rows={rows}, cols={cols}, n_tokens={n_tokens}, iters={iters}):\n  \
              legacy: {legacy_time:?} ({per_legacy:?}/iter)\n  \
              shared: {shared_time:?} ({per_shared:?}/iter)\n  \
              speedup: {speedup:.2}x"
