@@ -296,13 +296,21 @@ pub fn load_model(path: &str) -> Result<LoadedModel, GgufError> {
         );
         blocks.push(block);
 
-        // wgpu 29 mitigation: queue.write_buffer enqueues to a staging
-        // belt that doesn't recycle until the device is polled. After
-        // ~200 weight uploads (5+ per block × 36 blocks for Qwen 3B),
-        // unrecycled staging accumulates enough to trip OOM on the next
-        // create_buffer. Poll between block loads to force recycling.
+        // wgpu 29 mitigation: queue.write_buffer enqueues into wgpu's
+        // staging belt; the staging chunks are NOT recycled until the
+        // queue receives a submit that drains them. During model load
+        // we never submit, so the belt accumulates unbounded — for
+        // Qwen 3B that's ~200 weight uploads × ~150 MiB/block worth
+        // of staging on top of the resident weights, OOMing at block
+        // 34/36 even with 12 GB VRAM free.
+        //
+        // Fix: submit an empty command buffer between block loads.
+        // That forces the queue to retire the previous writes' staging
+        // chunks. poll(Wait) after the submit ensures everything is
+        // actually drained before the next block's writes begin.
         #[cfg(feature = "gpu")]
         if let Some(gpu) = ctx.gpu.as_ref() {
+            gpu.queue.submit(std::iter::empty());
             let _ = gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
         }
 
