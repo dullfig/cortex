@@ -1,5 +1,11 @@
 // Batch RMSNorm: output[tok, i] = input[tok, i] * weight[i] / sqrt(mean(input[tok]²) + eps)
 // One workgroup per token.
+//
+// This is the f32→f32 variant; used by bitnet sub-norms which still
+// operate on f32 scratch buffers. The packed-input variants live in
+// rmsnorm_batch_packed_to_f32.wgsl (per-block attn_norm/ffn_norm,
+// Phase B) and rmsnorm_batch_packed_to_packed.wgsl (final norm,
+// Phase B).
 
 struct Params { n: u32, eps: f32, n_tokens: u32, _pad: u32 }
 

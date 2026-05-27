@@ -210,6 +210,13 @@ pub struct Pipelines {
     /// See `shaders/matmul_gate_up_shared.wgsl`.
     pub matmul_gate_up_shared: wgpu::ComputePipeline,
     pub rmsnorm_batch: wgpu::ComputePipeline,
+    /// Phase B variant: reads packed-f16 input (hidden_buf), writes f32
+    /// output (scratch.normed). Used by per-block attn_norm / ffn_norm.
+    pub rmsnorm_batch_packed_to_f32: wgpu::ComputePipeline,
+    /// Phase B variant: reads packed-f16 input AND writes packed-f16
+    /// output. Used by the FINAL norm (hidden_buf → normed_buf), both
+    /// packed in Phase B.
+    pub rmsnorm_batch_packed_to_packed: wgpu::ComputePipeline,
     pub rope_batch: wgpu::ComputePipeline,
     pub silu_mul_batch: wgpu::ComputePipeline,
     /// Batched ReLU²(gate) * up for BitNet b1.58 SwiGLU activations.
@@ -278,6 +285,8 @@ impl Pipelines {
             matmul_shared: make(include_str!("shaders/matmul_shared.wgsl"), "matmul_shared"),
             matmul_gate_up_shared: make(include_str!("shaders/matmul_gate_up_shared.wgsl"), "matmul_gate_up_shared"),
             rmsnorm_batch: make(include_str!("shaders/rmsnorm_batch.wgsl"), "rmsnorm_batch"),
+            rmsnorm_batch_packed_to_f32: make(include_str!("shaders/rmsnorm_batch_packed_to_f32.wgsl"), "rmsnorm_batch_packed_to_f32"),
+            rmsnorm_batch_packed_to_packed: make(include_str!("shaders/rmsnorm_batch_packed_to_packed.wgsl"), "rmsnorm_batch_packed_to_packed"),
             rope_batch: make(include_str!("shaders/rope_batch.wgsl"), "rope_batch"),
             silu_mul_batch: make(include_str!("shaders/silu_mul_batch.wgsl"), "silu_mul_batch"),
             relu2_mul_batch: make(include_str!("shaders/relu2_mul_batch.wgsl"), "relu2_mul_batch"),
