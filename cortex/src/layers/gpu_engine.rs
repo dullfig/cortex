@@ -2160,7 +2160,24 @@ impl GpuEngine {
         start_pos: usize,
         scratch: &BlockScratch,
     ) {
-        self.forward_block_gpu_inner(encoder, block_idx, hidden_buf, n_tokens, start_pos, scratch, None, None, None, None);
+        // Phase A: KV cache is now packed f16, and the attention shaders
+        // read packed-f16 K/V. The pre-Phase-A "scratch K/V" path is
+        // gone (would require parallel f32 attention shaders to keep);
+        // forward_block_gpu now allocates a tiny single-block scratch
+        // cache and routes through the cached path. This is the only
+        // caller — production always passes its own kv_cache_target via
+        // forward_block_gpu_inner.
+        let attn = self.cpu.blocks()[block_idx].attention();
+        let tmp_cache = crate::layers::gpu_kv_cache::GpuKvCache::new(
+            Arc::clone(&self.gpu),
+            1, attn.n_kv_heads(), attn.head_dim(),
+            (start_pos + n_tokens).max(1),
+        );
+        let target = (tmp_cache.k_layer(0), tmp_cache.v_layer(0));
+        self.forward_block_gpu_inner(
+            encoder, block_idx, hidden_buf, n_tokens, start_pos, scratch,
+            None, Some(target), None, None,
+        );
     }
 
     /// Same as `forward_block_gpu` but with optional pre-softmax score
@@ -2989,7 +3006,9 @@ impl GpuEngine {
             &[k_src, v_src, k_cache, v_cache, &params_buf],
         );
 
-        let total = (kv_dim * n_tokens) as u32;
+        // Phase A: K/V cache is packed f16 (2 per u32). The shader writes
+        // ONE u32 per thread = 2 f32s packed. Halves the thread count.
+        let total = ((kv_dim / 2) * n_tokens) as u32;
         let groups = (total + 127) / 128;
         let dx = groups.min(65535);
         let dy = (groups + 65534) / 65535;
@@ -3598,6 +3617,12 @@ mod tests {
 
         let cpu_out = cpu_attention_reference(&q, &k, &v, n_heads, n_kv_heads, head_dim, n_tokens);
 
+        // Phase A: KV cache is packed f16 (2 per u32). The test now
+        // packs K/V before upload to match the attention shader's
+        // expectation. Q stays f32 (Phase A keeps Q f32).
+        let k_packed = GpuDevice::pack_f16(&k);
+        let v_packed = GpuDevice::pack_f16(&v);
+
         // GPU path: upload Q/K/V, allocate scores+out scratch, dispatch.
         let q_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("attn_test.q"),
@@ -3606,12 +3631,12 @@ mod tests {
         });
         let k_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("attn_test.k"),
-            contents: bytemuck::cast_slice(&k),
+            contents: bytemuck::cast_slice(&k_packed),
             usage: wgpu::BufferUsages::STORAGE,
         });
         let v_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("attn_test.v"),
-            contents: bytemuck::cast_slice(&v),
+            contents: bytemuck::cast_slice(&v_packed),
             usage: wgpu::BufferUsages::STORAGE,
         });
         let scores_bytes = (n_tokens * n_heads * max_seq * std::mem::size_of::<f32>()) as u64;
@@ -3652,11 +3677,13 @@ mod tests {
         drop(data); staging.unmap();
 
         assert_eq!(cpu_out.len(), gpu_out.len());
-        // f32 attention math; exp/softmax in shader matches CPU within ~1e-5
-        // for well-conditioned inputs.
+        // Phase A: K/V stored as f16 packed. CPU reference is f32. f16
+        // quantization noise on K and V flows into scores and the value
+        // sum; tolerance loosens from 1e-4 to 1e-2 to absorb ~10-bit
+        // mantissa rounding. Softmax in shader still runs f32.
         for (i, (c, g)) in cpu_out.iter().zip(&gpu_out).enumerate() {
             assert!(
-                (c - g).abs() < 1e-4,
+                (c - g).abs() < 1e-2,
                 "elem {i}: cpu={c} gpu={g} (diff={})",
                 (c - g).abs()
             );

@@ -11,24 +11,29 @@
 //! per token, no upload per token. Generation throughput on GPU is bound
 //! by GPU compute and not by CPU↔GPU transfer.
 //!
-//! Memory:
-//!   2 * n_layers * max_seq * n_kv_heads * head_dim * 4 bytes
+//! Memory (Phase A f16): K and V stored as packed f16 (2 per u32).
+//!   2 * n_layers * max_seq * n_kv_heads * head_dim * 2 bytes
 //!
-//! For Qwen 2.5-3B at max_seq=4096: 36 * 2 * 4096 * 256 * 4 = 288 MB.
-//! For Harmonizer-scale memex (13M tokens): 36 * 2 * 13M * 256 * 4 = 144 GB.
-//! That second case needs TurboQuant compression (#12) to be tractable.
+//! For Qwen 2.5-3B at max_seq=4096: 36 * 2 * 4096 * 256 * 2 = 144 MB
+//! (down from 288 MB f32). For Harmonizer-scale memex (13M tokens):
+//! 36 * 2 * 13M * 256 * 2 = 72 GB. Still needs TurboQuant compression
+//! for memex-scale, but half-precision buys 2x headroom.
 
 use std::sync::Arc;
 
 use crate::compute::wgpu_backend::GpuDevice;
 
 /// Resident KV cache on the GPU. One pair of (K, V) buffers per transformer
-/// layer, sized to `max_seq * n_kv_heads * head_dim` f32 elements each.
+/// layer, sized to `max_seq * n_kv_heads * head_dim` f16 elements each
+/// (Phase A: packed 2 f16 per u32; storage buffer holds u32s).
 pub struct GpuKvCache {
     gpu: Arc<GpuDevice>,
-    /// Per-layer K storage. `k_buffers[i]` holds `[max_seq, kv_dim]` f32 flat.
+    /// Per-layer K storage. `k_buffers[i]` holds `[max_seq, kv_dim/2]` u32
+    /// flat — each u32 packs 2 f16 K-values (Phase A). Shader unpacks via
+    /// `unpack2x16float` on read; `kv_write_batch` packs via
+    /// `pack2x16float` on write. kv_dim must be even (asserted on alloc).
     k_buffers: Vec<wgpu::Buffer>,
-    /// Per-layer V storage. Same shape as `k_buffers`.
+    /// Per-layer V storage. Same shape + packing as `k_buffers`.
     v_buffers: Vec<wgpu::Buffer>,
     n_layers: usize,
     n_kv_heads: usize,
@@ -49,7 +54,11 @@ impl GpuKvCache {
     ) -> Self {
         assert!(n_layers > 0 && n_kv_heads > 0 && head_dim > 0 && max_seq_len > 0);
         let kv_dim = n_kv_heads * head_dim;
-        let bytes_per_buffer = (max_seq_len * kv_dim * std::mem::size_of::<f32>()) as u64;
+        // Phase A: pack 2 f16 per u32 → 2 bytes per element instead of 4.
+        // kv_dim must be even (head_dim is always even for our supported
+        // models; assertion makes this explicit for any future model).
+        assert!(kv_dim % 2 == 0, "kv_dim ({kv_dim}) must be even for f16 packing");
+        let bytes_per_buffer = (max_seq_len * kv_dim * 2) as u64;
 
         let mut k_buffers = Vec::with_capacity(n_layers);
         let mut v_buffers = Vec::with_capacity(n_layers);
@@ -150,9 +159,9 @@ impl GpuKvCache {
     }
 
     /// Total VRAM bytes used by this cache (2 buffers per layer × layers ×
-    /// max_seq × kv_dim × 4 bytes).
+    /// max_seq × kv_dim × 2 bytes; f16 packed since Phase A).
     pub fn memory_bytes(&self) -> u64 {
-        2 * (self.n_layers as u64) * (self.max_seq_len as u64) * (self.kv_dim() as u64) * 4
+        2 * (self.n_layers as u64) * (self.max_seq_len as u64) * (self.kv_dim() as u64) * 2
     }
 
     /// Borrow the GPU device this cache is bound to (for orchestrators that
@@ -194,8 +203,9 @@ mod tests {
         assert_eq!(cache.max_seq_len(), 16);
         assert_eq!(cache.seq_len(), 0);
         assert!(cache.is_empty());
-        // 2 * 4 layers * 16 max_seq * 16 kv_dim * 4 bytes = 8192 bytes
-        assert_eq!(cache.memory_bytes(), 2 * 4 * 16 * 16 * 4);
+        // Phase A: f16 packed, 2 bytes per element.
+        // 2 * 4 layers * 16 max_seq * 16 kv_dim * 2 bytes = 4096 bytes
+        assert_eq!(cache.memory_bytes(), 2 * 4 * 16 * 16 * 2);
     }
 
     #[test]
