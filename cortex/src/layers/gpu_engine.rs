@@ -869,14 +869,18 @@ impl GpuEngine {
             &[layer.weight_buffer(), act_q_buf, act_scales_buf, out_f32_buf, &params_buf],
         );
 
+        // Shared-memory tiled dispatch (Phase 5): one workgroup per
+        // 32×16 output tile (32 M, 16 N). Each thread computes 2 outputs
+        // stride-16 in M. Matches the float matmul_shared layout.
         let rows = layer.out_features();
-        let dx = (rows.min(65535)) as u32;
-        let dy = ((rows + 65534) / 65535) as u32;
-        let dz = n_tokens as u32;
+        const TILE_M: usize = 32;
+        const TILE_N: usize = 16;
+        let dx = ((rows + TILE_M - 1) / TILE_M) as u32;
+        let dy = ((n_tokens + TILE_N - 1) / TILE_N) as u32;
 
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind, &[]);
-        pass.dispatch_workgroups(dx, dy, dz);
+        pass.dispatch_workgroups(dx, dy, 1);
     }
 
     /// Unified linear-layer dispatcher used by `forward_block_gpu_inner`.
