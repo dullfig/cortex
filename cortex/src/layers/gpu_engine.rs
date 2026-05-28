@@ -259,11 +259,12 @@ impl BlockScratch {
             scales:         mk((n_tokens as u64) * f32_bytes, "scratch.ternary.scales"),
         };
         Self {
-            // Phase B (scoped back): scratch.normed stays f32. Per-block
-            // rmsnorm reads packed hidden_buf via a new shader variant
-            // that writes f32 output (rmsnorm_batch_packed_to_f32). The
-            // matmul-input-packed win waits for Phase C.
-            normed:    mk((n_tokens * embed_dim) as u64 * f32_bytes, "scratch.normed"),
+            // Phase C1: scratch.normed packed f16 (2 per u32, half bytes).
+            // attn_norm/ffn_norm/o_sub_norm write packed via
+            // rmsnorm_batch_packed_to_packed; Q/K/V/O/gate/up matmuls
+            // read packed via matmul_shared_pin_fout (output still f32
+            // to scratch.q/k/v/gate/up which are still f32 in C1).
+            normed:    mk((n_tokens * embed_dim * 2) as u64, "scratch.normed"),
             q:         mk((n_tokens * n_heads * head_dim) as u64 * f32_bytes, "scratch.q"),
             k:         mk((n_tokens * n_kv_heads * head_dim) as u64 * f32_bytes, "scratch.k"),
             v:         mk((n_tokens * n_kv_heads * head_dim) as u64 * f32_bytes, "scratch.v"),
@@ -541,6 +542,42 @@ impl GpuEngine {
         self.dispatch_rmsnorm_in_pass(&mut pass, in_buf, weight_buf, out_buf, n, n_tokens, eps);
     }
 
+    /// Phase C1 encoder-level wrapper for packed→packed rmsnorm.
+    pub fn dispatch_rmsnorm_packed_to_packed_into(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        in_buf: &wgpu::Buffer,
+        weight_buf: &wgpu::Buffer,
+        out_buf: &wgpu::Buffer,
+        n: usize,
+        n_tokens: usize,
+        eps: f32,
+    ) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_engine.rmsnorm_packed_to_packed.pass"),
+            timestamp_writes: None,
+        });
+        self.dispatch_rmsnorm_packed_to_packed_in_pass(&mut pass, in_buf, weight_buf, out_buf, n, n_tokens, eps);
+    }
+
+    /// Phase C1 encoder-level wrapper for f32→packed rmsnorm (BitNet o_sub_norm).
+    pub fn dispatch_rmsnorm_f32_to_packed_into(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        in_buf: &wgpu::Buffer,
+        weight_buf: &wgpu::Buffer,
+        out_buf: &wgpu::Buffer,
+        n: usize,
+        n_tokens: usize,
+        eps: f32,
+    ) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_engine.rmsnorm_f32_to_packed.pass"),
+            timestamp_writes: None,
+        });
+        self.dispatch_rmsnorm_f32_to_packed_in_pass(&mut pass, in_buf, weight_buf, out_buf, n, n_tokens, eps);
+    }
+
     /// In-pass variant of `dispatch_rmsnorm_into`. Records the dispatch
     /// into the caller-supplied compute pass instead of opening a new one.
     /// See `dispatch_rmsnorm_into` for semantics. Both buffers are f32
@@ -587,6 +624,32 @@ impl GpuEngine {
         };
         let params_buf = self.gpu.create_params_buffer(&params);
         let pipeline = &self.gpu.pipelines.rmsnorm_batch_packed_to_f32;
+        let bind = self.gpu.make_bind_group(
+            pipeline, &[in_buf, weight_buf, out_buf, &params_buf],
+        );
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(n_tokens as u32, 1, 1);
+    }
+
+    /// Phase C1: rmsnorm with f32 input, packed-f16 output. Used by
+    /// BitNet o_sub_norm where scratch.attn_out (f32 in C1) feeds the
+    /// packed scratch.normed (C1+).
+    pub fn dispatch_rmsnorm_f32_to_packed_in_pass(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        in_buf: &wgpu::Buffer,
+        weight_buf: &wgpu::Buffer,
+        out_buf: &wgpu::Buffer,
+        n: usize,
+        n_tokens: usize,
+        eps: f32,
+    ) {
+        let params = RmsNormBatchParams {
+            n: n as u32, eps, n_tokens: n_tokens as u32, _pad: 0,
+        };
+        let params_buf = self.gpu.create_params_buffer(&params);
+        let pipeline = &self.gpu.pipelines.rmsnorm_batch_f32_to_packed;
         let bind = self.gpu.make_bind_group(
             pipeline, &[in_buf, weight_buf, out_buf, &params_buf],
         );
@@ -680,6 +743,46 @@ impl GpuEngine {
 
     /// Shared-memory tiled matmul. See `shaders/matmul_shared.wgsl` for
     /// the kernel design. Same Params struct as the legacy variant.
+    /// Phase C1: matmul_shared variant that reads PACKED f16 input
+    /// (Q/K/V/O/gate/up projections after scratch.normed is packed).
+    /// Output stays f32 (scratch.q/k/v/projected/gate/up still f32
+    /// in C1). Same Params, same dispatch math.
+    fn dispatch_matmul_shared_pin_fout_inner_in_pass(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        float: &crate::layers::gpu_floatlinear::GpuFloatLinear,
+        in_buf: &wgpu::Buffer,
+        out_buf: &wgpu::Buffer,
+        n_tokens: usize,
+    ) {
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct MatmulParams { rows: u32, cols: u32, n_tokens: u32, _pad: u32 }
+        let params = MatmulParams {
+            rows: float.out_features() as u32,
+            cols: float.in_features() as u32,
+            n_tokens: n_tokens as u32,
+            _pad: 0,
+        };
+        let params_buf = self.gpu.create_params_buffer(&params);
+
+        let pipeline = &self.gpu.pipelines.matmul_shared_pin_fout;
+        let bind = self.gpu.make_bind_group(
+            pipeline,
+            &[float.weight_buffer(), in_buf, out_buf, &params_buf],
+        );
+
+        let rows = float.out_features();
+        const TILE_M: usize = 32;
+        const TILE_N: usize = 16;
+        let dx = ((rows + TILE_M - 1) / TILE_M) as u32;
+        let dy = ((n_tokens + TILE_N - 1) / TILE_N) as u32;
+
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(dx, dy, 1);
+    }
+
     fn dispatch_matmul_shared_inner_in_pass(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
@@ -791,6 +894,72 @@ impl GpuEngine {
         true
     }
 
+    /// Phase C1: packed-input decode-path matmul (per-output legacy
+    /// shader, packed scratch.normed input → f32 output). Picked when
+    /// caller has packed input and n_tokens < TILE_N=16.
+    fn dispatch_matmul_pin_inner_in_pass(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        float: &crate::layers::gpu_floatlinear::GpuFloatLinear,
+        in_buf: &wgpu::Buffer,
+        out_buf: &wgpu::Buffer,
+        n_tokens: usize,
+    ) {
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct MatmulParams { rows: u32, cols: u32, n_tokens: u32, _pad: u32 }
+        let params = MatmulParams {
+            rows: float.out_features() as u32,
+            cols: float.in_features() as u32,
+            n_tokens: n_tokens as u32,
+            _pad: 0,
+        };
+        let params_buf = self.gpu.create_params_buffer(&params);
+
+        let pipeline = &self.gpu.pipelines.matmul_pin;
+        let bind = self.gpu.make_bind_group(
+            pipeline,
+            &[float.weight_buffer(), in_buf, out_buf, &params_buf],
+        );
+
+        let rows = float.out_features();
+        let dx = (rows.min(65535)) as u32;
+        let dy = ((rows + 65534) / 65535) as u32;
+        let dz = n_tokens as u32;
+
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(dx, dy, dz);
+    }
+
+    /// Phase C1 routing fn: dispatch matmul with PACKED f16 input.
+    /// Routes to matmul_shared_pin_fout (prefill, n_tokens >= 16) or
+    /// matmul_pin (decode). Output stays f32 in C1.
+    pub fn dispatch_matmul_packed_input_in_pass(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        layer: &dyn LinearLayer,
+        in_buf: &wgpu::Buffer,
+        out_buf: &wgpu::Buffer,
+        n_tokens: usize,
+    ) {
+        let float = layer
+            .as_any()
+            .downcast_ref::<crate::layers::gpu_floatlinear::GpuFloatLinear>()
+            .unwrap_or_else(|| {
+                panic!(
+                    "dispatch_matmul_packed_input_in_pass: layer is not GpuFloatLinear \
+                     (concrete type: {:?})", layer)
+            });
+        let threshold: usize = std::env::var("CORTEX_MATMUL_SHARED_THRESHOLD")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+        if n_tokens >= threshold {
+            self.dispatch_matmul_shared_pin_fout_inner_in_pass(pass, float, in_buf, out_buf, n_tokens);
+        } else {
+            self.dispatch_matmul_pin_inner_in_pass(pass, float, in_buf, out_buf, n_tokens);
+        }
+    }
+
     fn dispatch_matmul_legacy_inner_in_pass(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
@@ -870,6 +1039,37 @@ impl GpuEngine {
         let bind = self.gpu.make_bind_group(
             pipeline,
             &[input_f32_buf, act_q_buf, act_scales_buf, &params_buf],
+        );
+
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(n_tokens as u32, 1, 1);
+    }
+
+    /// Phase C1: packed-f16 input variant of dispatch_quantize_absmax_batch_in_pass.
+    /// Used when scratch.normed becomes packed (C1+) and bitnet's
+    /// quantize fronts the matmul. Output (i8 packed + scales) layout
+    /// is identical to the f32-input version, so downstream
+    /// `dispatch_ternary_matmul_batch_in_pass` is unchanged.
+    pub fn dispatch_quantize_absmax_batch_pin_in_pass(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        input_packed_buf: &wgpu::Buffer,
+        act_q_buf: &wgpu::Buffer,
+        act_scales_buf: &wgpu::Buffer,
+        cols: usize,
+        n_tokens: usize,
+    ) {
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct QuantParams { cols: u32, n_tokens: u32 }
+        let params = QuantParams { cols: cols as u32, n_tokens: n_tokens as u32 };
+        let params_buf = self.gpu.create_params_buffer(&params);
+
+        let pipeline = &self.gpu.pipelines.quantize_absmax_batch_pin;
+        let bind = self.gpu.make_bind_group(
+            pipeline,
+            &[input_packed_buf, act_q_buf, act_scales_buf, &params_buf],
         );
 
         pass.set_pipeline(pipeline);
@@ -963,6 +1163,23 @@ impl GpuEngine {
         self.dispatch_linear_batch_in_pass(&mut pass, layer, in_buf, out_buf, n_tokens, ternary_scratch);
     }
 
+    /// Phase C1 encoder-level wrapper for packed-input linear-batch.
+    pub fn dispatch_linear_batch_packed_input_into(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        layer: &dyn LinearLayer,
+        in_packed_buf: &wgpu::Buffer,
+        out_buf: &wgpu::Buffer,
+        n_tokens: usize,
+        ternary_scratch: &TernaryScratch,
+    ) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_engine.linear_batch_packed_input.pass"),
+            timestamp_writes: None,
+        });
+        self.dispatch_linear_batch_packed_input_in_pass(&mut pass, layer, in_packed_buf, out_buf, n_tokens, ternary_scratch);
+    }
+
     /// In-pass variant. See `dispatch_linear_batch_into`.
     pub fn dispatch_linear_batch_in_pass(
         &self,
@@ -991,6 +1208,43 @@ impl GpuEngine {
         }
         panic!(
             "GpuEngine.dispatch_linear_batch_in_pass: layer is neither GpuFloatLinear \
+             nor GpuBitLinear (concrete type: {:?})",
+            layer
+        );
+    }
+
+    /// Phase C1: packed-f16 input router for linear-batch dispatch.
+    /// Routes float layers to `dispatch_matmul_packed_input_in_pass`
+    /// (matmul_shared_pin_fout for prefill, matmul_pin for decode) and
+    /// bitnet layers to the packed-input quantize front +
+    /// existing ternary matmul back. Output buffers remain f32 in C1.
+    pub fn dispatch_linear_batch_packed_input_in_pass(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        layer: &dyn LinearLayer,
+        in_packed_buf: &wgpu::Buffer,
+        out_buf: &wgpu::Buffer,
+        n_tokens: usize,
+        ternary_scratch: &TernaryScratch,
+    ) {
+        let any = layer.as_any();
+        if any.downcast_ref::<crate::layers::gpu_floatlinear::GpuFloatLinear>().is_some() {
+            self.dispatch_matmul_packed_input_in_pass(pass, layer, in_packed_buf, out_buf, n_tokens);
+            return;
+        }
+        if let Some(bit) = any.downcast_ref::<crate::layers::gpu_bitlinear::GpuBitLinear>() {
+            self.dispatch_quantize_absmax_batch_pin_in_pass(
+                pass, in_packed_buf, &ternary_scratch.activations_i8, &ternary_scratch.scales,
+                bit.in_features(), n_tokens,
+            );
+            self.dispatch_ternary_matmul_batch_in_pass(
+                pass, bit, &ternary_scratch.activations_i8, &ternary_scratch.scales,
+                out_buf, n_tokens,
+            );
+            return;
+        }
+        panic!(
+            "GpuEngine.dispatch_linear_batch_packed_input_in_pass: layer is neither GpuFloatLinear \
              nor GpuBitLinear (concrete type: {:?})",
             layer
         );
@@ -2333,22 +2587,23 @@ impl GpuEngine {
                 );
             }
 
-            // 1. attn_norm: hidden (packed Phase B) -> normed (f32 scratch)
-            self.dispatch_rmsnorm_packed_to_f32_in_pass(
+            // 1. attn_norm: hidden (packed Phase B) -> normed (packed Phase C1)
+            self.dispatch_rmsnorm_packed_to_packed_in_pass(
                 &mut pass, hidden_buf, &block_gpu.attn_norm_weight_buf, &scratch.normed,
                 embed_dim, n_tokens, block_gpu.attn_norm_eps,
             );
 
-            // 2-4. Q, K, V projections (+ optional Qwen-style biases)
-            self.dispatch_linear_batch_in_pass(&mut pass, attn.q_proj(), &scratch.normed, &scratch.q, n_tokens, &scratch.ternary);
+            // 2-4. Q, K, V projections (+ optional Qwen-style biases).
+            // C1: scratch.normed is packed; route through packed-input dispatcher.
+            self.dispatch_linear_batch_packed_input_in_pass(&mut pass, attn.q_proj(), &scratch.normed, &scratch.q, n_tokens, &scratch.ternary);
             if let Some(buf) = block_gpu.q_bias_buf.as_ref() {
                 self.dispatch_bias_add_in_pass(&mut pass, &scratch.q, buf, q_dim, n_tokens);
             }
-            self.dispatch_linear_batch_in_pass(&mut pass, attn.k_proj(), &scratch.normed, &scratch.k, n_tokens, &scratch.ternary);
+            self.dispatch_linear_batch_packed_input_in_pass(&mut pass, attn.k_proj(), &scratch.normed, &scratch.k, n_tokens, &scratch.ternary);
             if let Some(buf) = block_gpu.k_bias_buf.as_ref() {
                 self.dispatch_bias_add_in_pass(&mut pass, &scratch.k, buf, kv_dim, n_tokens);
             }
-            self.dispatch_linear_batch_in_pass(&mut pass, attn.v_proj(), &scratch.normed, &scratch.v, n_tokens, &scratch.ternary);
+            self.dispatch_linear_batch_packed_input_in_pass(&mut pass, attn.v_proj(), &scratch.normed, &scratch.v, n_tokens, &scratch.ternary);
             if let Some(buf) = block_gpu.v_bias_buf.as_ref() {
                 self.dispatch_bias_add_in_pass(&mut pass, &scratch.v, buf, kv_dim, n_tokens);
             }
@@ -2405,41 +2660,41 @@ impl GpuEngine {
 
             // 6.5 (BitNet) attention sub-norm before o_proj. Reuses
             // scratch.normed (free after Q/K/V consumed it in pass 1).
-            let o_proj_in: &wgpu::Buffer = if let Some(sub_norm_w) = block_gpu.o_sub_norm_weight_buf.as_ref() {
-                self.dispatch_rmsnorm_in_pass(
+            // C1: scratch.normed is packed; bitnet path uses f32→packed
+            // sub-norm shader. Non-bitnet path uses scratch.attn_out
+            // (f32) directly and routes through the f32-input dispatcher.
+            if let Some(sub_norm_w) = block_gpu.o_sub_norm_weight_buf.as_ref() {
+                self.dispatch_rmsnorm_f32_to_packed_in_pass(
                     &mut pass, &scratch.attn_out, sub_norm_w, &scratch.normed,
                     embed_dim, n_tokens, block_gpu.o_sub_norm_eps,
                 );
-                &scratch.normed
+                // 7a. O projection (BitNet): packed scratch.normed -> projected
+                self.dispatch_linear_batch_packed_input_in_pass(&mut pass, attn.o_proj(), &scratch.normed, &scratch.projected, n_tokens, &scratch.ternary);
             } else {
-                &scratch.attn_out
-            };
-
-            // 7. O projection: (sub-normed) attn_out -> projected
-            self.dispatch_linear_batch_in_pass(&mut pass, attn.o_proj(), o_proj_in, &scratch.projected, n_tokens, &scratch.ternary);
+                // 7b. O projection (non-BitNet): f32 scratch.attn_out -> projected
+                self.dispatch_linear_batch_in_pass(&mut pass, attn.o_proj(), &scratch.attn_out, &scratch.projected, n_tokens, &scratch.ternary);
+            }
 
             // 8. Residual: hidden += projected
             self.dispatch_add_in_pass(&mut pass, hidden_buf, &scratch.projected, embed_dim, n_tokens);
 
-            // 9. ffn_norm: hidden (packed Phase B) -> normed (f32 scratch)
-            self.dispatch_rmsnorm_packed_to_f32_in_pass(
+            // 9. ffn_norm: hidden (packed Phase B) -> normed (packed Phase C1)
+            self.dispatch_rmsnorm_packed_to_packed_in_pass(
                 &mut pass, hidden_buf, &block_gpu.ffn_norm_weight_buf, &scratch.normed,
                 embed_dim, n_tokens, block_gpu.ffn_norm_eps,
             );
 
             // 10-11. Gate / Up projections.
-            // Try the fused gate+up dispatch first (one input load,
-            // both outputs). Falls back to two separate dispatches if
-            // the layers aren't both GpuFloatLinear or shapes mismatch.
-            // Both paths route through dispatch_linear_batch_in_pass /
-            // matmul_shared for bitnet / non-fused cases.
+            // C1: scratch.normed is packed. Fused dispatcher already
+            // takes packed input; non-fused fallback routes through
+            // dispatch_linear_batch_packed_input_in_pass.
             let fused_ok = n_tokens >= 16 && self.dispatch_gate_up_fused_in_pass(
                 &mut pass, swiglu.gate_proj(), swiglu.up_proj(),
                 &scratch.normed, &scratch.gate, &scratch.up, n_tokens,
             );
             if !fused_ok {
-                self.dispatch_linear_batch_in_pass(&mut pass, swiglu.gate_proj(), &scratch.normed, &scratch.gate, n_tokens, &scratch.ternary);
-                self.dispatch_linear_batch_in_pass(&mut pass, swiglu.up_proj(),   &scratch.normed, &scratch.up,   n_tokens, &scratch.ternary);
+                self.dispatch_linear_batch_packed_input_in_pass(&mut pass, swiglu.gate_proj(), &scratch.normed, &scratch.gate, n_tokens, &scratch.ternary);
+                self.dispatch_linear_batch_packed_input_in_pass(&mut pass, swiglu.up_proj(),   &scratch.normed, &scratch.up,   n_tokens, &scratch.ternary);
             }
 
             // 12. silu(gate) * up
@@ -2543,24 +2798,22 @@ impl GpuEngine {
 
         // ===== ATTENTION SUBLAYER =====
 
-        // 1. attn_norm
-        self.dispatch_rmsnorm_into(
+        // 1. attn_norm (hidden packed Phase B → normed packed Phase C1)
+        self.dispatch_rmsnorm_packed_to_packed_into(
             encoder, hidden_buf, &block_gpu.attn_norm_weight_buf, &scratch.normed,
             embed_dim, n_tokens, block_gpu.attn_norm_eps,
         );
 
-        // 2-4. Q, K, V projections — dispatch_linear_batch_into routes by
-        // layer type (float vs ternary). See forward_block_gpu_inner for
-        // the full rationale.
-        self.dispatch_linear_batch_into(encoder, attn.q_proj(), &scratch.normed, &scratch.q, n_tokens, &scratch.ternary);
+        // 2-4. Q, K, V projections — packed-input dispatcher (C1).
+        self.dispatch_linear_batch_packed_input_into(encoder, attn.q_proj(), &scratch.normed, &scratch.q, n_tokens, &scratch.ternary);
         if let Some(buf) = block_gpu.q_bias_buf.as_ref() {
             self.dispatch_bias_add_into(encoder, &scratch.q, buf, n_heads * head_dim, n_tokens);
         }
-        self.dispatch_linear_batch_into(encoder, attn.k_proj(), &scratch.normed, &scratch.k, n_tokens, &scratch.ternary);
+        self.dispatch_linear_batch_packed_input_into(encoder, attn.k_proj(), &scratch.normed, &scratch.k, n_tokens, &scratch.ternary);
         if let Some(buf) = block_gpu.k_bias_buf.as_ref() {
             self.dispatch_bias_add_into(encoder, &scratch.k, buf, kv_dim, n_tokens);
         }
-        self.dispatch_linear_batch_into(encoder, attn.v_proj(), &scratch.normed, &scratch.v, n_tokens, &scratch.ternary);
+        self.dispatch_linear_batch_packed_input_into(encoder, attn.v_proj(), &scratch.normed, &scratch.v, n_tokens, &scratch.ternary);
         if let Some(buf) = block_gpu.v_bias_buf.as_ref() {
             self.dispatch_bias_add_into(encoder, &scratch.v, buf, kv_dim, n_tokens);
         }
@@ -2643,31 +2896,33 @@ impl GpuEngine {
             n_tokens * n_heads, head_dim,
         );
 
-        // 6.5 (BitNet b1.58) attention sub-norm before o_proj
-        let o_proj_in: &wgpu::Buffer = if let Some(sub_norm_w) = block_gpu.o_sub_norm_weight_buf.as_ref() {
-            self.dispatch_rmsnorm_into(
+        // 6.5 (BitNet b1.58) attention sub-norm before o_proj.
+        // C1: scratch.normed is packed; bitnet uses f32→packed sub-norm
+        // shader, non-bitnet path consumes scratch.attn_out (f32) directly.
+        if let Some(sub_norm_w) = block_gpu.o_sub_norm_weight_buf.as_ref() {
+            self.dispatch_rmsnorm_f32_to_packed_into(
                 encoder, &scratch.attn_out, sub_norm_w, &scratch.normed,
                 embed_dim, n_tokens, block_gpu.o_sub_norm_eps,
             );
-            &scratch.normed
+            // 7a. O projection (BitNet): packed normed → projected.
+            self.dispatch_linear_batch_packed_input_into(encoder, attn.o_proj(), &scratch.normed, &scratch.projected, n_tokens, &scratch.ternary);
         } else {
-            &scratch.attn_out
-        };
-
-        // 7. O projection
-        self.dispatch_linear_batch_into(encoder, attn.o_proj(), o_proj_in, &scratch.projected, n_tokens, &scratch.ternary);
+            // 7b. O projection (non-BitNet): f32 attn_out → projected.
+            self.dispatch_linear_batch_into(encoder, attn.o_proj(), &scratch.attn_out, &scratch.projected, n_tokens, &scratch.ternary);
+        }
 
         // 8. Residual
         self.dispatch_add_into(encoder, hidden_buf, &scratch.projected, embed_dim, n_tokens);
 
         // ===== FFN SUBLAYER (unchanged from f32 path apart from sub-norm) =====
 
-        self.dispatch_rmsnorm_into(
+        // ffn_norm: hidden packed → normed packed (C1)
+        self.dispatch_rmsnorm_packed_to_packed_into(
             encoder, hidden_buf, &block_gpu.ffn_norm_weight_buf, &scratch.normed,
             embed_dim, n_tokens, block_gpu.ffn_norm_eps,
         );
-        self.dispatch_linear_batch_into(encoder, swiglu.gate_proj(), &scratch.normed, &scratch.gate, n_tokens, &scratch.ternary);
-        self.dispatch_linear_batch_into(encoder, swiglu.up_proj(),   &scratch.normed, &scratch.up,   n_tokens, &scratch.ternary);
+        self.dispatch_linear_batch_packed_input_into(encoder, swiglu.gate_proj(), &scratch.normed, &scratch.gate, n_tokens, &scratch.ternary);
+        self.dispatch_linear_batch_packed_input_into(encoder, swiglu.up_proj(),   &scratch.normed, &scratch.up,   n_tokens, &scratch.ternary);
         self.dispatch_gate_mul_into(encoder, &scratch.gate, &scratch.up, &scratch.activated, intermediate, n_tokens, swiglu.activation());
 
         // 12.5 (BitNet b1.58) FFN sub-norm before down_proj
@@ -5278,6 +5533,13 @@ mod tests {
             contents: bytemuck::cast_slice(&input),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
+        // C1: fused gate+up shader takes packed-f16 input.
+        let input_packed = GpuDevice::pack_f16(&input);
+        let in_packed_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("test.fused.in_packed"),
+            contents: bytemuck::cast_slice(&input_packed),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
         let out_bytes = (n_tokens * rows * 4) as u64;
         let mk_out = |label: &'static str| gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
@@ -5307,20 +5569,24 @@ mod tests {
             label: Some("test.fused.enc"),
         });
 
-        // Reference: two separate shared dispatches.
+        // Reference: two separate shared dispatches with the same
+        // packed input the fused shader reads (C1: matmul_shared_pin_fout).
+        // Pinning both to the packed-input variant keeps the comparison
+        // apples-to-apples and avoids f16 quantization error showing up
+        // as a "fused vs reference" gap.
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("test.fused.ref_gate"),
                 timestamp_writes: None,
             });
-            engine.dispatch_matmul_shared_inner_in_pass(&mut pass, &gate_layer, &in_buf, &gate_ref, n_tokens);
+            engine.dispatch_matmul_shared_pin_fout_inner_in_pass(&mut pass, &gate_layer, &in_packed_buf, &gate_ref, n_tokens);
         }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("test.fused.ref_up"),
                 timestamp_writes: None,
             });
-            engine.dispatch_matmul_shared_inner_in_pass(&mut pass, &up_layer, &in_buf, &up_ref, n_tokens);
+            engine.dispatch_matmul_shared_pin_fout_inner_in_pass(&mut pass, &up_layer, &in_packed_buf, &up_ref, n_tokens);
         }
         encoder.copy_buffer_to_buffer(&gate_ref, 0, &stg_gr, 0, out_bytes);
         encoder.copy_buffer_to_buffer(&up_ref, 0, &stg_ur, 0, out_bytes);
@@ -5332,7 +5598,7 @@ mod tests {
                 timestamp_writes: None,
             });
             let ok = engine.dispatch_gate_up_fused_in_pass(
-                &mut pass, &gate_layer, &up_layer, &in_buf, &gate_fused, &up_fused, n_tokens,
+                &mut pass, &gate_layer, &up_layer, &in_packed_buf, &gate_fused, &up_fused, n_tokens,
             );
             assert!(ok, "fused dispatch should succeed on matching GpuFloatLinear pair");
         }

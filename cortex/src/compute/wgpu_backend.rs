@@ -202,11 +202,23 @@ pub struct Pipelines {
     pub matmul: wgpu::ComputePipeline,
     /// Shared-memory tiled matmul (16×16 output tile, TILE_K=16). Used
     /// for prefill (n_tokens >= 16); decode falls back to legacy matmul.
-    /// See `shaders/matmul_shared.wgsl`.
+    /// F32 input, F32 output. See `shaders/matmul_shared.wgsl`.
     pub matmul_shared: wgpu::ComputePipeline,
+    /// Phase C1: packed-input, f32-output variant of matmul_shared.
+    /// Used for matmuls that read packed scratch.normed (Q/K/V/O/gate/up
+    /// projections — i.e. everything except down_proj which still reads
+    /// f32 scratch.activated in C1). See `matmul_shared_pin_fout.wgsl`.
+    pub matmul_shared_pin_fout: wgpu::ComputePipeline,
+    /// Phase C1: packed-input variant of the per-output legacy matmul,
+    /// used for decode (n_tokens < TILE_N) reading packed scratch.normed.
+    pub matmul_pin: wgpu::ComputePipeline,
+    /// Phase C1: packed-input variant of quantize_absmax_batch. Used by
+    /// bitnet matmul fronts when reading packed scratch.normed.
+    pub quantize_absmax_batch_pin: wgpu::ComputePipeline,
     /// Fused gate + up SwiGLU projection. One dispatch reads input once,
     /// computes both gate and up outputs (2 rows × 2 projections per
     /// thread). Halves the input HBM bandwidth for the gate/up pair.
+    /// Phase C1: input is packed f16; outputs still f32 in C1.
     /// See `shaders/matmul_gate_up_shared.wgsl`.
     pub matmul_gate_up_shared: wgpu::ComputePipeline,
     pub rmsnorm_batch: wgpu::ComputePipeline,
@@ -217,6 +229,9 @@ pub struct Pipelines {
     /// output. Used by the FINAL norm (hidden_buf → normed_buf), both
     /// packed in Phase B.
     pub rmsnorm_batch_packed_to_packed: wgpu::ComputePipeline,
+    /// Phase C1: f32 input, packed f16 output. Used by BitNet
+    /// o_sub_norm (scratch.attn_out f32 → scratch.normed packed).
+    pub rmsnorm_batch_f32_to_packed: wgpu::ComputePipeline,
     pub rope_batch: wgpu::ComputePipeline,
     pub silu_mul_batch: wgpu::ComputePipeline,
     /// Batched ReLU²(gate) * up for BitNet b1.58 SwiGLU activations.
@@ -283,10 +298,14 @@ impl Pipelines {
             // Batch
             matmul: make(include_str!("shaders/matmul.wgsl"), "matmul"),
             matmul_shared: make(include_str!("shaders/matmul_shared.wgsl"), "matmul_shared"),
+            matmul_shared_pin_fout: make(include_str!("shaders/matmul_shared_pin_fout.wgsl"), "matmul_shared_pin_fout"),
+            matmul_pin: make(include_str!("shaders/matmul_pin.wgsl"), "matmul_pin"),
+            quantize_absmax_batch_pin: make(include_str!("shaders/quantize_absmax_batch_pin.wgsl"), "quantize_absmax_batch_pin"),
             matmul_gate_up_shared: make(include_str!("shaders/matmul_gate_up_shared.wgsl"), "matmul_gate_up_shared"),
             rmsnorm_batch: make(include_str!("shaders/rmsnorm_batch.wgsl"), "rmsnorm_batch"),
             rmsnorm_batch_packed_to_f32: make(include_str!("shaders/rmsnorm_batch_packed_to_f32.wgsl"), "rmsnorm_batch_packed_to_f32"),
             rmsnorm_batch_packed_to_packed: make(include_str!("shaders/rmsnorm_batch_packed_to_packed.wgsl"), "rmsnorm_batch_packed_to_packed"),
+            rmsnorm_batch_f32_to_packed: make(include_str!("shaders/rmsnorm_batch_f32_to_packed.wgsl"), "rmsnorm_batch_f32_to_packed"),
             rope_batch: make(include_str!("shaders/rope_batch.wgsl"), "rope_batch"),
             silu_mul_batch: make(include_str!("shaders/silu_mul_batch.wgsl"), "silu_mul_batch"),
             relu2_mul_batch: make(include_str!("shaders/relu2_mul_batch.wgsl"), "relu2_mul_batch"),

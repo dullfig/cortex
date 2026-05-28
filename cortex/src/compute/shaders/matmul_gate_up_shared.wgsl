@@ -47,7 +47,9 @@ struct Params {
 
 @group(0) @binding(0) var<storage, read> gate_weights: array<u32>;
 @group(0) @binding(1) var<storage, read> up_weights:   array<u32>;
-@group(0) @binding(2) var<storage, read> input_mat:    array<f32>;
+// Phase C1: input packed f16 (scratch.normed is packed). Outputs stay
+// f32 in C1 (scratch.gate/up still f32 until C2).
+@group(0) @binding(2) var<storage, read> input_mat:    array<u32>;
 @group(0) @binding(3) var<storage, read_write> gate_out: array<f32>;
 @group(0) @binding(4) var<storage, read_write> up_out:   array<f32>;
 @group(0) @binding(5) var<uniform> params: Params;
@@ -174,11 +176,16 @@ fn main(
             var v2: f32 = 0.0;
             var v3: f32 = 0.0;
             if (in_tok < n_tokens && in_col < cols) {
-                let base = in_tok * cols + in_col;
-                v0 = input_mat[base + 0u];
-                if (in_col + 1u < cols) { v1 = input_mat[base + 1u]; }
-                if (in_col + 2u < cols) { v2 = input_mat[base + 2u]; }
-                if (in_col + 3u < cols) { v3 = input_mat[base + 3u]; }
+                // Phase C1: input packed f16. Read 2 u32 = 4 f16.
+                let base_u32 = (in_tok * cols + in_col) / 2u;
+                let p0 = unpack2x16float(input_mat[base_u32]);
+                v0 = p0.x;
+                v1 = p0.y;
+                if (in_col + 2u < cols) {
+                    let p1 = unpack2x16float(input_mat[base_u32 + 1u]);
+                    v2 = p1.x;
+                    v3 = p1.y;
+                }
             }
             b_tile[load_tok][load_k_base + 0u] = v0;
             b_tile[load_tok][load_k_base + 1u] = v1;
