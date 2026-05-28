@@ -47,20 +47,31 @@ struct Params {
 
 @group(0) @binding(0) var<storage, read> gate_weights: array<u32>;
 @group(0) @binding(1) var<storage, read> up_weights:   array<u32>;
-// Phase C1: input packed f16 (scratch.normed is packed). Outputs stay
-// f32 in C1 (scratch.gate/up still f32 until C2).
+// Phase C1: input packed f16 (scratch.normed is packed).
+// Phase C2: outputs packed f16 (scratch.gate, scratch.up are packed).
+// Thread-row mapping changed from stride-16 (li, li+16) to adjacent
+// pairs (li*2, li*2+1) so each thread's two outputs pack cleanly into
+// one u32 — requires `rows` (intermediate_size) to be even, which
+// every supported model satisfies (Qwen 0.5B=4864, Qwen 3B=11008,
+// BitNet 2B=6912).
 @group(0) @binding(2) var<storage, read> input_mat:    array<u32>;
-@group(0) @binding(3) var<storage, read_write> gate_out: array<f32>;
-@group(0) @binding(4) var<storage, read_write> up_out:   array<f32>;
+@group(0) @binding(3) var<storage, read_write> gate_out: array<u32>;
+@group(0) @binding(4) var<storage, read_write> up_out:   array<u32>;
 @group(0) @binding(5) var<uniform> params: Params;
 
 const TILE_M: u32 = 32u;
 const TILE_N: u32 = 16u;
 const TILE_K: u32 = 16u;
+// Phase C2: pad row stride to TILE_K+1=17 to avoid shared-memory bank
+// conflicts on the adjacent-pair (li*2, li*2+1) MADD access pattern.
+// Stride-16 → words(32*li+k) → bank((32*li+k) mod 32) = k mod 32 →
+// 16-way bank conflict (all threads on same bank). Stride-17 →
+// words(34*li+k) → bank((2*li+k) mod 32) → conflict-free.
+const TILE_K_P: u32 = 17u;
 
-var<workgroup> a_gate_tile: array<array<f32, TILE_K>, TILE_M>;
-var<workgroup> a_up_tile:   array<array<f32, TILE_K>, TILE_M>;
-var<workgroup> b_tile:      array<array<f32, TILE_K>, TILE_N>;
+var<workgroup> a_gate_tile: array<array<f32, TILE_K_P>, TILE_M>;
+var<workgroup> a_up_tile:   array<array<f32, TILE_K_P>, TILE_M>;
+var<workgroup> b_tile:      array<array<f32, TILE_K_P>, TILE_N>;
 
 @compute @workgroup_size(16, 16, 1)
 fn main(
@@ -79,8 +90,10 @@ fn main(
     let n_tokens = params.n_tokens;
     let half_cols = cols / 2u;
 
-    let out_row_a: u32 = row_base + li;
-    let out_row_b: u32 = row_base + 16u + li;
+    // Phase C2 row-pair mapping: thread (li, lj) handles output rows
+    // (li*2, li*2+1) for token lj — adjacent so they pack into one u32.
+    let out_row_a: u32 = row_base + li * 2u;
+    let out_row_b: u32 = row_base + li * 2u + 1u;
     let out_tok:   u32 = tok_base + lj;
     let a_in_bounds: bool = (out_row_a < rows) && (out_tok < n_tokens);
     let b_in_bounds: bool = (out_row_b < rows) && (out_tok < n_tokens);
@@ -200,113 +213,124 @@ fn main(
         // sharing b_val[k] across all four accumulators per K.
         // Hand-unrolled (Phase 2's lesson: naga loops don't unroll
         // and the driver doesn't either, costing ~2x throughput).
-        let li_b: u32 = 16u + li;
+        // Phase C2: thread reads two ADJACENT rows (li*2, li*2+1) instead
+        // of two stride-16 rows, so the per-thread outputs pack directly.
+        let li_a: u32 = li * 2u;
+        let li_b: u32 = li * 2u + 1u;
 
         let b0 = b_tile[lj][0u];
-        sum_gate_a = sum_gate_a + a_gate_tile[li][0u]   * b0;
+        sum_gate_a = sum_gate_a + a_gate_tile[li_a][0u]   * b0;
         sum_gate_b = sum_gate_b + a_gate_tile[li_b][0u] * b0;
-        sum_up_a   = sum_up_a   + a_up_tile[li][0u]     * b0;
+        sum_up_a   = sum_up_a   + a_up_tile[li_a][0u]     * b0;
         sum_up_b   = sum_up_b   + a_up_tile[li_b][0u]   * b0;
 
         let b1 = b_tile[lj][1u];
-        sum_gate_a = sum_gate_a + a_gate_tile[li][1u]   * b1;
+        sum_gate_a = sum_gate_a + a_gate_tile[li_a][1u]   * b1;
         sum_gate_b = sum_gate_b + a_gate_tile[li_b][1u] * b1;
-        sum_up_a   = sum_up_a   + a_up_tile[li][1u]     * b1;
+        sum_up_a   = sum_up_a   + a_up_tile[li_a][1u]     * b1;
         sum_up_b   = sum_up_b   + a_up_tile[li_b][1u]   * b1;
 
         let b2 = b_tile[lj][2u];
-        sum_gate_a = sum_gate_a + a_gate_tile[li][2u]   * b2;
+        sum_gate_a = sum_gate_a + a_gate_tile[li_a][2u]   * b2;
         sum_gate_b = sum_gate_b + a_gate_tile[li_b][2u] * b2;
-        sum_up_a   = sum_up_a   + a_up_tile[li][2u]     * b2;
+        sum_up_a   = sum_up_a   + a_up_tile[li_a][2u]     * b2;
         sum_up_b   = sum_up_b   + a_up_tile[li_b][2u]   * b2;
 
         let b3 = b_tile[lj][3u];
-        sum_gate_a = sum_gate_a + a_gate_tile[li][3u]   * b3;
+        sum_gate_a = sum_gate_a + a_gate_tile[li_a][3u]   * b3;
         sum_gate_b = sum_gate_b + a_gate_tile[li_b][3u] * b3;
-        sum_up_a   = sum_up_a   + a_up_tile[li][3u]     * b3;
+        sum_up_a   = sum_up_a   + a_up_tile[li_a][3u]     * b3;
         sum_up_b   = sum_up_b   + a_up_tile[li_b][3u]   * b3;
 
         let b4 = b_tile[lj][4u];
-        sum_gate_a = sum_gate_a + a_gate_tile[li][4u]   * b4;
+        sum_gate_a = sum_gate_a + a_gate_tile[li_a][4u]   * b4;
         sum_gate_b = sum_gate_b + a_gate_tile[li_b][4u] * b4;
-        sum_up_a   = sum_up_a   + a_up_tile[li][4u]     * b4;
+        sum_up_a   = sum_up_a   + a_up_tile[li_a][4u]     * b4;
         sum_up_b   = sum_up_b   + a_up_tile[li_b][4u]   * b4;
 
         let b5 = b_tile[lj][5u];
-        sum_gate_a = sum_gate_a + a_gate_tile[li][5u]   * b5;
+        sum_gate_a = sum_gate_a + a_gate_tile[li_a][5u]   * b5;
         sum_gate_b = sum_gate_b + a_gate_tile[li_b][5u] * b5;
-        sum_up_a   = sum_up_a   + a_up_tile[li][5u]     * b5;
+        sum_up_a   = sum_up_a   + a_up_tile[li_a][5u]     * b5;
         sum_up_b   = sum_up_b   + a_up_tile[li_b][5u]   * b5;
 
         let b6 = b_tile[lj][6u];
-        sum_gate_a = sum_gate_a + a_gate_tile[li][6u]   * b6;
+        sum_gate_a = sum_gate_a + a_gate_tile[li_a][6u]   * b6;
         sum_gate_b = sum_gate_b + a_gate_tile[li_b][6u] * b6;
-        sum_up_a   = sum_up_a   + a_up_tile[li][6u]     * b6;
+        sum_up_a   = sum_up_a   + a_up_tile[li_a][6u]     * b6;
         sum_up_b   = sum_up_b   + a_up_tile[li_b][6u]   * b6;
 
         let b7 = b_tile[lj][7u];
-        sum_gate_a = sum_gate_a + a_gate_tile[li][7u]   * b7;
+        sum_gate_a = sum_gate_a + a_gate_tile[li_a][7u]   * b7;
         sum_gate_b = sum_gate_b + a_gate_tile[li_b][7u] * b7;
-        sum_up_a   = sum_up_a   + a_up_tile[li][7u]     * b7;
+        sum_up_a   = sum_up_a   + a_up_tile[li_a][7u]     * b7;
         sum_up_b   = sum_up_b   + a_up_tile[li_b][7u]   * b7;
 
         let b8 = b_tile[lj][8u];
-        sum_gate_a = sum_gate_a + a_gate_tile[li][8u]   * b8;
+        sum_gate_a = sum_gate_a + a_gate_tile[li_a][8u]   * b8;
         sum_gate_b = sum_gate_b + a_gate_tile[li_b][8u] * b8;
-        sum_up_a   = sum_up_a   + a_up_tile[li][8u]     * b8;
+        sum_up_a   = sum_up_a   + a_up_tile[li_a][8u]     * b8;
         sum_up_b   = sum_up_b   + a_up_tile[li_b][8u]   * b8;
 
         let b9 = b_tile[lj][9u];
-        sum_gate_a = sum_gate_a + a_gate_tile[li][9u]   * b9;
+        sum_gate_a = sum_gate_a + a_gate_tile[li_a][9u]   * b9;
         sum_gate_b = sum_gate_b + a_gate_tile[li_b][9u] * b9;
-        sum_up_a   = sum_up_a   + a_up_tile[li][9u]     * b9;
+        sum_up_a   = sum_up_a   + a_up_tile[li_a][9u]     * b9;
         sum_up_b   = sum_up_b   + a_up_tile[li_b][9u]   * b9;
 
         let b10 = b_tile[lj][10u];
-        sum_gate_a = sum_gate_a + a_gate_tile[li][10u]   * b10;
+        sum_gate_a = sum_gate_a + a_gate_tile[li_a][10u]   * b10;
         sum_gate_b = sum_gate_b + a_gate_tile[li_b][10u] * b10;
-        sum_up_a   = sum_up_a   + a_up_tile[li][10u]     * b10;
+        sum_up_a   = sum_up_a   + a_up_tile[li_a][10u]     * b10;
         sum_up_b   = sum_up_b   + a_up_tile[li_b][10u]   * b10;
 
         let b11 = b_tile[lj][11u];
-        sum_gate_a = sum_gate_a + a_gate_tile[li][11u]   * b11;
+        sum_gate_a = sum_gate_a + a_gate_tile[li_a][11u]   * b11;
         sum_gate_b = sum_gate_b + a_gate_tile[li_b][11u] * b11;
-        sum_up_a   = sum_up_a   + a_up_tile[li][11u]     * b11;
+        sum_up_a   = sum_up_a   + a_up_tile[li_a][11u]     * b11;
         sum_up_b   = sum_up_b   + a_up_tile[li_b][11u]   * b11;
 
         let b12 = b_tile[lj][12u];
-        sum_gate_a = sum_gate_a + a_gate_tile[li][12u]   * b12;
+        sum_gate_a = sum_gate_a + a_gate_tile[li_a][12u]   * b12;
         sum_gate_b = sum_gate_b + a_gate_tile[li_b][12u] * b12;
-        sum_up_a   = sum_up_a   + a_up_tile[li][12u]     * b12;
+        sum_up_a   = sum_up_a   + a_up_tile[li_a][12u]     * b12;
         sum_up_b   = sum_up_b   + a_up_tile[li_b][12u]   * b12;
 
         let b13 = b_tile[lj][13u];
-        sum_gate_a = sum_gate_a + a_gate_tile[li][13u]   * b13;
+        sum_gate_a = sum_gate_a + a_gate_tile[li_a][13u]   * b13;
         sum_gate_b = sum_gate_b + a_gate_tile[li_b][13u] * b13;
-        sum_up_a   = sum_up_a   + a_up_tile[li][13u]     * b13;
+        sum_up_a   = sum_up_a   + a_up_tile[li_a][13u]     * b13;
         sum_up_b   = sum_up_b   + a_up_tile[li_b][13u]   * b13;
 
         let b14 = b_tile[lj][14u];
-        sum_gate_a = sum_gate_a + a_gate_tile[li][14u]   * b14;
+        sum_gate_a = sum_gate_a + a_gate_tile[li_a][14u]   * b14;
         sum_gate_b = sum_gate_b + a_gate_tile[li_b][14u] * b14;
-        sum_up_a   = sum_up_a   + a_up_tile[li][14u]     * b14;
+        sum_up_a   = sum_up_a   + a_up_tile[li_a][14u]     * b14;
         sum_up_b   = sum_up_b   + a_up_tile[li_b][14u]   * b14;
 
         let b15 = b_tile[lj][15u];
-        sum_gate_a = sum_gate_a + a_gate_tile[li][15u]   * b15;
+        sum_gate_a = sum_gate_a + a_gate_tile[li_a][15u]   * b15;
         sum_gate_b = sum_gate_b + a_gate_tile[li_b][15u] * b15;
-        sum_up_a   = sum_up_a   + a_up_tile[li][15u]     * b15;
+        sum_up_a   = sum_up_a   + a_up_tile[li_a][15u]     * b15;
         sum_up_b   = sum_up_b   + a_up_tile[li_b][15u]   * b15;
 
         workgroupBarrier();
     }
 
-    if (a_in_bounds) {
-        gate_out[out_tok * rows + out_row_a] = sum_gate_a;
-        up_out[out_tok * rows + out_row_a]   = sum_up_a;
-    }
-    if (b_in_bounds) {
-        gate_out[out_tok * rows + out_row_b] = sum_gate_b;
-        up_out[out_tok * rows + out_row_b]   = sum_up_b;
+    // Phase C2: pack adjacent (row, row+1) outputs into one u32.
+    // Both a_in_bounds and b_in_bounds must hold to write a full pair.
+    // For partial-tile edges where only the lower row is valid, write
+    // pack(sum_a, 0) — the trailing slot is past the valid `rows`
+    // range so consumers never read it.
+    // The pair index is (row_base/2 + li): TILE_M=32 rows per M-tile
+    // = 16 pairs per M-tile; li selects which pair within the tile.
+    let rows_half = rows / 2u;
+    let pair_idx = out_tok * rows_half + (row_base / 2u + li);
+    if (a_in_bounds && b_in_bounds) {
+        gate_out[pair_idx] = pack2x16float(vec2<f32>(sum_gate_a, sum_gate_b));
+        up_out[pair_idx]   = pack2x16float(vec2<f32>(sum_up_a,   sum_up_b));
+    } else if (a_in_bounds) {
+        gate_out[pair_idx] = pack2x16float(vec2<f32>(sum_gate_a, 0.0));
+        up_out[pair_idx]   = pack2x16float(vec2<f32>(sum_up_a,   0.0));
     }
 }

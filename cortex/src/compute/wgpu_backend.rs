@@ -215,6 +215,15 @@ pub struct Pipelines {
     /// Phase C1: packed-input variant of quantize_absmax_batch. Used by
     /// bitnet matmul fronts when reading packed scratch.normed.
     pub quantize_absmax_batch_pin: wgpu::ComputePipeline,
+    /// Phase C2: packed-input + packed-output decode-path matmul.
+    pub matmul_pin_pout: wgpu::ComputePipeline,
+    /// Phase C2: packed-output variant of ternary_matmul_batch (BitNet
+    /// gate/up writes packed scratch.gate / scratch.up).
+    pub ternary_matmul_batch_pout: wgpu::ComputePipeline,
+    /// Phase C2: SiLU(gate)*up with packed gate/up/output buffers.
+    pub silu_mul_batch_packed: wgpu::ComputePipeline,
+    /// Phase C2: ReLU²(gate)*up packed variant (BitNet activation).
+    pub relu2_mul_batch_packed: wgpu::ComputePipeline,
     /// Fused gate + up SwiGLU projection. One dispatch reads input once,
     /// computes both gate and up outputs (2 rows × 2 projections per
     /// thread). Halves the input HBM bandwidth for the gate/up pair.
@@ -301,6 +310,10 @@ impl Pipelines {
             matmul_shared_pin_fout: make(include_str!("shaders/matmul_shared_pin_fout.wgsl"), "matmul_shared_pin_fout"),
             matmul_pin: make(include_str!("shaders/matmul_pin.wgsl"), "matmul_pin"),
             quantize_absmax_batch_pin: make(include_str!("shaders/quantize_absmax_batch_pin.wgsl"), "quantize_absmax_batch_pin"),
+            matmul_pin_pout: make(include_str!("shaders/matmul_pin_pout.wgsl"), "matmul_pin_pout"),
+            ternary_matmul_batch_pout: make(include_str!("shaders/ternary_matmul_batch_pout.wgsl"), "ternary_matmul_batch_pout"),
+            silu_mul_batch_packed: make(include_str!("shaders/silu_mul_batch_packed.wgsl"), "silu_mul_batch_packed"),
+            relu2_mul_batch_packed: make(include_str!("shaders/relu2_mul_batch_packed.wgsl"), "relu2_mul_batch_packed"),
             matmul_gate_up_shared: make(include_str!("shaders/matmul_gate_up_shared.wgsl"), "matmul_gate_up_shared"),
             rmsnorm_batch: make(include_str!("shaders/rmsnorm_batch.wgsl"), "rmsnorm_batch"),
             rmsnorm_batch_packed_to_f32: make(include_str!("shaders/rmsnorm_batch_packed_to_f32.wgsl"), "rmsnorm_batch_packed_to_f32"),
