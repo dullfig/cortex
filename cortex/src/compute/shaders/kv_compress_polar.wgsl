@@ -1,8 +1,10 @@
-// Compress an f32 K (or V) tensor into PolarQuant-compressed cache buffers.
+// Compress a packed-f16 K (or V) tensor into PolarQuant-compressed
+// cache buffers.
 //
-// Input:  [n_tokens, n_kv_heads, head_dim] f32 — output of the K (or V)
-//         projection (post-RoPE for K). Source for one layer, one kind
-//         (K or V).
+// Input:  [n_tokens, n_kv_heads, head_dim] packed f16 (2 per u32) —
+//         output of the K (or V) projection (post-RoPE for K) AND/OR
+//         a resident `GpuKvCache` layer buffer (Phase A made those
+//         packed too). One layer, one kind (K or V).
 // Output: angles[(start_pos+t) * n_kv_heads + h, :] packed 4 buckets per u32
 //         radius[(start_pos+t) * n_kv_heads + h] = mean polar magnitude
 //
@@ -37,7 +39,8 @@ struct Params {
 const MAX_PAIRS: u32 = 64u;
 const MAX_WORDS: u32 = 16u; // MAX_PAIRS / 4
 
-@group(0) @binding(0) var<storage, read>       k_in:     array<f32>;       // [n_tokens, n_kv_heads, head_dim]
+// Phase A: packed f16 (2 per u32). Cooperative pair-load below.
+@group(0) @binding(0) var<storage, read>       k_in:     array<u32>;       // [n_tokens, n_kv_heads, head_dim/2]
 @group(0) @binding(1) var<storage, read>       rotation: array<f32>;       // [head_dim, head_dim] row-major
 @group(0) @binding(2) var<storage, read_write> angles:   array<u32>;       // packed 4 per word
 @group(0) @binding(3) var<storage, read_write> radius:   array<f32>;       // [max_seq * n_kv_heads]
@@ -50,7 +53,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let h = idx % params.n_kv_heads;
     if (t >= params.n_tokens) { return; }
 
-    let k_base = (t * params.n_kv_heads + h) * params.head_dim;
+    // k_in is packed f16: 2 values per u32. Base index is in u32 slots,
+    // so divide head_dim by 2 for the per-head stride.
+    let head_dim_half = params.head_dim / 2u;
+    let k_base = (t * params.n_kv_heads + h) * head_dim_half;
 
     // Local packed-word accumulator. Initialized lane-by-lane below.
     var local_words: array<u32, MAX_WORDS>;
@@ -69,10 +75,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let row_y = (2u * i + 1u) * params.head_dim;
         var x: f32 = 0.0;
         var y: f32 = 0.0;
-        for (var col: u32 = 0u; col < params.head_dim; col = col + 1u) {
-            let k_v = k_in[k_base + col];
-            x = x + rotation[row_x + col] * k_v;
-            y = y + rotation[row_y + col] * k_v;
+        // Iterate by u32 slot (2 f16 per slot); unpack inline.
+        for (var slot: u32 = 0u; slot < head_dim_half; slot = slot + 1u) {
+            let pair = unpack2x16float(k_in[k_base + slot]);
+            let col_lo = slot * 2u;
+            let col_hi = col_lo + 1u;
+            x = x + rotation[row_x + col_lo] * pair.x + rotation[row_x + col_hi] * pair.y;
+            y = y + rotation[row_y + col_lo] * pair.x + rotation[row_y + col_hi] * pair.y;
         }
 
         let r_i = sqrt(x * x + y * y);

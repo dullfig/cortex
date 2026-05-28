@@ -1231,8 +1231,11 @@ mod tests {
             gpu.clone(), n_layers, n_kv_heads, head_dim, max_seq, seed_base,
         );
 
-        let k_in_buf = gpu.create_storage_buffer(bytemuck::cast_slice(&k_data), "test.k_in");
-        let v_in_buf = gpu.create_storage_buffer(bytemuck::cast_slice(&v_data), "test.v_in");
+        // Phase A: kv_compress_polar now reads packed-f16 input.
+        let k_packed = GpuDevice::pack_f16(&k_data);
+        let v_packed = GpuDevice::pack_f16(&v_data);
+        let k_in_buf = gpu.create_storage_buffer(bytemuck::cast_slice(&k_packed), "test.k_in");
+        let v_in_buf = gpu.create_storage_buffer(bytemuck::cast_slice(&v_packed), "test.v_in");
 
         let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("test.compress_layer"),
@@ -1306,22 +1309,18 @@ mod tests {
         assert_eq!(got_v_packed, expected_v_packed.as_slice(),
             "GPU V angles differ from CPU compress");
 
-        // Radius can drift by ~1 ULP between CPU and GPU because WGSL
-        // implementations may emit FMAs for the per-pair dot-product
-        // accumulations while plain Rust math doesn't. Bytes are not
-        // byte-equal but the absolute drift is bounded by a few ULPs of
-        // the operand magnitude. The downstream effect on attention
-        // scores is well below the 1e-5 score tolerance the score shader
-        // already validates against. Use 1e-6 abs tolerance here.
+        // Radius tolerance: 1e-3 abs to accommodate Phase A's f16 input
+        // quantization on top of WGSL FMA drift (was 1e-6 when the
+        // source buffer was f32).
         for (i, (&g, &e)) in got_k_radius.iter().zip(expected_k_radius.iter()).enumerate() {
             assert!(
-                (g - e).abs() < 1e-6,
+                (g - e).abs() < 1e-3,
                 "K radius[{i}] differs: gpu={g}, cpu={e}, |Δ|={}", (g - e).abs(),
             );
         }
         for (i, (&g, &e)) in got_v_radius.iter().zip(cpu_v_radius.iter()).enumerate() {
             assert!(
-                (g - e).abs() < 1e-6,
+                (g - e).abs() < 1e-3,
                 "V radius[{i}] differs: gpu={g}, cpu={e}, |Δ|={}", (g - e).abs(),
             );
         }
@@ -1585,8 +1584,11 @@ mod tests {
         let mut polar_kv = GpuPolarKvCache::new(
             gpu.clone(), /*n_layers*/ 1, n_kv_heads, head_dim, max_seq, seed_base,
         );
-        let k_in_buf = gpu.create_storage_buffer(bytemuck::cast_slice(&all_k), "test.k_in_full");
-        let v_in_buf = gpu.create_storage_buffer(bytemuck::cast_slice(&all_v), "test.v_in_full");
+        // Phase A: kv_compress_polar reads packed f16 input.
+        let all_k_packed = GpuDevice::pack_f16(&all_k);
+        let all_v_packed = GpuDevice::pack_f16(&all_v);
+        let k_in_buf = gpu.create_storage_buffer(bytemuck::cast_slice(&all_k_packed), "test.k_in_full");
+        let v_in_buf = gpu.create_storage_buffer(bytemuck::cast_slice(&all_v_packed), "test.v_in_full");
         let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("test.batch.compress_full"),
         });
@@ -1736,11 +1738,11 @@ mod tests {
 
         let gpu_out = readback_f32(&gpu, &final_buf, n_tokens * n_query_heads * head_dim);
 
-        // Per-element comparison. Float-order error scales with the inner
-        // sum of seq_len terms; at total=9 that's well below 1e-5.
+        // Per-element comparison. Phase A f16-input adds compress-stage
+        // quantization noise; bumped from 1e-5.
         for (i, (&g, &e)) in gpu_out.iter().zip(cpu_out.iter()).enumerate() {
             assert!(
-                (g - e).abs() < 1e-5,
+                (g - e).abs() < 1e-3,
                 "out[{i}] differs: gpu={g}, cpu={e}, |Δ|={}", (g - e).abs(),
             );
         }
@@ -1783,8 +1785,11 @@ mod tests {
         let mut polar_kv = GpuPolarKvCache::new(
             gpu.clone(), 1, n_kv_heads, head_dim, max_seq, seed_base,
         );
-        let k_in = gpu.create_storage_buffer(bytemuck::cast_slice(&all_k), "test.k1");
-        let v_in = gpu.create_storage_buffer(bytemuck::cast_slice(&all_v), "test.v1");
+        // Phase A: kv_compress_polar reads packed f16 input.
+        let all_k_packed = GpuDevice::pack_f16(&all_k);
+        let all_v_packed = GpuDevice::pack_f16(&all_v);
+        let k_in = gpu.create_storage_buffer(bytemuck::cast_slice(&all_k_packed), "test.k1");
+        let v_in = gpu.create_storage_buffer(bytemuck::cast_slice(&all_v_packed), "test.v1");
         let mut e = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("test.compress.full"),
         });
@@ -1852,8 +1857,11 @@ mod tests {
             for t in 0..oneshot_seq {
                 let one = oneshot_scores[head * oneshot_seq + t];
                 let bat = batch_scores[head * max_seq + t];
+                // Phase A: f16 input on the batch path introduces small
+                // per-pair quantization noise that the oneshot path
+                // (CPU-pre-rotated f32 rq) doesn't see; bumped from 1e-5.
                 assert!(
-                    (one - bat).abs() < 1e-5,
+                    (one - bat).abs() < 1e-3,
                     "head {head}, t {t}: oneshot={one}, batch={bat}",
                 );
             }

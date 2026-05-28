@@ -578,16 +578,21 @@ mod tests {
             layer_data.push((k_data, v_data, cpu));
         }
 
-        // Build f32 GpuKvCache and upload f32 K/V into each layer's buffers.
+        // Build GpuKvCache and upload K/V. Phase A made the cache packed
+        // f16, so we pack the f32 source data before write_buffer; the
+        // kv_compress_polar shader was updated in lockstep to read
+        // packed-f16 input from these buffers.
         let mut f32_cache = GpuKvCache::new(
             gpu.clone(), n_layers, n_kv_heads, head_dim, max_seq,
         );
         for (layer, (k_data, v_data, _)) in layer_data.iter().enumerate() {
+            let k_packed = GpuDevice::pack_f16(k_data);
+            let v_packed = GpuDevice::pack_f16(v_data);
             gpu.queue.write_buffer(
-                f32_cache.k_layer(layer), 0, bytemuck::cast_slice(k_data),
+                f32_cache.k_layer(layer), 0, bytemuck::cast_slice(&k_packed),
             );
             gpu.queue.write_buffer(
-                f32_cache.v_layer(layer), 0, bytemuck::cast_slice(v_data),
+                f32_cache.v_layer(layer), 0, bytemuck::cast_slice(&v_packed),
             );
         }
         f32_cache.advance(n_tokens);
@@ -640,12 +645,14 @@ mod tests {
             assert_eq!(got_v_packed, expected_v_packed.as_slice(),
                 "V angles mismatch on layer {layer}");
 
-            // Radius: 1e-6 abs tolerance (FMA drift, same as gpu_compress test).
+            // Radius tolerance: 1e-3 abs to accommodate Phase A's f16
+            // input quantization on top of FMA drift (was 1e-6 when the
+            // GpuKvCache source was f32).
             let got_k_radius_bytes = readback_buffer(&gpu, polar_kv.k_radius_layer(layer), radius_bytes);
             let got_k_radius: &[f32] = bytemuck::cast_slice(&got_k_radius_bytes);
             for (i, (&g, &e)) in got_k_radius.iter().zip(expected_k_radius.iter()).enumerate() {
                 assert!(
-                    (g - e).abs() < 1e-6,
+                    (g - e).abs() < 1e-3,
                     "K radius[{i}] layer {layer} differs: gpu={g}, cpu={e}",
                 );
             }
@@ -653,7 +660,7 @@ mod tests {
             let got_v_radius: &[f32] = bytemuck::cast_slice(&got_v_radius_bytes);
             for (i, (&g, &e)) in got_v_radius.iter().zip(expected_v_radius.iter()).enumerate() {
                 assert!(
-                    (g - e).abs() < 1e-6,
+                    (g - e).abs() < 1e-3,
                     "V radius[{i}] layer {layer} differs: gpu={g}, cpu={e}",
                 );
             }
