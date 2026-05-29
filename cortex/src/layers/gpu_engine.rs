@@ -283,7 +283,12 @@ impl BlockScratch {
             gate:      mk((n_tokens * intermediate * 2) as u64, "scratch.gate"),
             up:        mk((n_tokens * intermediate * 2) as u64, "scratch.up"),
             activated: mk((n_tokens * intermediate * 2) as u64, "scratch.activated"),
-            projected: mk((n_tokens * embed_dim * 2) as u64, "scratch.projected"),
+            // Option E extended: scratch.projected reverts to f32. BitNet
+            // matmul outputs (o_proj, down_proj) routinely exceed f16's
+            // 65504 ceiling; packing them saturates to Inf and propagates
+            // into hidden via the residual. Keeping projected f32 costs
+            // ~16MB of scratch on Qwen 3B at 2048 tokens — negligible.
+            projected: mk((n_tokens * embed_dim) as u64 * f32_bytes, "scratch.projected"),
             ternary,
         }
     }
@@ -2371,16 +2376,18 @@ impl GpuEngine {
         }
         let t_embed = t_start.elapsed();
 
-        // Phase B: hidden_buf and normed_buf are now packed f16 (2 per
-        // u32). Pack the embedding lookup before uploading.
-        // packed_u32_count = n_tokens * embed_dim / 2.
-        let packed_bytes = (hidden_init.len() * 2) as u64; // 2 bytes per f16
-        let hidden_packed = GpuDevice::pack_f16(&hidden_init);
+        // Option E (BitNet fix): hidden_buf reverts to f32 (BitNet's
+        // residual stream exceeds f16's 65504 ceiling, causing
+        // pack2x16float saturation → NaN cascade). normed_buf stays
+        // packed (one block's normed value, well-bounded).
+        let hidden_bytes = (hidden_init.len() * std::mem::size_of::<f32>()) as u64;
+        let packed_bytes = (hidden_init.len() * 2) as u64; // 2 bytes per f16 (for normed/staging)
         let hidden_buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("forward_with_cache.hidden"),
-            contents: bytemuck::cast_slice(&hidden_packed),
+            contents: bytemuck::cast_slice(&hidden_init),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
+        let _ = hidden_bytes;
         let normed_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("forward_with_cache.normed"),
             size: packed_bytes,
@@ -2447,16 +2454,18 @@ impl GpuEngine {
         // after each block, reads back after submit, counts Inf/NaN per
         // layer. Gated on CORTEX_DEBUG_HIDDEN_FINITE.
         let debug_finite = std::env::var("CORTEX_DEBUG_HIDDEN_FINITE").is_ok();
+        // Option E: hidden_buf is f32; capture buffers must match that size.
+        let hidden_bytes = (n_tokens * self.embed_dim * std::mem::size_of::<f32>()) as u64;
         let debug_captures: Vec<wgpu::Buffer> = if debug_finite {
             (0..n_layers).map(|i| self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(&format!("debug_finite.capture.{}", i)),
-                size: packed_bytes,
+                size: hidden_bytes,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             })).collect()
         } else { Vec::new() };
         let debug_stagings: Vec<wgpu::Buffer> = if debug_finite {
-            (0..n_layers).map(|_| self.gpu.create_staging_buffer(packed_bytes)).collect()
+            (0..n_layers).map(|_| self.gpu.create_staging_buffer(hidden_bytes)).collect()
         } else { Vec::new() };
         for i in 0..n_layers {
             let target = (cache.k_layer(i), cache.v_layer(i));
@@ -2467,16 +2476,16 @@ impl GpuEngine {
                 None, Some(target), capture, inject,
             );
             if debug_finite {
-                encoder.copy_buffer_to_buffer(&debug_captures[i], 0, &debug_stagings[i], 0, packed_bytes);
+                encoder.copy_buffer_to_buffer(&debug_captures[i], 0, &debug_stagings[i], 0, hidden_bytes);
             }
             if let (true, Some(t)) = (timer_active, self.timer.as_ref()) {
                 encoder.write_timestamp(&t.query_set, (i as u32) + 1);
             }
         }
-        // Final norm (Phase B): hidden_buf and normed_buf are both packed.
+        // Final norm — Option E: hidden_buf f32, normed_buf packed.
         {
             let mut pass = self.begin_timed_pass(&mut encoder, "final_norm");
-            self.dispatch_rmsnorm_packed_to_packed_in_pass(
+            self.dispatch_rmsnorm_f32_to_packed_in_pass(
                 &mut pass, &hidden_buf, &self.final_norm_weight_buf, &normed_buf,
                 self.embed_dim, n_tokens, self.final_norm_eps,
             );
@@ -2522,8 +2531,9 @@ impl GpuEngine {
                 "CORTEX_DEBUG_HIDDEN_FINITE: per-block hidden-state scan",
             );
             for i in 0..n_layers {
-                let unpacked = read_back_buffer_f16_unpack(
-                    &self.gpu, &debug_stagings[i], packed_bytes as usize,
+                // Option E: hidden_buf is f32; read back directly (no unpack).
+                let unpacked = read_back_buffer(
+                    &self.gpu, &debug_stagings[i], hidden_bytes as usize,
                 );
                 let mut n_inf: usize = 0;
                 let mut n_nan: usize = 0;
@@ -2672,12 +2682,11 @@ impl GpuEngine {
             hidden_init.extend_from_slice(&embed_data[off..off + self.embed_dim]);
         }
 
-        // ---- Allocate buffers (Phase B: packed f16) ----
+        // ---- Allocate buffers — Option E: hidden_buf f32, normed packed ----
         let packed_bytes = (hidden_init.len() * 2) as u64;
-        let hidden_packed = GpuDevice::pack_f16(&hidden_init);
         let hidden_buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("forward_full.hidden"),
-            contents: bytemuck::cast_slice(&hidden_packed),
+            contents: bytemuck::cast_slice(&hidden_init),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
         let normed_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -2714,7 +2723,8 @@ impl GpuEngine {
                 label: Some("forward_full.final_norm.pass"),
                 timestamp_writes: None,
             });
-            self.dispatch_rmsnorm_packed_to_packed_in_pass(
+            // Option E: hidden f32, normed packed.
+            self.dispatch_rmsnorm_f32_to_packed_in_pass(
                 &mut pass, &hidden_buf, &self.final_norm_weight_buf, &normed_buf,
                 self.embed_dim, n_tokens, self.final_norm_eps,
             );
@@ -2853,14 +2863,15 @@ impl GpuEngine {
 
             // Injection-phase hook (#6c). Broadcast-add a [embed_dim] delta
             // into every token's hidden BEFORE attn_norm.
+            // Option E: hidden_buf is f32 again — use f32 broadcast.
             if let Some(delta_buf) = pre_block_hidden_inject {
-                self.dispatch_add_broadcast_in_pass(
+                self.dispatch_add_broadcast_f32_in_pass(
                     &mut pass, hidden_buf, delta_buf, embed_dim, n_tokens,
                 );
             }
 
-            // 1. attn_norm: hidden (packed Phase B) -> normed (packed Phase C1)
-            self.dispatch_rmsnorm_packed_to_packed_in_pass(
+            // 1. attn_norm: hidden (f32 Option E) -> normed (packed).
+            self.dispatch_rmsnorm_f32_to_packed_in_pass(
                 &mut pass, hidden_buf, &block_gpu.attn_norm_weight_buf, &scratch.normed,
                 embed_dim, n_tokens, block_gpu.attn_norm_eps,
             );
@@ -2932,26 +2943,25 @@ impl GpuEngine {
             let mut pass = self.begin_timed_pass(encoder, "block.pass2");
 
             // 6.5 (BitNet) attention sub-norm before o_proj.
-            // C3: scratch.attn_out is packed; bitnet sub-norm becomes
-            // packed→packed (was f32→packed in C1/C2). Non-bitnet path
-            // routes packed attn_out → packed projected directly.
+            // Option E extended: scratch.projected is f32 → o_proj uses
+            // packed-input/f32-output dispatcher (the C1 variant).
             if let Some(sub_norm_w) = block_gpu.o_sub_norm_weight_buf.as_ref() {
                 self.dispatch_rmsnorm_packed_to_packed_in_pass(
                     &mut pass, &scratch.attn_out, sub_norm_w, &scratch.normed,
                     embed_dim, n_tokens, block_gpu.o_sub_norm_eps,
                 );
-                // 7a. O projection (BitNet): packed normed → packed projected
-                self.dispatch_linear_batch_packed_io_in_pass(&mut pass, attn.o_proj(), &scratch.normed, &scratch.projected, n_tokens, &scratch.ternary);
+                // 7a. O projection (BitNet): packed normed → f32 projected
+                self.dispatch_linear_batch_packed_input_in_pass(&mut pass, attn.o_proj(), &scratch.normed, &scratch.projected, n_tokens, &scratch.ternary);
             } else {
-                // 7b. O projection (non-BitNet): packed attn_out → packed projected
-                self.dispatch_linear_batch_packed_io_in_pass(&mut pass, attn.o_proj(), &scratch.attn_out, &scratch.projected, n_tokens, &scratch.ternary);
+                // 7b. O projection (non-BitNet): packed attn_out → f32 projected
+                self.dispatch_linear_batch_packed_input_in_pass(&mut pass, attn.o_proj(), &scratch.attn_out, &scratch.projected, n_tokens, &scratch.ternary);
             }
 
-            // 8. Residual: hidden (packed) += projected (packed, C3).
-            self.dispatch_add_packed_in_pass(&mut pass, hidden_buf, &scratch.projected, embed_dim, n_tokens);
+            // 8. Residual: hidden f32 += projected f32 (Option E extended).
+            self.dispatch_add_f32_in_pass(&mut pass, hidden_buf, &scratch.projected, embed_dim, n_tokens);
 
-            // 9. ffn_norm: hidden (packed Phase B) -> normed (packed Phase C1)
-            self.dispatch_rmsnorm_packed_to_packed_in_pass(
+            // 9. ffn_norm: hidden (f32 Option E) -> normed (packed).
+            self.dispatch_rmsnorm_f32_to_packed_in_pass(
                 &mut pass, hidden_buf, &block_gpu.ffn_norm_weight_buf, &scratch.normed,
                 embed_dim, n_tokens, block_gpu.ffn_norm_eps,
             );
@@ -2987,18 +2997,18 @@ impl GpuEngine {
                 &scratch.activated
             };
 
-            // 13. Down projection. C3: input and output both packed.
-            self.dispatch_linear_batch_packed_io_in_pass(&mut pass, swiglu.down_proj(), down_proj_in, &scratch.projected, n_tokens, &scratch.ternary);
+            // 13. Down projection — Option E extended: packed input, f32 output.
+            self.dispatch_linear_batch_packed_input_in_pass(&mut pass, swiglu.down_proj(), down_proj_in, &scratch.projected, n_tokens, &scratch.ternary);
 
-            // 14. Residual: hidden (packed) += projected (packed, C3).
-            self.dispatch_add_packed_in_pass(&mut pass, hidden_buf, &scratch.projected, embed_dim, n_tokens);
+            // 14. Residual: hidden f32 += projected f32 (Option E extended).
+            self.dispatch_add_f32_in_pass(&mut pass, hidden_buf, &scratch.projected, embed_dim, n_tokens);
             // pass2 ends here (drop)
         }
 
         // 15. (optional) capture post-block hidden state — shim hook point.
-        // Phase B+: hidden_buf is packed f16; capture is half size.
+        // Option E: hidden_buf is f32 again; capture is full f32 size.
         if let Some(capture_buf) = post_block_hidden_capture {
-            let bytes = (n_tokens * embed_dim * 2) as u64;
+            let bytes = (n_tokens * embed_dim * std::mem::size_of::<f32>()) as u64;
             encoder.copy_buffer_to_buffer(hidden_buf, 0, capture_buf, 0, bytes);
         }
     }
@@ -3054,7 +3064,8 @@ impl GpuEngine {
         // full discussion — same broadcast-add semantics, just on the
         // polar attention path.
         if let Some(delta_buf) = pre_block_hidden_inject {
-            self.dispatch_add_broadcast_into(
+            // Option E: hidden_buf is f32 — use f32 broadcast.
+            self.dispatch_add_broadcast_f32_into(
                 encoder, hidden_buf, delta_buf, self.embed_dim, n_tokens,
             );
         }
@@ -3088,8 +3099,8 @@ impl GpuEngine {
 
         // ===== ATTENTION SUBLAYER =====
 
-        // 1. attn_norm (hidden packed Phase B → normed packed Phase C1)
-        self.dispatch_rmsnorm_packed_to_packed_into(
+        // 1. attn_norm — Option E: hidden f32 → normed packed.
+        self.dispatch_rmsnorm_f32_to_packed_into(
             encoder, hidden_buf, &block_gpu.attn_norm_weight_buf, &scratch.normed,
             embed_dim, n_tokens, block_gpu.attn_norm_eps,
         );
@@ -3201,13 +3212,13 @@ impl GpuEngine {
             self.dispatch_linear_batch_into(encoder, attn.o_proj(), &scratch.attn_out, &scratch.projected, n_tokens, &scratch.ternary);
         }
 
-        // 8. Residual
-        self.dispatch_add_into(encoder, hidden_buf, &scratch.projected, embed_dim, n_tokens);
+        // 8. Residual — Option E extended: hidden f32 += projected f32.
+        self.dispatch_add_f32_into(encoder, hidden_buf, &scratch.projected, embed_dim, n_tokens);
 
         // ===== FFN SUBLAYER (unchanged from f32 path apart from sub-norm) =====
 
-        // ffn_norm: hidden packed → normed packed (C1)
-        self.dispatch_rmsnorm_packed_to_packed_into(
+        // ffn_norm — Option E: hidden f32 → normed packed.
+        self.dispatch_rmsnorm_f32_to_packed_into(
             encoder, hidden_buf, &block_gpu.ffn_norm_weight_buf, &scratch.normed,
             embed_dim, n_tokens, block_gpu.ffn_norm_eps,
         );
@@ -3230,7 +3241,8 @@ impl GpuEngine {
 
         // C2 down_proj: packed input, f32 output (scratch.projected is C3 target).
         self.dispatch_linear_batch_packed_input_into(encoder, swiglu.down_proj(), down_proj_in, &scratch.projected, n_tokens, &scratch.ternary);
-        self.dispatch_add_into(encoder, hidden_buf, &scratch.projected, embed_dim, n_tokens);
+        // Option E extended: hidden f32 += projected f32.
+        self.dispatch_add_f32_into(encoder, hidden_buf, &scratch.projected, embed_dim, n_tokens);
 
         // (optional) post-block hidden state capture — shim hook point.
         if let Some(capture_buf) = post_block_hidden_capture {
@@ -3852,6 +3864,81 @@ impl GpuEngine {
         pass.dispatch_workgroups(groups, 1, 1);
     }
 
+    /// Option E extended: fully-f32 residual add (both a and b f32).
+    /// Used when scratch.projected reverts to f32 alongside hidden_buf.
+    pub fn dispatch_add_f32_in_pass(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        a_buf: &wgpu::Buffer,
+        b_buf: &wgpu::Buffer,
+        n: usize,
+        n_tokens: usize,
+    ) {
+        let params = AddInplaceBatchParams { n: n as u32, n_tokens: n_tokens as u32 };
+        let params_buf = self.gpu.create_params_buffer(&params);
+        let pipeline = &self.gpu.pipelines.add_inplace_batch_f32;
+        let bind = self.gpu.make_bind_group(pipeline, &[a_buf, b_buf, &params_buf]);
+        let total = (n * n_tokens) as u32;
+        let groups = (total + 255) / 256;
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(groups, 1, 1);
+    }
+
+    /// Encoder-level wrapper for the fully-f32 residual add.
+    pub fn dispatch_add_f32_into(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        a_buf: &wgpu::Buffer,
+        b_buf: &wgpu::Buffer,
+        n: usize,
+        n_tokens: usize,
+    ) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_engine.add_f32.pass"),
+            timestamp_writes: None,
+        });
+        self.dispatch_add_f32_in_pass(&mut pass, a_buf, b_buf, n, n_tokens);
+    }
+
+    /// Option E (BitNet fix): residual add with f32 `a` (hidden_buf,
+    /// reverted from packed) and packed-f16 `b` (scratch.projected).
+    /// Each thread processes one u32 of `b` = 2 f32 positions in `a`.
+    pub fn dispatch_add_f32a_packedb_in_pass(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        a_buf: &wgpu::Buffer,
+        b_buf: &wgpu::Buffer,
+        n: usize,
+        n_tokens: usize,
+    ) {
+        let params = AddInplaceBatchParams { n: n as u32, n_tokens: n_tokens as u32 };
+        let params_buf = self.gpu.create_params_buffer(&params);
+        let pipeline = &self.gpu.pipelines.add_inplace_batch_f32a_packedb;
+        let bind = self.gpu.make_bind_group(pipeline, &[a_buf, b_buf, &params_buf]);
+        let total = (n * n_tokens / 2) as u32;
+        let groups = (total + 255) / 256;
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(groups, 1, 1);
+    }
+
+    /// Encoder-level wrapper for the f32a/packedb residual add.
+    pub fn dispatch_add_f32a_packedb_into(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        a_buf: &wgpu::Buffer,
+        b_buf: &wgpu::Buffer,
+        n: usize,
+        n_tokens: usize,
+    ) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_engine.add_f32a_packedb.pass"),
+            timestamp_writes: None,
+        });
+        self.dispatch_add_f32a_packedb_in_pass(&mut pass, a_buf, b_buf, n, n_tokens);
+    }
+
     /// Phase C3 encoder-level wrapper for packed add.
     pub fn dispatch_add_packed_into(
         &self,
@@ -3941,6 +4028,43 @@ impl GpuEngine {
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(groups, 1, 1);
+    }
+
+    /// Option E (BitNet fix): fully-f32 broadcast add (hidden_buf
+    /// reverted to f32; delta was always f32). One thread per element.
+    pub fn dispatch_add_broadcast_f32_in_pass(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        a_buf: &wgpu::Buffer,
+        delta_buf: &wgpu::Buffer,
+        n: usize,
+        n_tokens: usize,
+    ) {
+        let params = AddInplaceBatchParams { n: n as u32, n_tokens: n_tokens as u32 };
+        let params_buf = self.gpu.create_params_buffer(&params);
+        let pipeline = &self.gpu.pipelines.add_broadcast_batch_f32;
+        let bind = self.gpu.make_bind_group(pipeline, &[a_buf, delta_buf, &params_buf]);
+        let total = (n * n_tokens) as u32;
+        let groups = (total + 255) / 256;
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(groups, 1, 1);
+    }
+
+    /// Encoder-level wrapper for the f32 broadcast add.
+    pub fn dispatch_add_broadcast_f32_into(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        a_buf: &wgpu::Buffer,
+        delta_buf: &wgpu::Buffer,
+        n: usize,
+        n_tokens: usize,
+    ) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_engine.add_broadcast_f32.pass"),
+            timestamp_writes: None,
+        });
+        self.dispatch_add_broadcast_f32_in_pass(&mut pass, a_buf, delta_buf, n, n_tokens);
     }
 
     /// Upload an f32 slice to a GPU storage buffer. Used by callers
@@ -5720,12 +5844,11 @@ mod tests {
         let gpu_model = toy_float_model_for_gpu(gpu.clone());
         let engine = GpuEngine::with_max_seq(gpu_model, gpu.clone(), 16);
 
-        // Upload the same hidden-state input (Phase B: packed f16).
-        let bytes = (n_tokens * embed_dim * 2) as u64;
-        let hidden_packed = GpuDevice::pack_f16(&hidden_cpu);
+        // Upload the same hidden-state input. Option E: hidden_buf is f32.
+        let bytes = (n_tokens * embed_dim * std::mem::size_of::<f32>()) as u64;
         let hidden_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("test.hidden"),
-            contents: bytemuck::cast_slice(&hidden_packed),
+            contents: bytemuck::cast_slice(&hidden_cpu),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
         let staging = gpu.create_staging_buffer(bytes);
@@ -5751,11 +5874,11 @@ mod tests {
         encoder.copy_buffer_to_buffer(&hidden_buf, 0, &staging, 0, bytes);
         gpu.queue.submit(Some(encoder.finish()));
 
-        let gpu_out = read_back_buffer_f16_unpack(&gpu, &staging, bytes as usize);
+        // Option E: hidden_buf f32; read back directly.
+        let gpu_out = read_back_buffer(&gpu, &staging, bytes as usize);
 
         assert_eq!(cpu_out.len(), gpu_out.len(), "shape mismatch");
-        // Phase B: hidden_buf is packed f16 — additional rounding on top
-        // of the f16 weight quant. Loosen tolerance accordingly.
+        // Tolerance covers f16 quantization on weights and packed scratch.
         for (i, (c, g)) in cpu_out.iter().zip(&gpu_out).enumerate() {
             assert!(
                 (c - g).abs() < 0.05,
@@ -6364,12 +6487,11 @@ mod tests {
         // GPU path.
         let engine = GpuEngine::with_max_seq(gpu_model, gpu.clone(), 16);
 
-        // Phase B: hidden_buf is packed f16.
-        let bytes = (n_tokens * embed_dim * 2) as u64;
-        let hidden_packed = GpuDevice::pack_f16(&hidden_in);
+        // Option E: hidden_buf is f32 (reverted from Phase B packing).
+        let bytes = (n_tokens * embed_dim * std::mem::size_of::<f32>()) as u64;
         let hidden_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("test.bitnet.hidden"),
-            contents: bytemuck::cast_slice(&hidden_packed),
+            contents: bytemuck::cast_slice(&hidden_in),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
         let staging = gpu.create_staging_buffer(bytes);
@@ -6391,11 +6513,12 @@ mod tests {
         encoder.copy_buffer_to_buffer(&hidden_buf, 0, &staging, 0, bytes);
         gpu.queue.submit(Some(encoder.finish()));
 
-        let gpu_out = read_back_buffer_f16_unpack(&gpu, &staging, bytes as usize);
+        // Option E: hidden_buf f32 readback (no f16 unpack).
+        let gpu_out = read_back_buffer(&gpu, &staging, bytes as usize);
 
         // Tolerance: per-token absmax quantization rounding accumulates
-        // through Q/K/V/attention/o_proj/gate/up/down + Phase B f16
-        // hidden-buf rounding. Loosened to 5e-2.
+        // through Q/K/V/attention/o_proj/gate/up/down + packed scratch
+        // rounding. Loosened to 5e-2.
         assert_eq!(cpu_out.len(), gpu_out.len(), "shape mismatch");
         for (i, (c, g)) in cpu_out.iter().zip(&gpu_out).enumerate() {
             assert!(
