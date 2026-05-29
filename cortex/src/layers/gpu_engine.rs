@@ -2442,13 +2442,33 @@ impl GpuEngine {
         if let (true, Some(t)) = (timer_active, self.timer.as_ref()) {
             encoder.write_timestamp(&t.query_set, 0);
         }
+        // Phase B/C debug: per-block hidden-state finite check. Allocates
+        // a packed-sized capture buffer per layer, captures hidden_buf
+        // after each block, reads back after submit, counts Inf/NaN per
+        // layer. Gated on CORTEX_DEBUG_HIDDEN_FINITE.
+        let debug_finite = std::env::var("CORTEX_DEBUG_HIDDEN_FINITE").is_ok();
+        let debug_captures: Vec<wgpu::Buffer> = if debug_finite {
+            (0..n_layers).map(|i| self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("debug_finite.capture.{}", i)),
+                size: packed_bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })).collect()
+        } else { Vec::new() };
+        let debug_stagings: Vec<wgpu::Buffer> = if debug_finite {
+            (0..n_layers).map(|_| self.gpu.create_staging_buffer(packed_bytes)).collect()
+        } else { Vec::new() };
         for i in 0..n_layers {
             let target = (cache.k_layer(i), cache.v_layer(i));
             let inject = inject_deltas.get(i).and_then(|opt| opt.as_ref());
+            let capture = if debug_finite { Some(&debug_captures[i]) } else { None };
             self.forward_block_gpu_inner(
                 &mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch,
-                None, Some(target), None, inject,
+                None, Some(target), capture, inject,
             );
+            if debug_finite {
+                encoder.copy_buffer_to_buffer(&debug_captures[i], 0, &debug_stagings[i], 0, packed_bytes);
+            }
             if let (true, Some(t)) = (timer_active, self.timer.as_ref()) {
                 encoder.write_timestamp(&t.query_set, (i as u32) + 1);
             }
@@ -2490,6 +2510,49 @@ impl GpuEngine {
         // CPU finalize_logits (LM head matmul) which still consumes f32.
         let normed = read_back_buffer_f16_unpack(&self.gpu, &staging, packed_bytes as usize);
         let t_readback = t_start.elapsed() - t_pre_readback;
+
+        // Per-block hidden-state finite check (CORTEX_DEBUG_HIDDEN_FINITE).
+        // Reads back each layer's post-block hidden, unpacks f16, counts
+        // non-finite + tracks the running absmax. Locates the first layer
+        // where pack2x16float saturates to Inf (the gut-feel BitNet
+        // failure mode).
+        if debug_finite {
+            tracing::info!(
+                n_tokens, embed_dim = self.embed_dim, n_layers,
+                "CORTEX_DEBUG_HIDDEN_FINITE: per-block hidden-state scan",
+            );
+            for i in 0..n_layers {
+                let unpacked = read_back_buffer_f16_unpack(
+                    &self.gpu, &debug_stagings[i], packed_bytes as usize,
+                );
+                let mut n_inf: usize = 0;
+                let mut n_nan: usize = 0;
+                let mut max_abs: f32 = 0.0;
+                let mut first_bad_idx: Option<usize> = None;
+                for (idx, &v) in unpacked.iter().enumerate() {
+                    if v.is_nan() {
+                        n_nan += 1;
+                        if first_bad_idx.is_none() { first_bad_idx = Some(idx); }
+                    } else if v.is_infinite() {
+                        n_inf += 1;
+                        if first_bad_idx.is_none() { first_bad_idx = Some(idx); }
+                    } else {
+                        let a = v.abs();
+                        if a > max_abs { max_abs = a; }
+                    }
+                }
+                tracing::info!(
+                    layer = i, n_inf, n_nan, max_abs,
+                    first_bad_idx = ?first_bad_idx,
+                    total = unpacked.len(),
+                    "hidden state",
+                );
+                if n_inf + n_nan > 0 {
+                    tracing::warn!(layer = i,
+                        "FIRST LAYER with non-finite values — saturation point");
+                }
+            }
+        }
 
         // Read back timestamp markers (if active) and log the per-block
         // GPU waterfall + per-pass cumulative times.
@@ -2933,8 +2996,9 @@ impl GpuEngine {
         }
 
         // 15. (optional) capture post-block hidden state — shim hook point.
+        // Phase B+: hidden_buf is packed f16; capture is half size.
         if let Some(capture_buf) = post_block_hidden_capture {
-            let bytes = (n_tokens * embed_dim * std::mem::size_of::<f32>()) as u64;
+            let bytes = (n_tokens * embed_dim * 2) as u64;
             encoder.copy_buffer_to_buffer(hidden_buf, 0, capture_buf, 0, bytes);
         }
     }
