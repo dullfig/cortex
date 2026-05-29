@@ -224,6 +224,17 @@ pub struct Pipelines {
     pub silu_mul_batch_packed: wgpu::ComputePipeline,
     /// Phase C2: ReLU²(gate)*up packed variant (BitNet activation).
     pub relu2_mul_batch_packed: wgpu::ComputePipeline,
+    /// Phase C3: prefill matmul with packed input + packed output.
+    /// Used for Q/K/V/O/down projections when scratch.q/k/v/attn_out/
+    /// projected are packed.
+    pub matmul_shared_pin_pout: wgpu::ComputePipeline,
+    /// Phase C3: packed RoPE (in-place on packed q/k scratch).
+    pub rope_batch_packed: wgpu::ComputePipeline,
+    /// Phase C3: packed bias add (Qwen Q/K/V biases on packed scratch).
+    pub bias_add_batch_packed: wgpu::ComputePipeline,
+    /// Phase C3: packed residual add (both sides packed —
+    /// hidden_buf += scratch.projected when projected is packed).
+    pub add_inplace_batch_packed: wgpu::ComputePipeline,
     /// Fused gate + up SwiGLU projection. One dispatch reads input once,
     /// computes both gate and up outputs (2 rows × 2 projections per
     /// thread). Halves the input HBM bandwidth for the gate/up pair.
@@ -314,6 +325,10 @@ impl Pipelines {
             ternary_matmul_batch_pout: make(include_str!("shaders/ternary_matmul_batch_pout.wgsl"), "ternary_matmul_batch_pout"),
             silu_mul_batch_packed: make(include_str!("shaders/silu_mul_batch_packed.wgsl"), "silu_mul_batch_packed"),
             relu2_mul_batch_packed: make(include_str!("shaders/relu2_mul_batch_packed.wgsl"), "relu2_mul_batch_packed"),
+            matmul_shared_pin_pout: make(include_str!("shaders/matmul_shared_pin_pout.wgsl"), "matmul_shared_pin_pout"),
+            rope_batch_packed: make(include_str!("shaders/rope_batch_packed.wgsl"), "rope_batch_packed"),
+            bias_add_batch_packed: make(include_str!("shaders/bias_add_batch_packed.wgsl"), "bias_add_batch_packed"),
+            add_inplace_batch_packed: make(include_str!("shaders/add_inplace_batch_packed.wgsl"), "add_inplace_batch_packed"),
             matmul_gate_up_shared: make(include_str!("shaders/matmul_gate_up_shared.wgsl"), "matmul_gate_up_shared"),
             rmsnorm_batch: make(include_str!("shaders/rmsnorm_batch.wgsl"), "rmsnorm_batch"),
             rmsnorm_batch_packed_to_f32: make(include_str!("shaders/rmsnorm_batch_packed_to_f32.wgsl"), "rmsnorm_batch_packed_to_f32"),

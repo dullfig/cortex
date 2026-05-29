@@ -1,14 +1,13 @@
 // Write K and V vectors for multiple tokens into KV cache.
-// k_src/v_src: [n_tokens, kv_dim] f32 (scratch from RoPE / V proj)
+// Phase C3: k_src/v_src are now packed f16 too (scratch.k/v packed).
+// k_src/v_src: [n_tokens, kv_dim/2] u32 (packed f16)
 // k_cache/v_cache: [max_seq, kv_dim/2] u32 (packed f16, Phase A)
-// Pack 2 adjacent f32 K-values into one u32 via pack2x16float.
-// Dispatch: one thread per (token, kv_dim_pair). Total threads =
-// n_tokens × (kv_dim / 2). kv_dim is guaranteed even.
+// One thread copies one u32 slot per (tok, dim_pair).
 
 struct Params { kv_dim: u32, start_pos: u32, n_tokens: u32, _pad: u32 }
 
-@group(0) @binding(0) var<storage, read> k_src: array<f32>;
-@group(0) @binding(1) var<storage, read> v_src: array<f32>;
+@group(0) @binding(0) var<storage, read> k_src: array<u32>;
+@group(0) @binding(1) var<storage, read> v_src: array<u32>;
 @group(0) @binding(2) var<storage, read_write> k_cache: array<u32>;
 @group(0) @binding(3) var<storage, read_write> v_cache: array<u32>;
 @group(0) @binding(4) var<uniform> params: Params;
@@ -23,15 +22,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let tok = flat_u32 / kv_dim_half;
     let dim_pair = flat_u32 % kv_dim_half;
 
-    // Read two adjacent f32 source values per K and V.
-    let src_base = tok * params.kv_dim + dim_pair * 2u;
-    let k_lo = k_src[src_base];
-    let k_hi = k_src[src_base + 1u];
-    let v_lo = v_src[src_base];
-    let v_hi = v_src[src_base + 1u];
-
-    // Pack to f16 pair and write to cache at packed u32 index.
+    // Source already packed: one u32 = one pair.
+    let src_u32 = tok * kv_dim_half + dim_pair;
     let cache_u32 = (params.start_pos + tok) * kv_dim_half + dim_pair;
-    k_cache[cache_u32] = pack2x16float(vec2<f32>(k_lo, k_hi));
-    v_cache[cache_u32] = pack2x16float(vec2<f32>(v_lo, v_hi));
+    k_cache[cache_u32] = k_src[src_u32];
+    v_cache[cache_u32] = v_src[src_u32];
 }
