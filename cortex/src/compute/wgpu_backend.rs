@@ -190,8 +190,14 @@ pub struct Pipelines {
     pub attn_score_polar: wgpu::ComputePipeline,
     pub attn_value_polar: wgpu::ComputePipeline,
     pub derotate: wgpu::ComputePipeline,
+    /// Phase C3 polar: packed-f16 output variant of derotate (writes
+    /// packed scratch.attn_out).
+    pub derotate_packed: wgpu::ComputePipeline,
     pub kv_compress_polar: wgpu::ComputePipeline,
     pub rotate_q: wgpu::ComputePipeline,
+    /// Phase C3 polar: packed-f16 input variant of rotate_q (reads
+    /// packed scratch.q). Output rq stays f32.
+    pub rotate_q_packed: wgpu::ComputePipeline,
     pub attn_score_polar_batch: wgpu::ComputePipeline,
     pub attn_value_polar_batch: wgpu::ComputePipeline,
     // Batch (prefill)
@@ -291,8 +297,10 @@ impl Pipelines {
             attn_score_polar: make(include_str!("shaders/attn_score_polar.wgsl"), "attn_score_polar"),
             attn_value_polar: make(include_str!("shaders/attn_value_polar.wgsl"), "attn_value_polar"),
             derotate: make(include_str!("shaders/derotate.wgsl"), "derotate"),
+            derotate_packed: make(include_str!("shaders/derotate_packed.wgsl"), "derotate_packed"),
             kv_compress_polar: make(include_str!("shaders/kv_compress_polar.wgsl"), "kv_compress_polar"),
             rotate_q: make(include_str!("shaders/rotate_q.wgsl"), "rotate_q"),
+            rotate_q_packed: make(include_str!("shaders/rotate_q_packed.wgsl"), "rotate_q_packed"),
             attn_score_polar_batch: make(include_str!("shaders/attn_score_polar_batch.wgsl"), "attn_score_polar_batch"),
             attn_value_polar_batch: make(include_str!("shaders/attn_value_polar_batch.wgsl"), "attn_value_polar_batch"),
             // Batch

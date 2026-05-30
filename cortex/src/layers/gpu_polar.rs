@@ -309,6 +309,43 @@ pub fn dispatch_derotate(
     pass.dispatch_workgroups(groups, 1, 1);
 }
 
+/// Phase C3 polar variant of `dispatch_derotate`. Reads f32 weighted-V
+/// (from attn_value_polar_batch), writes packed-f16 attn_out.
+/// Half the thread count (one per d-pair).
+pub fn dispatch_derotate_packed(
+    gpu: &Arc<GpuDevice>,
+    encoder: &mut wgpu::CommandEncoder,
+    weighted_rot_buf: &wgpu::Buffer,
+    rotation_buf: &wgpu::Buffer,
+    out_buf: &wgpu::Buffer,
+    n_heads: usize,
+    head_dim: usize,
+) {
+    let params = DerotateParams {
+        n_heads: n_heads as u32,
+        head_dim: head_dim as u32,
+        _pad0: 0,
+        _pad1: 0,
+    };
+    let params_buf = gpu.create_params_buffer(&params);
+
+    let pipeline = &gpu.pipelines.derotate_packed;
+    let bind = gpu.make_bind_group(
+        pipeline,
+        &[weighted_rot_buf, rotation_buf, out_buf, &params_buf],
+    );
+
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("derotate_packed.dispatch"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, &bind, &[]);
+    // Half the threads — one per (head, d_pair).
+    let groups = ((n_heads * head_dim / 2) as u32 + 255) / 256;
+    pass.dispatch_workgroups(groups, 1, 1);
+}
+
 /// Run the compressed-V attention output path end-to-end and read back
 /// the de-rotated result.
 ///
@@ -430,6 +467,41 @@ pub fn dispatch_rotate_q(
 
     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
         label: Some("rotate_q.dispatch"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, &bind, &[]);
+    let threads = (n_tokens * n_heads * head_dim) as u32;
+    let groups = (threads + 255) / 256;
+    pass.dispatch_workgroups(groups, 1, 1);
+}
+
+/// Phase C3 polar variant of `dispatch_rotate_q`. Reads packed-f16 Q
+/// (post-C3 scratch.q), writes f32 rq. Same dispatch shape.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_rotate_q_packed(
+    gpu: &Arc<GpuDevice>,
+    encoder: &mut wgpu::CommandEncoder,
+    q_buf: &wgpu::Buffer,
+    rotation_buf: &wgpu::Buffer,
+    rq_buf: &wgpu::Buffer,
+    n_tokens: usize,
+    n_heads: usize,
+    head_dim: usize,
+) {
+    let params = RotateQParams {
+        n_tokens: n_tokens as u32,
+        n_heads: n_heads as u32,
+        head_dim: head_dim as u32,
+        _pad: 0,
+    };
+    let params_buf = gpu.create_params_buffer(&params);
+
+    let pipeline = &gpu.pipelines.rotate_q_packed;
+    let bind = gpu.make_bind_group(pipeline, &[q_buf, rotation_buf, rq_buf, &params_buf]);
+
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("rotate_q_packed.dispatch"),
         timestamp_writes: None,
     });
     pass.set_pipeline(pipeline);

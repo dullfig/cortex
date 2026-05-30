@@ -2753,19 +2753,6 @@ impl GpuEngine {
         post_block_hidden_capture: Option<&wgpu::Buffer>,
         pre_block_hidden_inject: Option<&wgpu::Buffer>,
     ) {
-        // Phase C3 TODO: this polar variant has not been updated for the
-        // packed scratch.q / scratch.k / scratch.v / scratch.attn_out.
-        // rotate_q.wgsl and derotate.wgsl still read/write f32; needs
-        // packed variants (or per-call pack/unpack scratch). Panicking
-        // here so callers don't silently get garbage. Polar retrieval
-        // (`--enable-polar-cache`) is disabled until this lands.
-        panic!(
-            "forward_block_gpu_polar_inner: not yet ported for Phase C3 \
-             packed scratch.q/k/v/attn_out — rotate_q and derotate \
-             shaders need packed variants. Disable --enable-polar-cache \
-             or revert to pre-C3 cortex."
-        );
-        #[allow(unreachable_code)] {
         let block = &self.cpu.blocks()[block_idx];
         let block_gpu = &self.blocks_gpu[block_idx];
         let attn = block.attention();
@@ -2815,38 +2802,39 @@ impl GpuEngine {
             embed_dim, n_tokens, block_gpu.attn_norm_eps,
         );
 
-        // 2-4. Q, K, V projections — packed-input dispatcher (C1).
-        self.dispatch_linear_batch_packed_input_into(encoder, attn.q_proj(), &scratch.normed, &scratch.q, n_tokens, &scratch.ternary);
+        // 2-4. Q, K, V projections — C3: packed input AND packed output.
+        self.dispatch_linear_batch_packed_io_into(encoder, attn.q_proj(), &scratch.normed, &scratch.q, n_tokens, &scratch.ternary);
         if let Some(buf) = block_gpu.q_bias_buf.as_ref() {
-            self.dispatch_bias_add_into(encoder, &scratch.q, buf, n_heads * head_dim, n_tokens);
+            self.dispatch_bias_add_packed_into(encoder, &scratch.q, buf, n_heads * head_dim, n_tokens);
         }
-        self.dispatch_linear_batch_packed_input_into(encoder, attn.k_proj(), &scratch.normed, &scratch.k, n_tokens, &scratch.ternary);
+        self.dispatch_linear_batch_packed_io_into(encoder, attn.k_proj(), &scratch.normed, &scratch.k, n_tokens, &scratch.ternary);
         if let Some(buf) = block_gpu.k_bias_buf.as_ref() {
-            self.dispatch_bias_add_into(encoder, &scratch.k, buf, kv_dim, n_tokens);
+            self.dispatch_bias_add_packed_into(encoder, &scratch.k, buf, kv_dim, n_tokens);
         }
-        self.dispatch_linear_batch_packed_input_into(encoder, attn.v_proj(), &scratch.normed, &scratch.v, n_tokens, &scratch.ternary);
+        self.dispatch_linear_batch_packed_io_into(encoder, attn.v_proj(), &scratch.normed, &scratch.v, n_tokens, &scratch.ternary);
         if let Some(buf) = block_gpu.v_bias_buf.as_ref() {
-            self.dispatch_bias_add_into(encoder, &scratch.v, buf, kv_dim, n_tokens);
+            self.dispatch_bias_add_packed_into(encoder, &scratch.v, buf, kv_dim, n_tokens);
         }
 
-        // 5. RoPE on Q and K
-        self.dispatch_rope_into(
+        // 5. RoPE on Q and K — C3 packed (in-place).
+        self.dispatch_rope_packed_into(
             encoder, &scratch.q, &self.rope_cos_buf, &self.rope_sin_buf,
             n_heads, head_dim, start_pos, n_tokens,
         );
-        self.dispatch_rope_into(
+        self.dispatch_rope_packed_into(
             encoder, &scratch.k, &self.rope_cos_buf, &self.rope_sin_buf,
             n_kv_heads, head_dim, start_pos, n_tokens,
         );
 
         // 5.5 Compress K and V into the polar cache at [start_pos, start_pos+n_tokens).
+        // kv_compress_polar reads packed-f16 input (fixed 2026-05-27).
         crate::layers::gpu_polar::compress_layer_into_polar(
             &self.gpu, encoder, polar_cache, block_idx,
             &scratch.k, &scratch.v, n_tokens, start_pos,
         );
 
-        // 6a. rotate_q: scratch.q (RoPE-rotated, original space) → rotated_buf (compressed/rotated space).
-        crate::layers::gpu_polar::dispatch_rotate_q(
+        // 6a. rotate_q: packed scratch.q → f32 rotated_buf.
+        crate::layers::gpu_polar::dispatch_rotate_q_packed(
             &self.gpu, encoder, &scratch.q, polar_cache.rotation_layer(block_idx), rotated_buf,
             n_tokens, n_heads, head_dim,
         );
@@ -2899,9 +2887,9 @@ impl GpuEngine {
             n_heads, n_kv_heads, head_dim, start_pos, n_tokens, attn_max_seq,
         );
 
-        // 6f. derotate: rotated_buf → scratch.attn_out (apply R^T per (tok, head))
+        // 6f. derotate: f32 rotated_buf → packed scratch.attn_out (C3).
         //     Treat (n_tokens * n_heads) as effective head count — R is per-layer.
-        crate::layers::gpu_polar::dispatch_derotate(
+        crate::layers::gpu_polar::dispatch_derotate_packed(
             &self.gpu, encoder, rotated_buf,
             polar_cache.rotation_layer(block_idx), &scratch.attn_out,
             n_tokens * n_heads, head_dim,
@@ -2936,7 +2924,6 @@ impl GpuEngine {
             let bytes = (n_tokens * embed_dim * 2) as u64;
             encoder.copy_buffer_to_buffer(hidden_buf, 0, capture_buf, 0, bytes);
         }
-        } // unreachable_code block (Phase C3 polar panic)
     }
 
     /// Build cos/sin lookup tables for the `rope_batch` shader, sized to
