@@ -1,39 +1,29 @@
 //! # cortex
 //!
-//! Universal local transformer engine with persistent memory.
+//! Float transformer inference engine with persistent memory. Targets
+//! Qwen-class GGUF models (Q4_K_M, F16, BF16, F32) on GPU via wgpu.
 //!
-//! Runs any GGUF model — ternary {-1,0,+1}, quantized (Q4_K, Q8), or float —
-//! through the same transformer stack. The `LinearLayer` trait abstracts over
-//! weight formats; the `ComputeBackend` trait abstracts over hardware.
+//! Note: ternary/BitNet inference moved to the sibling `ternary-rs`
+//! crate on 2026-05-29 (see git tag `bitnet-archive-2026-05-29` for
+//! the last cortex commit with the ternary path).
 //!
 //! ## Architecture
 //!
 //! ```text
 //! cortex
-//! ├── tensor        — weight storage: ternary (2-bit), quantized, float
-//! ├── ops           — kernels: ternary matmul, LUT, quantization, dequantization
+//! ├── tensor        — float weight storage (FloatTensor)
+//! ├── ops           — kernels: dequant (Q4_K → f32), polar quant, QJL
 //! ├── compute       — backends: scalar, AVX2, wgpu (GPU)
 //! ├── layers        — transformer stack: embedding → attention → FFN → output
-//! │   ├── linear    — trait: BitLinear | FloatLinear | WgpuLinear
+//! │   ├── linear    — FloatLinear (Q4_K, F16, F32 weights, f32 matmul)
 //! │   ├── attention — GQA with RoPE, causal mask, KV cache
-//! │   ├── swiglu    — gated FFN (SiLU or ReLU²)
+//! │   ├── swiglu    — gated FFN (SiLU activation)
 //! │   ├── model     — full TransformerModel: forward, generate, retrieve
 //! │   └── memory    — trait: persistent compressed memory (engram implements)
-//! ├── gguf          — GGUF v3 parser: TQ1_0, TQ2_0, I2S, Q4_K, F16, F32
+//! ├── gguf          — GGUF v3 parser: Q4_K, Q5_K, Q6_K, F16, BF16, F32
 //! ├── tokenizer     — BPE tokenizer from GGUF metadata
-//! └── loader        — load_model(): GGUF → detect weights → pick LinearLayer → go
+//! └── loader        — load_model(): GGUF → FloatLinear → go
 //! ```
-//!
-//! ## Model support
-//!
-//! The GGUF loader auto-detects weight types and selects the right `LinearLayer`:
-//!
-//! | Weight type        | LinearLayer   | Compute          |
-//! |--------------------|---------------|------------------|
-//! | TQ1_0, TQ2_0, I2S | `BitLinear`   | CPU (AVX2/scalar) |
-//! | Q4_K, Q5_K, Q6_K  | `FloatLinear` | CPU (dequant+f32) |
-//! | F16, BF16, F32     | `FloatLinear` | CPU or GPU        |
-//! | Any (with GPU)     | `WgpuLinear`  | GPU (WGPU shaders) |
 //!
 //! ## Memory (optional)
 //!
@@ -49,7 +39,6 @@
 //! ## Lineage
 //!
 //! cortex absorbs and generalizes:
-//! - **ternary-rs**: ternary kernels, BitLinear, GGUF loader, full transformer stack
 //! - **engram**: compressed KV cache (PolarQuant), tiered memory, retrieval, consolidation
 //! - **neuralkv-core** (GPU path): WGPU shaders for matmul, attention, FFN
 
@@ -61,7 +50,7 @@ pub mod gguf;
 pub mod tokenizer;
 pub mod loader;
 
-pub use tensor::{TernaryTensor, ActivationTensor, Ternary};
+pub use tensor::FloatTensor;
 pub use gguf::{GgufFile, GgufError, GgmlType, TensorInfo, ModelConfig, MetadataValue};
 pub use tokenizer::Tokenizer;
 pub use loader::{load_model, LoadedModel};

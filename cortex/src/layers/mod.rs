@@ -1,20 +1,17 @@
-//! Neural network layers for universal transformer inference.
+//! Neural network layers for cortex transformer inference.
 //!
 //! Each layer operates on the tensor types from `tensor.rs` using the
 //! kernels from `ops/`. The layers compose to build a full transformer
 //! forward pass in `transformer.rs`.
 //!
-//! The `linear` trait abstracts over weight formats (ternary, quantized, float).
+//! The `linear` trait abstracts over float weight formats (Q4_K, F16, F32).
 //! The `memory` trait adds optional persistent associative memory.
 
 pub mod attention;
-pub mod bitlinear;
 #[cfg(feature = "memory")]
 pub mod engram_memory;
 pub mod ffn;
 pub mod floatlinear;
-#[cfg(feature = "gpu")]
-pub mod gpu_bitlinear;
 #[cfg(feature = "gpu")]
 pub mod gpu_engine;
 #[cfg(feature = "gpu")]

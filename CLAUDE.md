@@ -1,10 +1,12 @@
 > **Cross-session coordination:** Before making any design/scope decision, read `C:\Users\danu\.claude\projects\C--src-ringhub-integration\memory\MEMORY.md` first — that folder is the shared brain across all Claude sessions on this project. Decisions pinned there supersede anything in this repo's older docs.
 >
 > **If something has happened to Daniel:** read `C:\src\CARETAKER.md` — the project's caretaker-handoff document.
+>
+> **2026-05-29: BitNet un-merge.** The ternary/BitNet inference path moved out of cortex into the sibling `ternary-rs` crate. Cortex is now a float-only Qwen-class GPU transformer (Q4_K_M, F16, BF16, F32). Architectural rationale: `project_training_time_representation.md` (pinned in integration repo) — representation choices belong at training time, not runtime polymorphism. Pre-excision cortex is preserved at git tag `bitnet-archive-2026-05-29` (commit e1e2dc1); GPU port artifacts went to `ternary-rs/incoming-cortex-gpu/` for ternary-rs's Stage 1.
 
 # cortex
 
-Universal local transformer engine with persistent memory. Runs any GGUF model — ternary, quantized, or float.
+Float transformer inference engine with persistent memory. Targets Qwen-class GGUF models on GPU via wgpu.
 
 ## Workspace
 
@@ -39,39 +41,35 @@ AgentOS integration: add as `LlmClient::Local(CortexLocal)` variant in `agentos-
 
 ## Lineage
 
-cortex absorbs and generalizes three projects:
-- **ternary-rs** → ternary kernels, BitLinear, GGUF loader, full transformer stack (DONE)
+cortex absorbs and generalizes:
 - **engram** → compressed KV cache (PolarQuant + QJL CPU side, DONE);
   tiered memory + bidirectional-attention retrieval + consolidation (TODO)
-- **neuralkv-core** (GPU path) → WGPU shaders for matmul, attention, FFN (TODO)
+- **neuralkv-core** (GPU path) → WGPU shaders for matmul, attention, FFN (DONE for matmul/attention/FFN)
+
+Ternary/BitNet inference: see `ternary-rs` (un-merged 2026-05-29).
 
 ## Architecture (cortex core)
 
-### Core (from ternary-rs)
-- **Tensor** (`cortex/src/tensor.rs`) — 2-bit packed ternary, 8-bit quantized activations, float tensors
-- **I2S Kernel** (`cortex/src/ops/matmul.rs`) — Ternary matvec via conditional add/sub/skip
-- **LUT Kernel** (`cortex/src/ops/lut.rs`) — Lookup table kernel, zero arithmetic in hot loop
-- **GGUF** (`cortex/src/gguf.rs`) — Parser for TQ1_0, TQ2_0, I2S, Q4_K, F16, F32, BF16
-- **Loader** (`cortex/src/loader.rs`) — `load_model()`: GGUF → auto-detect → right LinearLayer → go
+### Core
+- **Tensor** (`cortex/src/tensor.rs`) — `FloatTensor` (f32)
+- **GGUF** (`cortex/src/gguf.rs`) — Parser for Q4_K, Q5_K, Q6_K, F16, F32, BF16
+- **Loader** (`cortex/src/loader.rs`) — `load_model()`: GGUF → FloatLinear → go
 
 ### Layers
-- **LinearLayer trait** (`cortex/src/layers/linear.rs`) — the universal seam: BitLinear | FloatLinear | WgpuLinear
-- **BitLinear** (`cortex/src/layers/bitlinear.rs`) — ternary linear: quantize → ternary matmul → rescale
+- **LinearLayer trait** (`cortex/src/layers/linear.rs`) — single-impl seam (effectively `FloatLinear` only); kept for the trait shape pinkies depend on
 - **FloatLinear** (`cortex/src/layers/floatlinear.rs`) — dequantized float linear (Q4_K, F16, F32)
+- **GpuFloatLinear** (`cortex/src/layers/gpu_floatlinear.rs`) — GPU-resident f16-packed weights, GPU matmul
 - **Attention** (`cortex/src/layers/attention.rs`) — GQA with RoPE, causal mask, KV cache
-- **SwiGLU** (`cortex/src/layers/swiglu.rs`) — gated FFN (SiLU or ReLU²)
+- **SwiGLU** (`cortex/src/layers/swiglu.rs`) — gated FFN (SiLU)
 - **TransformerModel** (`cortex/src/layers/model.rs`) — full forward pass, generate, forward_cached
 - **Memory trait** (`cortex/src/layers/memory.rs`) — TransformerMemory: ingest, retrieve, consolidate
 
 ### Compute Backends
-- **Scalar** (`cortex/src/compute/scalar.rs`) — portable fallback
-- **AVX2** (`cortex/src/compute/avx2.rs`) — x86-64 SIMD
-- **WGPU** (`cortex/src/compute/wgpu_backend.rs`) — GPU via Vulkan/DX12/Metal
+- **WGPU** (`cortex/src/compute/wgpu_backend.rs`) — GPU via Vulkan/DX12/Metal (the only backend now; CPU scalar/AVX2 backends were ternary-only and left with the BitNet un-merge)
 
 ### TurboQuant KV compression (from engram)
 - **PolarQuant** (`cortex/src/ops/polar.rs`) — random orthogonal rotation +
-  3-bit polar angle quantization. Stage 1: ~7.5x reduction (u8-per-angle;
-  ~12x with future bit-packing).
+  3-bit polar angle quantization. Stage 1: ~7.5x reduction.
 - **QJL** (`cortex/src/ops/qjl.rs`) — 1-bit sign-of-projection residual
   correction. Stage 2: refines attention dot products.
 - **QuantizedKvCache** (`cortex/src/layers/quantized_kv_cache.rs`) —
@@ -85,10 +83,9 @@ cortex absorbs and generalizes three projects:
 
 ## Key Invariants
 
-- `LinearLayer` is the abstraction point: ternary or float, the transformer doesn't care
 - Memory uses the SAME model's Q/K projections — one embedding space
-- GGUF auto-detection: TQ1_0/TQ2_0 → BitLinear, Q4_K/F16/F32 → FloatLinear
-- All f32 at layer boundaries — no custom tensor framework lock-in
+- GGUF: Q4_K/Q5_K/Q6_K/F16/BF16/F32 → FloatLinear (dequantized at load)
+- All f32 at layer boundaries (activations may be packed-f16 internally for bandwidth)
 - Zero unsafe
 
 ## Public API
@@ -107,15 +104,15 @@ let response = provider.complete(&request)?;
 
 ## Testing
 
-393 tests covering: ternary packing, matmul kernels, quantization, GGUF parsing,
-layer forward passes, attention, RoPE, SwiGLU, full model forward, sampler,
-retrieval (forward_traced + attention-score ranking), TurboQuant compression
-(PolarQuant + QJL + QuantizedKvCache + GPU score/value/derotate shaders +
-algorithm-quality cosine pinning + resident GpuPolarKvCache storage +
-resident dispatchers byte-equal to oneshot + GPU prefill compress shader +
-GPU-only f32→polar conversion + multi-token causal-masked batch shaders +
-polar trace forward through full model), hidden-state extraction hooks
-(per-block + final post-norm) for shim runtime, ort link smoke.
+Workspace tests cover: GGUF parsing, layer forward passes, attention,
+RoPE, SwiGLU, full model forward, sampler, retrieval (forward_traced +
+attention-score ranking), TurboQuant compression (PolarQuant + QJL +
+QuantizedKvCache + GPU score/value/derotate shaders + algorithm-quality
+cosine pinning + resident GpuPolarKvCache storage + resident dispatchers
+byte-equal to oneshot + GPU prefill compress shader + GPU-only f32→polar
+conversion + multi-token causal-masked batch shaders + polar trace
+forward through full model), hidden-state extraction hooks (per-block +
+final post-norm) for shim runtime, ort link smoke.
 
 For GPU-heavy tests, prefer `cargo test --workspace -- --test-threads=1`
 to avoid VRAM contention between concurrently-running GPU tests on a
@@ -125,160 +122,32 @@ Run all: `cargo test --workspace`
 
 ## Roadmap
 
-- [x] Full transformer forward pass (ternary + float)
+- [x] Full transformer forward pass (float)
 - [x] KV cache for autoregressive generation
 - [x] Token sampler (top-k, top-p, temperature)
 - [x] TransformerMemory trait definition
 - [x] cortex-cloud: OpenAI-compatible HTTP server
 - [x] cortex-local: in-process provider for AgentOS
 - [x] Move QuantizedKvCache from engram into cortex (CPU side)
-- [x] GPU score shader for compressed K (`attn_score_polar.wgsl` +
-      `gpu_polar::attn_score_polar_oneshot`); matches CPU `dot_key` within 1e-5
-- [x] GPU value/derotate shaders for compressed V
-      (`attn_value_polar.wgsl` + `derotate.wgsl`); matches CPU dequant+aggregate
-      at seq_len=4096 within 1e-3 (float-order error scales O(seq_len))
-- [x] Resident `GpuPolarKvCache` storage (per-layer K/V angle+radius
-      buffers + per-layer rotation matrices); ~7x VRAM vs f32 GpuKvCache
-      on Qwen 3B shape; byte-layout compatible with the oneshot dispatchers
-- [x] Resident dispatchers (`attn_score_polar_resident` /
-      `attn_value_polar_resident`) that take `&GpuPolarKvCache` + a
-      layer index; output byte-equal to the oneshot path
-- [x] GPU prefill compress shader (`kv_compress_polar.wgsl` +
-      `compress_layer_into_polar`); rotates + polar-quantizes f32 K/V
-      directly into the resident polar buffers, no CPU round-trip;
-      angles byte-equal to CPU `append_one`, radius matches within 1
-      ULP (FMA tolerance)
-- [x] `GpuPolarKvCache::populate_from_f32_cache_gpu` — convert a
-      populated f32 `GpuKvCache` to a polar cache via the compress
-      shader (per-layer, all-on-GPU). Unblocks the cortex-cloud
-      retrieval path: prefill stays f32, then a one-time conversion
-      hands the polar cache to subsequent retrieve queries
-- [x] Multi-token causal-masked batch shaders: `rotate_q.wgsl` +
-      `attn_score_polar_batch.wgsl` + `attn_value_polar_batch.wgsl`
-      (derotate.wgsl reused for the multi-token output by treating
-      `n_tokens * n_query_heads` as effective head count). Full
-      5-stage GPU pipeline matches CPU reference within 1e-5
-- [x] `forward_full_gpu_polar_traced` — polar-aware traced forward
-      that runs every block through `forward_block_gpu_polar_inner`:
-      f32 RMSNorm + Q/K/V projections + RoPE, then GPU compress writes
-      query K/V into the polar cache, then the polar attention chain
-      (rotate_q → score_polar_batch → softmax_batch → value_polar_batch
-      → derotate). Pre-softmax score capture via the same Option<&Buffer>
-      hook as the f32 path
+- [x] GPU polar attention pipeline (compress / score / value / derotate)
 - [x] cortex-cloud retrieve cache_load → polar backend wiring
-      (`--enable-polar-cache` flag; `cache_load` builds a parallel
-      polar cache via `populate_from_f32_cache_gpu`; single-shard
-      `/v1/retrieve` dispatches on `entry.polar.is_some()` to use
-      `forward_full_gpu_polar_traced`. Validated end-to-end against
-      Qwen 3B + 1941 Harmonizer corpus: polar trace returns
-      semantically-correct hits including offset 324 = "Bluejacket")
-- [x] Shim phase dispatch — gate (#6a): `gate_shims` /
-      `steer_shims` / `inject_shims` / `shim_rules` on
-      `/v1/chat/completions`. Gate fires once after a shared prefill;
-      `shim_rules` (declarative match-and-dispatch, no scripting)
-      route to `silent` (short-circuit, `finish_reason: "silent"`,
-      zero content) or `activate` (proceeds to generation). Streaming
-      and non-streaming both supported; metadata (`gate_decisions`,
-      `active_steers`, `signals`, timings) lands on the final chunk /
-      response. Steers (#6b) and injection (#6c) record the requested
-      sets in metadata for forward-compat but are not yet applied.
-      Validated end-to-end on Qwen 2.5-3B + a squared-norm gate shim
-      (`pinky/tools/gate_smoke_shim.onnx`): silent + proceed paths
-      pass for both streaming and non-streaming wires
-- [x] Batched GPU bitnet path (#bn): unblocks bitnet 1.58b prefill on
-      GPU end-to-end. Before this, `dispatch_matmul_into` hard-panicked
-      on `GpuBitLinear` and the block forward additionally rejected
-      BitNet's attention/FFN sub-norms and ReLU² activation, so any
-      ternary GGUF fell back to CPU full-forward. Now:
-      - `quantize_absmax_batch.wgsl` (per-token absmax → i8 + scales)
-        and `ternary_matmul_batch.wgsl` (multi-token analog of
-        `ternary_matvec`, decode byte-matches the single-token shader)
-      - `dispatch_linear_batch_into` routes by concrete layer type
-        (`GpuFloatLinear` → existing matmul, `GpuBitLinear` →
-        quantize-then-matmul); all six block linear call sites
-        (Q/K/V/o/gate/up/down) go through it
-      - `TernaryScratch` (activations_i8 + scales buffers) added to
-        `BlockScratch`, sized for `max(embed_dim, intermediate)`
-      - `GpuBlock` gains optional `o_sub_norm_weight_buf` +
-        `ffn_sub_norm_weight_buf` (uploaded from `attn.o_sub_norm()` /
-        `swiglu.sub_norm()`); `forward_block_gpu_inner` and the polar
-        variant insert `dispatch_rmsnorm_into` before o_proj/down_proj
-        when present
-      - `relu2_mul_batch.wgsl` + `dispatch_gate_mul_into` route between
-        SiLU and ReLU² based on `swiglu.activation()`
-      Validated against `models/ggml-model-i2_s.gguf` (BitNet 1.58b
-      1.2 GB GGUF): streaming chat completion through
-      `forward_full_gpu_with_cache` returns coherent text ("The
-      capital of France is Paris. Paris is known for its historical
-      landmarks, cultural institutions, and..."). Three shader-level
-      parity tests + one toy-block integration test cover the new
-      surface; workspace tests at 396/396.
-      Also: routed non-streaming `chat_completions` through
-      `generate_stateless_gpu` (same path streaming uses) instead of
-      the per-layer-CPU-sync `engine.generate()` fallback. Bitnet
-      non-streaming jumps 6-7x (1.7→12.5 t/s @ 32 tokens, 2.8→18.1
-      t/s @ 128, ~3→19.1 t/s @ 256). Float Q4_K_M unchanged. Single-
-      token `ternary_matvec` shader also tuned (16-col tile, unrolled
-      decode, branchless sign) but the routing win dominates;
-      `cortex_local::CortexLocal::complete()` still uses the slow
-      `model.generate()` path and would need analogous wrapping in
-      `GpuEngine` to match — separate follow-up.
-- [x] `POST /v1/shims/embed` — text → pooled hidden-state vector.
-      Used by AgentOS for shim-classifier training so trained shims
-      operate over the same substrate they'll see at inference time
-      (alternative was MiniLM stub → throwaway training data once
-      cortex's hidden states landed). Vocabulary mirrors shim
-      manifest fields exactly: `layer` ∈ {`final`, `entrance:N` for
-      `1<=N<=n_layers`}, `pooling` ∈ {`last_token`, `mean`}.
-      `entrance:0` rejects (embedding-lookup output not captured in
-      v1). Pooling primitive `pool_layer_hidden` extracted out of
-      `run_shim_against_hidden` so both `/v1/shims/infer` and
-      `/v1/shims/embed` share one path. Gated by `--enable-shims`.
-      Validated 7 cases end-to-end (`pinky/tools/embed_smoke_test.sh`):
-      final/last_token, final/mean (differ from last_token),
-      entrance:5/last_token, entrance:0 reject, entrance:9999 reject,
-      empty text reject, unknown pooling reject. Workspace tests
-      still 392/392; no regression on gate/steer/inject smokes
-- [ ] cortex-cloud retrieval-cache config flag → polar backend
-- [x] Shim phase dispatch — steer (#6b): per-token `hidden_delta`
-      composition in declared order. Engine gains
-      `forward_full_gpu_with_cache_returning_hidden` (skips the
-      LM-head projection so the steer path doesn't pay it twice).
-      `apply_steers_inplace` runs each steer's ort session on the
-      last-token hidden, adds the delta, then `cpu().finalize_logits`
-      re-projects on CPU. `steer_shims` is the request default; a
-      matched rule's `activate` overrides. Both streaming
-      (`spawn_blocking` + `blocking_lock` on the per-shim mutex) and
-      non-streaming (`generate_stateless_with_steers`) carry steers
-      through the per-token loop. v1 limit: steers + cache_shards
-      reject (cached returning_hidden is a follow-up). Validated
-      end-to-end on Qwen 2.5-3B: identity steer (zero delta)
-      produces baseline output byte-for-byte; +5 across all dims
-      shifts generation completely (`pinky/tools/steer_smoke_test.sh`)
-- [x] Shim phase dispatch — injection (#6c): residual-add at
-      block entrance (`entrance:N` or `entrance:all`) via
-      `pre_block_hidden_inject` parameter on `forward_block_gpu_inner`
-      and the polar variant. New `add_broadcast_batch.wgsl` shader
-      adds a `[embed_dim]` delta to every token's row of `[n_tokens,
-      embed_dim]` hidden in place — same buffer works for prefill
-      (n_tokens=prompt_len) and decode (n_tokens=1). New
-      `forward_full_gpu_with_cache_inject_returning_hidden` (and the
-      logits-returning variant) thread per-layer inject deltas
-      through every block. Composition is sum (commutative,
-      order-independent per spec). v1 limit: inject + cache_shards
-      reject (cached inject is a follow-up). Validated end-to-end
-      on Qwen 2.5-3B: identity_inject (zero delta, entrance:all)
-      produces baseline byte-for-byte; noise_inject (0.1*input,
-      entrance:0) shifts generation completely
-      (`pinky/tools/inject_smoke_test.sh`). All three shim phases
-      now compose: gate decides silence, inject shapes forward,
-      steer shapes per-token logits
+      (`--enable-polar-cache`)
+- [x] Shim phase dispatch — gate / steer / inject (all three phases compose)
+- [x] `POST /v1/shims/embed` — text → pooled hidden-state vector
+- [x] f16-activations rollout (Phases A → C3): KV cache + hidden_buf
+      + per-block scratch packed f16
+- [x] BitNet un-merge: ternary path moved to ternary-rs (2026-05-29).
+      Tag: bitnet-archive-2026-05-29 (commit e1e2dc1).
+- [ ] Restore C3 packed perf for Qwen now that BitNet's gone (currently
+      hidden_buf + scratch.projected reverted to f32 for the Option E
+      BitNet fix; ~9% Qwen prefill regression vs C3 baseline)
+- [ ] Polar variant `forward_block_gpu_polar_inner` C3 port (rotate_q /
+      derotate need packed variants; currently panic-guarded)
 - [ ] QJL correction on V dequant (currently K-only) to close the cosine-
       similarity gap on attention output (PolarQuant alone hits ~0.84)
 - [ ] Bit-pack 3-bit angle representation (u8 → 3-bits, ~12x compression)
 - [ ] Wire QuantizedKvCache into cortex-cloud as the cache_pool backing store
 - [ ] Move retrieval (bidirectional attention) from engram into cortex
 - [ ] Move HierarchicalCache + consolidation from engram
-- [ ] WgpuLinear from neuralkv-core shaders
 - [ ] project_qk() method on TransformerModel for memory integration
 - [ ] Wire into AgentOS as `handler: cortex` organism listener

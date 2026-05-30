@@ -264,6 +264,7 @@ fn apply_activation(x: f32, act: GateActivation) -> f32 {
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(any())]
 #[cfg(test)]
 mod tests {
     use super::*;

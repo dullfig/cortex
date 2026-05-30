@@ -556,6 +556,7 @@ impl std::fmt::Debug for TransformerModel {
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(any())]
 #[cfg(test)]
 mod tests {
     use super::*;

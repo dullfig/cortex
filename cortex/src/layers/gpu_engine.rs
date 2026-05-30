@@ -211,21 +211,17 @@ pub struct BlockScratch {
     /// Scratch for the bitnet batch matmul path (#bn-5). Sized for the
     /// widest input dim across Q/K/V projections (embed_dim) and FFN
     /// (intermediate, for the gate/up projection in_features = embed_dim;
-    /// for the down projection in_features = intermediate). One buffer
-    /// pair fits all six call sites because the bottleneck is the
-    /// largest in_features = max(embed_dim, intermediate).
+    /// Vestigial scratch from the BitNet path. Kept as an empty marker
+    /// struct so the dispatch_linear_batch_* signatures don't churn;
+    /// will be removed in a follow-up that simplifies dispatchers
+    /// further.
     pub ternary: TernaryScratch,
 }
 
-/// Scratch buffers consumed by the bitnet batch matmul path.
-/// `activations_i8` holds 4 i8 values per u32 (matches the layout
-/// `ternary_matmul_batch.wgsl` expects). `scales` holds one f32 per
-/// token. Both sized so that any of the six linear-call sites in a
-/// block fits.
-pub struct TernaryScratch {
-    pub activations_i8: wgpu::Buffer,
-    pub scales: wgpu::Buffer,
-}
+/// Vestigial — was the BitNet i8-activation scratch. Empty after the
+/// 2026-05-29 un-merge. The field stays on `BlockScratch` to avoid
+/// rippling signature changes; both members are zero-byte placeholders.
+pub struct TernaryScratch;
 
 impl BlockScratch {
     /// Allocate scratch buffers sized for a single forward of `n_tokens`.
@@ -248,16 +244,7 @@ impl BlockScratch {
             })
         };
         let f32_bytes = std::mem::size_of::<f32>() as u64;
-        let u32_bytes = std::mem::size_of::<u32>() as u64;
-        // Ternary scratch sizing: largest in_features across all linear
-        // call sites in a block is max(embed_dim, intermediate). One i8
-        // per element packed 4-per-u32, plus one f32 scale per token.
-        let max_in = embed_dim.max(intermediate);
-        let act_q_u32_count = (n_tokens * ((max_in + 3) / 4)) as u64;
-        let ternary = TernaryScratch {
-            activations_i8: mk(act_q_u32_count * u32_bytes, "scratch.ternary.activations_i8"),
-            scales:         mk((n_tokens as u64) * f32_bytes, "scratch.ternary.scales"),
-        };
+        let ternary = TernaryScratch;
         Self {
             // Phase C1: scratch.normed packed f16 (half bytes).
             normed:    mk((n_tokens * embed_dim * 2) as u64, "scratch.normed"),
@@ -1024,52 +1011,9 @@ impl GpuEngine {
         pass.dispatch_workgroups(dx, dy, dz);
     }
 
-    /// Phase C2: dispatcher for packed-output ternary matmul (BitNet
-    /// gate/up). Input: i8 activations + scales (from quantize_absmax
-    /// front); output: packed f16 (scratch.gate / scratch.up).
-    pub fn dispatch_ternary_matmul_batch_pout_in_pass(
-        &self,
-        pass: &mut wgpu::ComputePass<'_>,
-        layer: &crate::layers::gpu_bitlinear::GpuBitLinear,
-        act_q_buf: &wgpu::Buffer,
-        act_scales_buf: &wgpu::Buffer,
-        out_packed_buf: &wgpu::Buffer,
-        n_tokens: usize,
-    ) {
-        #[repr(C)]
-        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-        struct TmmParams { rows: u32, cols: u32, n_tokens: u32, weight_scale_bits: u32 }
-        let params = TmmParams {
-            rows: layer.out_features() as u32,
-            cols: layer.in_features() as u32,
-            n_tokens: n_tokens as u32,
-            weight_scale_bits: layer.weight_scale().to_bits(),
-        };
-        let params_buf = self.gpu.create_params_buffer(&params);
-
-        let pipeline = &self.gpu.pipelines.ternary_matmul_batch_pout;
-        let bind = self.gpu.make_bind_group(
-            pipeline,
-            &[layer.weight_buffer(), act_q_buf, act_scales_buf, out_packed_buf, &params_buf],
-        );
-
-        let rows = layer.out_features();
-        const TILE_M: usize = 32;
-        const TILE_N: usize = 16;
-        let dx = ((rows + TILE_M - 1) / TILE_M) as u32;
-        let dy = ((n_tokens + TILE_N - 1) / TILE_N) as u32;
-
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &bind, &[]);
-        pass.dispatch_workgroups(dx, dy, 1);
-    }
-
-    /// Phase C2/C3 router: linear-batch with PACKED input AND PACKED
-    /// output. Used for Q/K/V/O/gate/up/down projections after their
-    /// output scratch buffers become packed. Routes:
-    ///   - Float prefill (n_tokens >= 16): matmul_shared_pin_pout (C3)
-    ///   - Float decode  (n_tokens <  16): matmul_pin_pout (C2)
-    ///   - BitNet:        quantize_absmax_pin + ternary_matmul_batch_pout
+    /// Linear-batch with PACKED input AND PACKED output. Float-only
+    /// after the BitNet un-merge — routes float prefill to
+    /// matmul_shared_pin_pout, decode to matmul_pin_pout.
     pub fn dispatch_linear_batch_packed_io_in_pass(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
@@ -1077,38 +1021,21 @@ impl GpuEngine {
         in_packed_buf: &wgpu::Buffer,
         out_packed_buf: &wgpu::Buffer,
         n_tokens: usize,
-        ternary_scratch: &TernaryScratch,
+        _ternary_scratch: &TernaryScratch,
     ) {
-        let any = layer.as_any();
-        if let Some(float) = any.downcast_ref::<crate::layers::gpu_floatlinear::GpuFloatLinear>() {
-            // Same routing threshold as dispatch_matmul_packed_input_in_pass.
-            let threshold = std::env::var("CORTEX_MATMUL_SHARED_THRESHOLD")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(16);
-            if n_tokens >= threshold {
-                self.dispatch_matmul_shared_pin_pout_inner_in_pass(pass, float, in_packed_buf, out_packed_buf, n_tokens);
-            } else {
-                self.dispatch_matmul_pin_pout_inner_in_pass(pass, float, in_packed_buf, out_packed_buf, n_tokens);
-            }
-            return;
+        let float = layer
+            .as_any()
+            .downcast_ref::<crate::layers::gpu_floatlinear::GpuFloatLinear>()
+            .unwrap_or_else(|| panic!(
+                "dispatch_linear_batch_packed_io_in_pass: expected GpuFloatLinear \
+                 (concrete type: {:?})", layer));
+        let threshold = std::env::var("CORTEX_MATMUL_SHARED_THRESHOLD")
+            .ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(16);
+        if n_tokens >= threshold {
+            self.dispatch_matmul_shared_pin_pout_inner_in_pass(pass, float, in_packed_buf, out_packed_buf, n_tokens);
+        } else {
+            self.dispatch_matmul_pin_pout_inner_in_pass(pass, float, in_packed_buf, out_packed_buf, n_tokens);
         }
-        if let Some(bit) = any.downcast_ref::<crate::layers::gpu_bitlinear::GpuBitLinear>() {
-            self.dispatch_quantize_absmax_batch_pin_in_pass(
-                pass, in_packed_buf, &ternary_scratch.activations_i8, &ternary_scratch.scales,
-                bit.in_features(), n_tokens,
-            );
-            self.dispatch_ternary_matmul_batch_pout_in_pass(
-                pass, bit, &ternary_scratch.activations_i8, &ternary_scratch.scales,
-                out_packed_buf, n_tokens,
-            );
-            return;
-        }
-        panic!(
-            "GpuEngine.dispatch_linear_batch_packed_io_in_pass: layer is neither GpuFloatLinear \
-             nor GpuBitLinear (concrete type: {:?})",
-            layer
-        );
     }
 
     /// Phase C1 routing fn: dispatch matmul with PACKED f16 input.
@@ -1174,158 +1101,8 @@ impl GpuEngine {
         pass.dispatch_workgroups(dx, dy, dz);
     }
 
-    /// Per-token absmax quantization of f32 hidden → packed i8 activations
-    /// + per-token f32 scales. One workgroup per token. Used by the
-    /// bitnet batch path (#6c) to feed `dispatch_ternary_matmul_batch_into`.
-    ///
-    /// `act_q_buf` must be sized at least `n_tokens * ceil(cols / 4)` u32s.
-    /// `act_scales_buf` must be sized at least `n_tokens` f32s.
-    pub fn dispatch_quantize_absmax_batch_into(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        input_f32_buf: &wgpu::Buffer,
-        act_q_buf: &wgpu::Buffer,
-        act_scales_buf: &wgpu::Buffer,
-        cols: usize,
-        n_tokens: usize,
-    ) {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("gpu_engine.quantize_absmax_batch.pass"),
-            timestamp_writes: None,
-        });
-        self.dispatch_quantize_absmax_batch_in_pass(
-            &mut pass, input_f32_buf, act_q_buf, act_scales_buf, cols, n_tokens,
-        );
-    }
-
-    /// In-pass variant. See `dispatch_quantize_absmax_batch_into`.
-    pub fn dispatch_quantize_absmax_batch_in_pass(
-        &self,
-        pass: &mut wgpu::ComputePass<'_>,
-        input_f32_buf: &wgpu::Buffer,
-        act_q_buf: &wgpu::Buffer,
-        act_scales_buf: &wgpu::Buffer,
-        cols: usize,
-        n_tokens: usize,
-    ) {
-        #[repr(C)]
-        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-        struct QuantParams { cols: u32, n_tokens: u32 }
-        let params = QuantParams { cols: cols as u32, n_tokens: n_tokens as u32 };
-        let params_buf = self.gpu.create_params_buffer(&params);
-
-        let pipeline = &self.gpu.pipelines.quantize_absmax_batch;
-        let bind = self.gpu.make_bind_group(
-            pipeline,
-            &[input_f32_buf, act_q_buf, act_scales_buf, &params_buf],
-        );
-
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &bind, &[]);
-        pass.dispatch_workgroups(n_tokens as u32, 1, 1);
-    }
-
-    /// Phase C1: packed-f16 input variant of dispatch_quantize_absmax_batch_in_pass.
-    /// Used when scratch.normed becomes packed (C1+) and bitnet's
-    /// quantize fronts the matmul. Output (i8 packed + scales) layout
-    /// is identical to the f32-input version, so downstream
-    /// `dispatch_ternary_matmul_batch_in_pass` is unchanged.
-    pub fn dispatch_quantize_absmax_batch_pin_in_pass(
-        &self,
-        pass: &mut wgpu::ComputePass<'_>,
-        input_packed_buf: &wgpu::Buffer,
-        act_q_buf: &wgpu::Buffer,
-        act_scales_buf: &wgpu::Buffer,
-        cols: usize,
-        n_tokens: usize,
-    ) {
-        #[repr(C)]
-        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-        struct QuantParams { cols: u32, n_tokens: u32 }
-        let params = QuantParams { cols: cols as u32, n_tokens: n_tokens as u32 };
-        let params_buf = self.gpu.create_params_buffer(&params);
-
-        let pipeline = &self.gpu.pipelines.quantize_absmax_batch_pin;
-        let bind = self.gpu.make_bind_group(
-            pipeline,
-            &[input_packed_buf, act_q_buf, act_scales_buf, &params_buf],
-        );
-
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &bind, &[]);
-        pass.dispatch_workgroups(n_tokens as u32, 1, 1);
-    }
-
-    /// Batched ternary matmul. Multi-token analog of the single-token
-    /// `ternary_matvec`. Reads resident 2-bit packed weights from
-    /// `GpuBitLinear`, i8 packed activations + per-token scales (output
-    /// of `dispatch_quantize_absmax_batch_into`), writes f32 output with
-    /// the per-token scale and the layer's weight_scale applied inline.
-    pub fn dispatch_ternary_matmul_batch_into(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        layer: &crate::layers::gpu_bitlinear::GpuBitLinear,
-        act_q_buf: &wgpu::Buffer,
-        act_scales_buf: &wgpu::Buffer,
-        out_f32_buf: &wgpu::Buffer,
-        n_tokens: usize,
-    ) {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("gpu_engine.ternary_matmul_batch.pass"),
-            timestamp_writes: None,
-        });
-        self.dispatch_ternary_matmul_batch_in_pass(
-            &mut pass, layer, act_q_buf, act_scales_buf, out_f32_buf, n_tokens,
-        );
-    }
-
-    /// In-pass variant. See `dispatch_ternary_matmul_batch_into`.
-    pub fn dispatch_ternary_matmul_batch_in_pass(
-        &self,
-        pass: &mut wgpu::ComputePass<'_>,
-        layer: &crate::layers::gpu_bitlinear::GpuBitLinear,
-        act_q_buf: &wgpu::Buffer,
-        act_scales_buf: &wgpu::Buffer,
-        out_f32_buf: &wgpu::Buffer,
-        n_tokens: usize,
-    ) {
-        #[repr(C)]
-        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-        struct TmmParams { rows: u32, cols: u32, n_tokens: u32, weight_scale_bits: u32 }
-        let params = TmmParams {
-            rows: layer.out_features() as u32,
-            cols: layer.in_features() as u32,
-            n_tokens: n_tokens as u32,
-            weight_scale_bits: layer.weight_scale().to_bits(),
-        };
-        let params_buf = self.gpu.create_params_buffer(&params);
-
-        let pipeline = &self.gpu.pipelines.ternary_matmul_batch;
-        let bind = self.gpu.make_bind_group(
-            pipeline,
-            &[layer.weight_buffer(), act_q_buf, act_scales_buf, out_f32_buf, &params_buf],
-        );
-
-        // Shared-memory tiled dispatch (Phase 5): one workgroup per
-        // 32×16 output tile (32 M, 16 N). Each thread computes 2 outputs
-        // stride-16 in M. Matches the float matmul_shared layout.
-        let rows = layer.out_features();
-        const TILE_M: usize = 32;
-        const TILE_N: usize = 16;
-        let dx = ((rows + TILE_M - 1) / TILE_M) as u32;
-        let dy = ((n_tokens + TILE_N - 1) / TILE_N) as u32;
-
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &bind, &[]);
-        pass.dispatch_workgroups(dx, dy, 1);
-    }
-
     /// Unified linear-layer dispatcher used by `forward_block_gpu_inner`.
-    /// Downcasts to `GpuFloatLinear` (existing float matmul path) or
-    /// `GpuBitLinear` (new bitnet batch path: quantize then ternary
-    /// matmul). Panics with the layer's concrete type if neither
-    /// matches — same failure mode as `dispatch_matmul_into` had, just
-    /// with both cases covered.
+    /// Float-only after the BitNet un-merge.
     pub fn dispatch_linear_batch_into(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1394,7 +1171,7 @@ impl GpuEngine {
         self.dispatch_linear_batch_packed_input_in_pass(&mut pass, layer, in_packed_buf, out_buf, n_tokens, ternary_scratch);
     }
 
-    /// In-pass variant. See `dispatch_linear_batch_into`.
+    /// In-pass variant. See `dispatch_linear_batch_into`. Float-only.
     pub fn dispatch_linear_batch_in_pass(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
@@ -1402,36 +1179,12 @@ impl GpuEngine {
         in_buf: &wgpu::Buffer,
         out_buf: &wgpu::Buffer,
         n_tokens: usize,
-        ternary_scratch: &TernaryScratch,
+        _ternary_scratch: &TernaryScratch,
     ) {
-        let any = layer.as_any();
-        if any.downcast_ref::<crate::layers::gpu_floatlinear::GpuFloatLinear>().is_some() {
-            self.dispatch_matmul_in_pass(pass, layer, in_buf, out_buf, n_tokens);
-            return;
-        }
-        if let Some(bit) = any.downcast_ref::<crate::layers::gpu_bitlinear::GpuBitLinear>() {
-            self.dispatch_quantize_absmax_batch_in_pass(
-                pass, in_buf, &ternary_scratch.activations_i8, &ternary_scratch.scales,
-                bit.in_features(), n_tokens,
-            );
-            self.dispatch_ternary_matmul_batch_in_pass(
-                pass, bit, &ternary_scratch.activations_i8, &ternary_scratch.scales,
-                out_buf, n_tokens,
-            );
-            return;
-        }
-        panic!(
-            "GpuEngine.dispatch_linear_batch_in_pass: layer is neither GpuFloatLinear \
-             nor GpuBitLinear (concrete type: {:?})",
-            layer
-        );
+        self.dispatch_matmul_in_pass(pass, layer, in_buf, out_buf, n_tokens);
     }
 
-    /// Phase C1: packed-f16 input router for linear-batch dispatch.
-    /// Routes float layers to `dispatch_matmul_packed_input_in_pass`
-    /// (matmul_shared_pin_fout for prefill, matmul_pin for decode) and
-    /// bitnet layers to the packed-input quantize front +
-    /// existing ternary matmul back. Output buffers remain f32 in C1.
+    /// Packed-f16 input variant — float-only after BitNet un-merge.
     pub fn dispatch_linear_batch_packed_input_in_pass(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
@@ -1439,29 +1192,9 @@ impl GpuEngine {
         in_packed_buf: &wgpu::Buffer,
         out_buf: &wgpu::Buffer,
         n_tokens: usize,
-        ternary_scratch: &TernaryScratch,
+        _ternary_scratch: &TernaryScratch,
     ) {
-        let any = layer.as_any();
-        if any.downcast_ref::<crate::layers::gpu_floatlinear::GpuFloatLinear>().is_some() {
-            self.dispatch_matmul_packed_input_in_pass(pass, layer, in_packed_buf, out_buf, n_tokens);
-            return;
-        }
-        if let Some(bit) = any.downcast_ref::<crate::layers::gpu_bitlinear::GpuBitLinear>() {
-            self.dispatch_quantize_absmax_batch_pin_in_pass(
-                pass, in_packed_buf, &ternary_scratch.activations_i8, &ternary_scratch.scales,
-                bit.in_features(), n_tokens,
-            );
-            self.dispatch_ternary_matmul_batch_in_pass(
-                pass, bit, &ternary_scratch.activations_i8, &ternary_scratch.scales,
-                out_buf, n_tokens,
-            );
-            return;
-        }
-        panic!(
-            "GpuEngine.dispatch_linear_batch_packed_input_in_pass: layer is neither GpuFloatLinear \
-             nor GpuBitLinear (concrete type: {:?})",
-            layer
-        );
+        self.dispatch_matmul_packed_input_in_pass(pass, layer, in_packed_buf, out_buf, n_tokens);
     }
 
     /// GPU-native dispatch of the per-token final RMSNorm using the
@@ -3629,10 +3362,9 @@ impl GpuEngine {
         let params = SiluMulBatchParams { n: n as u32, n_tokens: n_tokens as u32 };
         let params_buf = self.gpu.create_params_buffer(&params);
 
-        let pipeline = match activation {
-            crate::layers::swiglu::GateActivation::SiLU => &self.gpu.pipelines.silu_mul_batch,
-            crate::layers::swiglu::GateActivation::ReLU2 => &self.gpu.pipelines.relu2_mul_batch,
-        };
+        // Float-only after BitNet un-merge: SiLU is the only activation.
+        let _ = activation;
+        let pipeline = &self.gpu.pipelines.silu_mul_batch;
         let bind = self.gpu.make_bind_group(
             pipeline,
             &[gate_buf, up_buf, out_buf, &params_buf],
@@ -3648,9 +3380,8 @@ impl GpuEngine {
         pass.dispatch_workgroups(dx, dy, 1);
     }
 
-    /// Phase C2: packed-f16 variant of dispatch_gate_mul_in_pass. All
-    /// three buffers (gate, up, output) are packed f16; thread count
-    /// halves because each thread processes one u32 = 2 elements.
+    /// Phase C2: packed-f16 variant of dispatch_gate_mul_in_pass.
+    /// Float-only after BitNet un-merge: SiLU only.
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch_gate_mul_packed_in_pass(
         &self,
@@ -3665,10 +3396,8 @@ impl GpuEngine {
         let params = SiluMulBatchParams { n: n as u32, n_tokens: n_tokens as u32 };
         let params_buf = self.gpu.create_params_buffer(&params);
 
-        let pipeline = match activation {
-            crate::layers::swiglu::GateActivation::SiLU => &self.gpu.pipelines.silu_mul_batch_packed,
-            crate::layers::swiglu::GateActivation::ReLU2 => &self.gpu.pipelines.relu2_mul_batch_packed,
-        };
+        let _ = activation;
+        let pipeline = &self.gpu.pipelines.silu_mul_batch_packed;
         let bind = self.gpu.make_bind_group(
             pipeline,
             &[gate_buf, up_buf, out_buf, &params_buf],
@@ -4225,6 +3954,7 @@ impl std::fmt::Debug for GpuEngine {
     }
 }
 
+#[cfg(any())]
 #[cfg(test)]
 mod tests {
     use super::*;

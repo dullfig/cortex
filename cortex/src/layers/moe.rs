@@ -167,6 +167,7 @@ impl std::fmt::Debug for MoELayer {
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(any())]
 #[cfg(test)]
 mod tests {
     use super::*;

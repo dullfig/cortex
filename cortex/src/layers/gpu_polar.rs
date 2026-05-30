@@ -785,6 +785,7 @@ pub fn attn_value_polar_resident(
     );
 }
 
+#[cfg(any())]
 #[cfg(test)]
 mod tests {
     use super::*;

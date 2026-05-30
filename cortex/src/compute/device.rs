@@ -3,7 +3,36 @@
 //! Provides a unified view of available compute resources (CPU features,
 //! GPU adapters) and a formatted boot banner for startup diagnostics.
 
-use super::CpuFeatures;
+/// CPU SIMD capability flags detected at runtime. Used by the boot
+/// banner for diagnostics; cortex itself runs entirely on GPU after the
+/// 2026-05-29 BitNet un-merge.
+#[derive(Debug, Clone, Copy)]
+pub struct CpuFeatures {
+    pub avx2: bool,
+    pub avx512f: bool,
+    pub neon: bool,
+}
+
+impl CpuFeatures {
+    pub fn detect() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        {
+            Self {
+                avx2: std::arch::is_x86_feature_detected!("avx2"),
+                avx512f: std::arch::is_x86_feature_detected!("avx512f"),
+                neon: false,
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            Self { avx2: false, avx512f: false, neon: true }
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            Self { avx2: false, avx512f: false, neon: false }
+        }
+    }
+}
 
 /// Information about a detected GPU adapter.
 #[derive(Debug, Clone)]
@@ -92,7 +121,7 @@ impl HardwareInfo {
         }
 
         let simd = self.cpu_compute_name();
-        eprintln!("  [boot] CPU compute: {} ternary kernel", simd);
+        eprintln!("  [boot] CPU SIMD: {}", simd);
 
         // GPU(s)
         if self.gpus.is_empty() {

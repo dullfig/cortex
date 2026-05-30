@@ -1,8 +1,9 @@
-//! GGUF model file parser for loading ternary (1.58-bit) LLM weights.
+//! GGUF model file parser for cortex float weights.
 //!
-//! Implements the GGUF v3 format as used by llama.cpp and BitNet.cpp.
-//! Supports ternary tensor types TQ1_0 and TQ2_0, plus F32/F16/BF16 for
-//! non-quantized layers (embeddings, norms, output heads).
+//! Implements the GGUF v3 format. Supports F32 / F16 / BF16 and the
+//! Q4_K / Q5_K / Q6_K block-quantized types (dequantized to f32 at
+//! load time). Ternary (TQ1_0 / TQ2_0 / I2S) was removed 2026-05-29
+//! when BitNet inference moved to the ternary-rs crate.
 //!
 //! No mmap, no unsafe, no external ML deps — just std + thiserror.
 
@@ -13,7 +14,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tracing::{debug, info};
 
-use crate::tensor::{FloatTensor, Ternary, TernaryTensor};
+use crate::tensor::FloatTensor;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -27,18 +28,6 @@ const GGUF_VERSION: u32 = 3;
 
 /// Default tensor data alignment in bytes.
 const DEFAULT_ALIGNMENT: usize = 32;
-
-/// TQ2_0 block size: 256 elements per block.
-const TQ2_BLOCK_ELEMENTS: usize = 256;
-
-/// TQ2_0 block byte size: 64 data bytes + 2 scale bytes.
-const TQ2_BLOCK_BYTES: usize = 66;
-
-/// TQ1_0 block size: 256 elements per block.
-const TQ1_BLOCK_ELEMENTS: usize = 256;
-
-/// TQ1_0 block byte size: 48 base-3 + 4 tail + 2 scale.
-const TQ1_BLOCK_BYTES: usize = 54;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -112,20 +101,9 @@ pub enum GgmlType {
     Q6_K = 14,
     /// Brain floating point 16.
     BF16 = 30,
-    /// Ternary 1-bit (base-3 packed), 256-element blocks.
-    TQ1_0 = 34,
-    /// Ternary 2-bit packed, 256-element blocks.
-    TQ2_0 = 35,
-    /// BitNet.cpp I2_S: 2-bit packed ternary + single per-tensor float scale.
-    I2S = 36,
 }
 
 impl GgmlType {
-    /// Whether this type is a ternary (1.58-bit) format.
-    pub fn is_ternary(self) -> bool {
-        matches!(self, GgmlType::TQ1_0 | GgmlType::TQ2_0 | GgmlType::I2S)
-    }
-
     /// Whether this type is a standard quantized format (needs dequantization).
     pub fn is_quantized(self) -> bool {
         matches!(
@@ -161,9 +139,11 @@ impl TryFrom<u32> for GgmlType {
             13 => Ok(GgmlType::Q5_K),
             14 => Ok(GgmlType::Q6_K),
             30 => Ok(GgmlType::BF16),
-            34 => Ok(GgmlType::TQ1_0),
-            35 => Ok(GgmlType::TQ2_0),
-            36 => Ok(GgmlType::I2S),
+            // Ternary types (TQ1_0=34, TQ2_0=35, I2S=36) intentionally
+            // not supported: cortex is float-only after the 2026-05-29
+            // BitNet un-merge. Use the `ternary-rs` crate for BitNet
+            // models. The error message guides callers there.
+            34 | 35 | 36 => Err(GgufError::UnsupportedTensorType(v)),
             _ => Err(GgufError::UnsupportedTensorType(v)),
         }
     }
@@ -452,250 +432,9 @@ fn bf16_to_f32(bits: u16) -> f32 {
 // TQ2_0 unpacking
 // ---------------------------------------------------------------------------
 
-/// Remap table for TQ2_0: GGUF encoding → our ternary encoding.
-///
-/// GGUF TQ2_0: 0 = -1, 1 = 0, 2 = +1
-/// Our encoding: 0b00 = -1, 0b01 = 0, 0b10 = +1
-const TQ2_REMAP: [u8; 4] = [
-    0b00, // GGUF 0 → Neg
-    0b01, // GGUF 1 → Zero
-    0b10, // GGUF 2 → Pos
-    0b01, // GGUF 3 → Zero (unused, safe fallback)
-];
-
-/// Unpack a TQ2_0 block (256 elements, 66 bytes) into ternary values.
-///
-/// Returns the 256 ternary values and the per-block f16 scale.
-fn unpack_tq2_0_block(block: &[u8]) -> ([Ternary; TQ2_BLOCK_ELEMENTS], f32) {
-    debug_assert_eq!(block.len(), TQ2_BLOCK_BYTES);
-
-    let mut values = [Ternary::Zero; TQ2_BLOCK_ELEMENTS];
-
-    // First 64 bytes: 2 bits per value, 4 values per byte
-    for (byte_idx, &b) in block[..64].iter().enumerate() {
-        for slot in 0..4 {
-            let gguf_code = (b >> (slot * 2)) & 0x03;
-            let val_idx = byte_idx * 4 + slot;
-            values[val_idx] = Ternary::from_bits(TQ2_REMAP[gguf_code as usize]);
-        }
-    }
-
-    // Last 2 bytes: f16 scale
-    let scale_bits = u16::from_le_bytes([block[64], block[65]]);
-    let scale = f16_to_f32(scale_bits);
-
-    (values, scale)
-}
-
-/// Unpack TQ2_0 tensor data into a `TernaryTensor` and averaged weight scale.
-fn unpack_tq2_0(data: &[u8], n_elements: u64) -> (TernaryTensor, f32) {
-    let n = n_elements as usize;
-    let n_blocks = n.div_ceil(TQ2_BLOCK_ELEMENTS);
-
-    let mut all_values = Vec::with_capacity(n);
-    let mut scale_sum = 0.0f64;
-
-    for block_idx in 0..n_blocks {
-        let start = block_idx * TQ2_BLOCK_BYTES;
-        let block = &data[start..start + TQ2_BLOCK_BYTES];
-        let (values, scale) = unpack_tq2_0_block(block);
-
-        let remaining = n - block_idx * TQ2_BLOCK_ELEMENTS;
-        let count = remaining.min(TQ2_BLOCK_ELEMENTS);
-        all_values.extend_from_slice(&values[..count]);
-        scale_sum += scale.abs() as f64;
-    }
-
-    let avg_scale = (scale_sum / n_blocks as f64) as f32;
-
-    // Pack into our 2-bit format
-    let packed_len = n.div_ceil(4);
-    let mut packed = vec![0u8; packed_len];
-    for (i, &v) in all_values.iter().enumerate() {
-        let byte_idx = i / 4;
-        let bit_offset = (i % 4) * 2;
-        packed[byte_idx] |= (v as u8) << bit_offset;
-    }
-
-    // Shape is set by caller; use 1D here
-    (TernaryTensor::from_packed(packed, 1, n), avg_scale)
-}
-
-// ---------------------------------------------------------------------------
-// I2_S unpacking (BitNet.cpp native format)
-// ---------------------------------------------------------------------------
-
-/// Unpack I2_S data: 2-bit packed ternary with a single per-tensor float scale.
-///
-/// Layout: `[n_elements/4 bytes of packed data] [4 bytes f32 scale]`
-/// Encoding: 0=-1, 1=0, 2=+1 (same as TQ2_0).
-///
-/// **Interleaved packing** (from BitNet.cpp `quantize_i2_s`):
-/// Values are packed in blocks of `QK_I2_S = 128` elements into 32 bytes.
-/// Within each 32-byte block, byte `p` (0..31) contains 4 values from
-/// positions `p`, `p+32`, `p+64`, `p+96` within the 128-element block:
-///   - bits 7:6 = value at offset `p + 0*32`
-///   - bits 5:4 = value at offset `p + 1*32`
-///   - bits 3:2 = value at offset `p + 2*32`
-///   - bits 1:0 = value at offset `p + 3*32`
-fn unpack_i2s(data: &[u8], n_elements: u64) -> (TernaryTensor, f32) {
-    let n = n_elements as usize;
-    let packed_bytes = n.div_ceil(4);
-
-    // Scale is the last 4 bytes after the packed data
-    let scale = if data.len() >= packed_bytes + 4 {
-        let scale_bytes = &data[packed_bytes..packed_bytes + 4];
-        f32::from_le_bytes([scale_bytes[0], scale_bytes[1], scale_bytes[2], scale_bytes[3]])
-    } else {
-        1.0
-    };
-
-    // I2_S: 128-element blocks, 32 bytes per block.
-    // Each byte holds 4 ternary values from 4 interleaved groups of 32:
-    //   bits 7:6 → group 0 (offset p),    bits 5:4 → group 1 (offset p+32),
-    //   bits 3:2 → group 2 (offset p+64), bits 1:0 → group 3 (offset p+96).
-    // GGUF encoding: 0 = -1, 1 = 0, 2 = +1 (remapped via TQ2_REMAP).
-    const QK: usize = 128;
-    const BLOCK_BYTES: usize = QK / 4; // 32
-
-    let mut all_values = vec![Ternary::Zero; n];
-
-    let n_full_blocks = n / QK;
-    let remainder = n % QK;
-
-    for block_idx in 0..n_full_blocks {
-        let byte_start = block_idx * BLOCK_BYTES;
-        let val_start = block_idx * QK;
-
-        for p in 0..BLOCK_BYTES {
-            let b = data[byte_start + p];
-            all_values[val_start + p]      = Ternary::from_bits(TQ2_REMAP[((b >> 6) & 0x03) as usize]);
-            all_values[val_start + p + 32] = Ternary::from_bits(TQ2_REMAP[((b >> 4) & 0x03) as usize]);
-            all_values[val_start + p + 64] = Ternary::from_bits(TQ2_REMAP[((b >> 2) & 0x03) as usize]);
-            all_values[val_start + p + 96] = Ternary::from_bits(TQ2_REMAP[(b & 0x03) as usize]);
-        }
-    }
-
-    // Handle remainder
-    if remainder > 0 {
-        let byte_start = n_full_blocks * BLOCK_BYTES;
-        let val_start = n_full_blocks * QK;
-        let mut idx = 0;
-        let rem_bytes = remainder.div_ceil(4);
-        for p in 0..rem_bytes {
-            let b = data[byte_start + p];
-            for shift in [6, 4, 2, 0] {
-                if idx >= remainder { break; }
-                let code = (b >> shift) & 0x03;
-                all_values[val_start + idx] = Ternary::from_bits(TQ2_REMAP[code as usize]);
-                idx += 1;
-            }
-        }
-    }
-
-    // Repack into our internal 2-bit format
-    let mut packed = vec![0u8; packed_bytes];
-    for (i, &v) in all_values.iter().enumerate() {
-        let byte_idx = i / 4;
-        let bit_offset = (i % 4) * 2;
-        packed[byte_idx] |= (v as u8) << bit_offset;
-    }
-
-    (TernaryTensor::from_packed(packed, 1, n), scale)
-}
-
-// ---------------------------------------------------------------------------
-// TQ1_0 unpacking
-// ---------------------------------------------------------------------------
-
-/// Decode a single byte of base-3 packed data into 5 ternary values.
-///
-/// Each byte encodes 5 values in base 3 (3^5 = 243 ≤ 255).
-/// Values: 0 = -1, 1 = 0, 2 = +1.
-fn decode_base3(byte: u8) -> [Ternary; 5] {
-    let mut result = [Ternary::Zero; 5];
-    let mut val = byte as u16; // u16 to avoid overflow during division
-
-    for item in &mut result {
-        let rem = (val % 3) as u8;
-        *item = match rem {
-            0 => Ternary::Neg,
-            1 => Ternary::Zero,
-            2 => Ternary::Pos,
-            _ => unreachable!(),
-        };
-        val /= 3;
-    }
-
-    result
-}
-
-/// Unpack a TQ1_0 block (256 elements, 54 bytes) into ternary values.
-///
-/// Layout:
-/// - Bytes 0..48: 48 base-3 bytes → 240 values (5 values per byte)
-/// - Bytes 48..52: 4 bytes of 2-bit packed values → 16 values (4 per byte)
-/// - Bytes 52..54: f16 scale
-fn unpack_tq1_0_block(block: &[u8]) -> ([Ternary; TQ1_BLOCK_ELEMENTS], f32) {
-    debug_assert_eq!(block.len(), TQ1_BLOCK_BYTES);
-
-    let mut values = [Ternary::Zero; TQ1_BLOCK_ELEMENTS];
-
-    // First 240 values: base-3 packed, 5 per byte
-    for (byte_idx, &b) in block[..48].iter().enumerate() {
-        let decoded = decode_base3(b);
-        let base = byte_idx * 5;
-        values[base..base + 5].copy_from_slice(&decoded);
-    }
-
-    // Last 16 values: 2-bit packed (same encoding as TQ2_0)
-    for byte_idx in 0..4 {
-        let b = block[48 + byte_idx];
-        for slot in 0..4 {
-            let gguf_code = (b >> (slot * 2)) & 0x03;
-            let val_idx = 240 + byte_idx * 4 + slot;
-            values[val_idx] = Ternary::from_bits(TQ2_REMAP[gguf_code as usize]);
-        }
-    }
-
-    // Scale: f16 at bytes 52..54
-    let scale_bits = u16::from_le_bytes([block[52], block[53]]);
-    let scale = f16_to_f32(scale_bits);
-
-    (values, scale)
-}
-
-/// Unpack TQ1_0 tensor data into a `TernaryTensor` and averaged weight scale.
-fn unpack_tq1_0(data: &[u8], n_elements: u64) -> (TernaryTensor, f32) {
-    let n = n_elements as usize;
-    let n_blocks = n.div_ceil(TQ1_BLOCK_ELEMENTS);
-
-    let mut all_values = Vec::with_capacity(n);
-    let mut scale_sum = 0.0f64;
-
-    for block_idx in 0..n_blocks {
-        let start = block_idx * TQ1_BLOCK_BYTES;
-        let block = &data[start..start + TQ1_BLOCK_BYTES];
-        let (values, scale) = unpack_tq1_0_block(block);
-
-        let remaining = n - block_idx * TQ1_BLOCK_ELEMENTS;
-        let count = remaining.min(TQ1_BLOCK_ELEMENTS);
-        all_values.extend_from_slice(&values[..count]);
-        scale_sum += scale.abs() as f64;
-    }
-
-    let avg_scale = (scale_sum / n_blocks as f64) as f32;
-
-    let packed_len = n.div_ceil(4);
-    let mut packed = vec![0u8; packed_len];
-    for (i, &v) in all_values.iter().enumerate() {
-        let byte_idx = i / 4;
-        let bit_offset = (i % 4) * 2;
-        packed[byte_idx] |= (v as u8) << bit_offset;
-    }
-
-    (TernaryTensor::from_packed(packed, 1, n), avg_scale)
-}
+// Ternary unpacking (TQ1_0, TQ2_0, I2S) removed 2026-05-29 — see the
+// ternary-rs crate. The matching enum variants reject at TryFrom<u32>
+// above with UnsupportedTensorType.
 
 // ---------------------------------------------------------------------------
 // Float tensor loading
@@ -979,48 +718,6 @@ impl GgufFile {
         self.tensors.get(name)
     }
 
-    /// Load a ternary tensor (TQ1_0 or TQ2_0) by name.
-    ///
-    /// Returns `(TernaryTensor, weight_scale)` ready for `BitLinear::new()`.
-    /// The tensor is reshaped to (rows, cols) from the stored shape.
-    pub fn load_ternary(&self, name: &str) -> Result<(TernaryTensor, f32)> {
-        let info = self
-            .tensors
-            .get(name)
-            .ok_or_else(|| GgufError::MissingMetadata(name.to_string()))?;
-
-        let data = self.read_tensor_data(info)?;
-
-        let (mut tensor, scale) = match info.ggml_type {
-            GgmlType::TQ2_0 => unpack_tq2_0(&data, info.n_elements),
-            GgmlType::TQ1_0 => unpack_tq1_0(&data, info.n_elements),
-            GgmlType::I2S => unpack_i2s(&data, info.n_elements),
-            other => {
-                return Err(GgufError::UnsupportedTensorType(other as u32));
-            }
-        };
-
-        // Reshape: if 2D, apply (rows, cols)
-        if info.shape.len() == 2 {
-            tensor = TernaryTensor::from_packed(
-                tensor.packed_data().to_vec(),
-                info.shape[0],
-                info.shape[1],
-            );
-        }
-
-        debug!(
-            name,
-            ?info.ggml_type,
-            scale,
-            rows = tensor.rows(),
-            cols = tensor.cols(),
-            "loaded ternary tensor"
-        );
-
-        Ok((tensor, scale))
-    }
-
     /// Load a float tensor (F32, F16, or BF16) by name.
     pub fn load_float(&self, name: &str) -> Result<FloatTensor> {
         let info = self
@@ -1076,42 +773,6 @@ impl GgufFile {
     /// Read raw tensor bytes (for diagnostic tools that need to try different interpretations).
     pub fn read_tensor_data_pub(&self, info: &TensorInfo) -> Result<Vec<u8>> {
         self.read_tensor_data(info)
-    }
-
-    /// Load a ternary tensor from an in-memory reader source.
-    /// Used for testing when there's no file on disk.
-    pub fn load_ternary_from_reader<R: Read + Seek>(
-        &self,
-        name: &str,
-        mut reader: R,
-    ) -> Result<(TernaryTensor, f32)> {
-        let info = self
-            .tensors
-            .get(name)
-            .ok_or_else(|| GgufError::MissingMetadata(name.to_string()))?;
-
-        let byte_size = tensor_byte_size(info.ggml_type, info.n_elements, self.alignment);
-        let abs_offset = self.tensor_data_offset + info.offset;
-        reader.seek(SeekFrom::Start(abs_offset))?;
-
-        let mut buf = vec![0u8; byte_size];
-        reader.read_exact(&mut buf)?;
-
-        let (mut tensor, scale) = match info.ggml_type {
-            GgmlType::TQ2_0 => unpack_tq2_0(&buf, info.n_elements),
-            GgmlType::TQ1_0 => unpack_tq1_0(&buf, info.n_elements),
-            other => return Err(GgufError::UnsupportedTensorType(other as u32)),
-        };
-
-        if info.shape.len() == 2 {
-            tensor = TernaryTensor::from_packed(
-                tensor.packed_data().to_vec(),
-                info.shape[0],
-                info.shape[1],
-            );
-        }
-
-        Ok((tensor, scale))
     }
 
     /// Load a float tensor from an in-memory reader source.
@@ -1176,18 +837,6 @@ fn tensor_byte_size(ggml_type: GgmlType, n_elements: u64, _alignment: usize) -> 
         GgmlType::Q4_K => n.div_ceil(Q4_K_BLOCK_SIZE) * Q4_K_BLOCK_BYTES,
         GgmlType::Q5_K => n.div_ceil(Q5_K_BLOCK_SIZE) * Q5_K_BLOCK_BYTES,
         GgmlType::Q6_K => n.div_ceil(Q6_K_BLOCK_SIZE) * Q6_K_BLOCK_BYTES,
-        GgmlType::TQ2_0 => {
-            let n_blocks = n.div_ceil(TQ2_BLOCK_ELEMENTS);
-            n_blocks * TQ2_BLOCK_BYTES
-        }
-        GgmlType::TQ1_0 => {
-            let n_blocks = n.div_ceil(TQ1_BLOCK_ELEMENTS);
-            n_blocks * TQ1_BLOCK_BYTES
-        }
-        GgmlType::I2S => {
-            // packed 2-bit data + 4-byte float scale
-            n.div_ceil(4) + 4
-        }
     }
 }
 
@@ -1374,134 +1023,8 @@ mod tests {
         assert!((bf16_to_f32(0xBF80) - -1.0).abs() < f32::EPSILON);
     }
 
-    // -- TQ2_0 tests --
-
-    #[test]
-    fn tq2_remap_correctness() {
-        assert_eq!(Ternary::from_bits(TQ2_REMAP[0]), Ternary::Neg);
-        assert_eq!(Ternary::from_bits(TQ2_REMAP[1]), Ternary::Zero);
-        assert_eq!(Ternary::from_bits(TQ2_REMAP[2]), Ternary::Pos);
-        assert_eq!(Ternary::from_bits(TQ2_REMAP[3]), Ternary::Zero); // unused
-    }
-
-    #[test]
-    fn tq2_unpack_basic() {
-        // Build a TQ2_0 block: 256 values, all -1 (GGUF code 0)
-        let mut block = vec![0u8; TQ2_BLOCK_BYTES];
-        // All data bytes are 0 → all values are GGUF 0 → our Neg
-        // Set scale to f16 1.0
-        let scale_bits: u16 = 0x3C00;
-        block[64] = scale_bits.to_le_bytes()[0];
-        block[65] = scale_bits.to_le_bytes()[1];
-
-        let (values, scale) = unpack_tq2_0_block(&block);
-        assert!((scale - 1.0).abs() < f32::EPSILON);
-        for v in &values {
-            assert_eq!(*v, Ternary::Neg);
-        }
-    }
-
-    #[test]
-    fn tq2_unpack_mixed() {
-        let mut block = vec![0u8; TQ2_BLOCK_BYTES];
-        // First byte: GGUF values [0,1,2,1] = [Neg,Zero,Pos,Zero]
-        // Encoding: 0|(1<<2)|(2<<4)|(1<<6) = 0 + 4 + 32 + 64 = 100 = 0x64
-        block[0] = 0x64;
-        // Scale = f16 0.5 = 0x3800
-        block[64] = 0x00;
-        block[65] = 0x38;
-
-        let (values, scale) = unpack_tq2_0_block(&block);
-        assert!((scale - 0.5).abs() < f32::EPSILON);
-        assert_eq!(values[0], Ternary::Neg);
-        assert_eq!(values[1], Ternary::Zero);
-        assert_eq!(values[2], Ternary::Pos);
-        assert_eq!(values[3], Ternary::Zero);
-    }
-
-    // -- TQ1_0 / base-3 tests --
-
-    #[test]
-    fn decode_base3_all_neg() {
-        // All -1: each rem = 0, so byte = 0*3^4 + 0*3^3 + 0*3^2 + 0*3 + 0 = 0
-        let result = decode_base3(0);
-        for v in &result {
-            assert_eq!(*v, Ternary::Neg);
-        }
-    }
-
-    #[test]
-    fn decode_base3_all_zero() {
-        // All 0 (ternary code 1): 1 + 3 + 9 + 27 + 81 = 121
-        let result = decode_base3(121);
-        for v in &result {
-            assert_eq!(*v, Ternary::Zero);
-        }
-    }
-
-    #[test]
-    fn decode_base3_all_pos() {
-        // All +1 (ternary code 2): 2 + 6 + 18 + 54 + 162 = 242
-        let result = decode_base3(242);
-        for v in &result {
-            assert_eq!(*v, Ternary::Pos);
-        }
-    }
-
-    #[test]
-    fn decode_base3_mixed() {
-        // [Neg, Zero, Pos, Neg, Zero] = [0, 1, 2, 0, 1]
-        // byte = 0 + 1*3 + 2*9 + 0*27 + 1*81 = 0 + 3 + 18 + 0 + 81 = 102
-        let result = decode_base3(102);
-        assert_eq!(result[0], Ternary::Neg);
-        assert_eq!(result[1], Ternary::Zero);
-        assert_eq!(result[2], Ternary::Pos);
-        assert_eq!(result[3], Ternary::Neg);
-        assert_eq!(result[4], Ternary::Zero);
-    }
-
-    #[test]
-    fn tq1_unpack_block() {
-        // Build a TQ1_0 block with known values
-        let mut block = vec![0u8; TQ1_BLOCK_BYTES];
-
-        // Byte 0: all Neg (base3 = 0)
-        block[0] = 0;
-        // Byte 1: all Zero (base3 = 121)
-        block[1] = 121;
-        // Bytes 2..48: all Pos (base3 = 242)
-        for i in 2..48 {
-            block[i] = 242;
-        }
-        // Tail (bytes 48..52): all GGUF 2 = Pos
-        // 2|(2<<2)|(2<<4)|(2<<6) = 2+8+32+128 = 0xAA
-        for i in 48..52 {
-            block[i] = 0xAA;
-        }
-        // Scale: f16 1.0
-        block[52] = 0x00;
-        block[53] = 0x3C;
-
-        let (values, scale) = unpack_tq1_0_block(&block);
-        assert!((scale - 1.0).abs() < f32::EPSILON);
-
-        // First 5 values: all Neg
-        for i in 0..5 {
-            assert_eq!(values[i], Ternary::Neg, "index {i}");
-        }
-        // Next 5: all Zero
-        for i in 5..10 {
-            assert_eq!(values[i], Ternary::Zero, "index {i}");
-        }
-        // 10..240: all Pos
-        for i in 10..240 {
-            assert_eq!(values[i], Ternary::Pos, "index {i}");
-        }
-        // 240..256: all Pos (from tail)
-        for i in 240..256 {
-            assert_eq!(values[i], Ternary::Pos, "index {i}");
-        }
-    }
+    // Ternary tests (TQ2_0, TQ1_0, base-3) deleted with the ternary
+    // unpackers 2026-05-29. See ternary-rs crate.
 
     // -- Header parsing tests --
 
@@ -1609,8 +1132,10 @@ mod tests {
         assert_eq!(GgmlType::try_from(0).unwrap(), GgmlType::F32);
         assert_eq!(GgmlType::try_from(1).unwrap(), GgmlType::F16);
         assert_eq!(GgmlType::try_from(30).unwrap(), GgmlType::BF16);
-        assert_eq!(GgmlType::try_from(34).unwrap(), GgmlType::TQ1_0);
-        assert_eq!(GgmlType::try_from(35).unwrap(), GgmlType::TQ2_0);
+        // Ternary types 34/35/36 are explicitly rejected (moved to ternary-rs).
+        assert!(GgmlType::try_from(34).is_err());
+        assert!(GgmlType::try_from(35).is_err());
+        assert!(GgmlType::try_from(36).is_err());
         assert!(GgmlType::try_from(99).is_err());
     }
 
@@ -1707,86 +1232,8 @@ mod tests {
         assert!((ft.data()[1] - -1.0).abs() < f32::EPSILON);
     }
 
-    #[test]
-    fn end_to_end_tq2_tensor() {
-        let mut b = GgufBuilder::new();
-
-        // Build one TQ2_0 block: 256 elements
-        let mut block = vec![0u8; TQ2_BLOCK_BYTES];
-        // First 64 bytes: all GGUF code 2 (= +1) → 0xAA per byte
-        // GGUF 2 in each 2-bit slot: 2|(2<<2)|(2<<4)|(2<<6) = 0xAA
-        for i in 0..64 {
-            block[i] = 0xAA;
-        }
-        // Scale: f16 0.5
-        block[64] = 0x00;
-        block[65] = 0x38;
-
-        b.add_tensor(
-            "blk.0.attn_q.weight",
-            &[16, 16],
-            GgmlType::TQ2_0 as u32,
-            block,
-        );
-        let data = b.build();
-
-        let gguf = GgufFile::open_reader(Cursor::new(data.clone())).unwrap();
-        let (tensor, scale) = gguf
-            .load_ternary_from_reader("blk.0.attn_q.weight", Cursor::new(data))
-            .unwrap();
-
-        assert_eq!(tensor.rows(), 16);
-        assert_eq!(tensor.cols(), 16);
-        assert!((scale - 0.5).abs() < f32::EPSILON);
-
-        // All values should be Pos
-        for r in 0..16 {
-            for c in 0..16 {
-                assert_eq!(tensor.get(r, c), Ternary::Pos, "({r},{c})");
-            }
-        }
-    }
-
-    #[test]
-    fn end_to_end_tq1_tensor() {
-        let mut b = GgufBuilder::new();
-
-        // Build one TQ1_0 block: all Zero (base3 = 121 for each byte)
-        let mut block = vec![0u8; TQ1_BLOCK_BYTES];
-        for i in 0..48 {
-            block[i] = 121; // all Zero in base-3
-        }
-        // Tail: GGUF code 1 = Zero → 1|(1<<2)|(1<<4)|(1<<6) = 0x55
-        for i in 48..52 {
-            block[i] = 0x55;
-        }
-        // Scale: f16 1.0
-        block[52] = 0x00;
-        block[53] = 0x3C;
-
-        b.add_tensor(
-            "blk.0.ffn.weight",
-            &[16, 16],
-            GgmlType::TQ1_0 as u32,
-            block,
-        );
-        let data = b.build();
-
-        let gguf = GgufFile::open_reader(Cursor::new(data.clone())).unwrap();
-        let (tensor, scale) = gguf
-            .load_ternary_from_reader("blk.0.ffn.weight", Cursor::new(data))
-            .unwrap();
-
-        assert_eq!(tensor.rows(), 16);
-        assert_eq!(tensor.cols(), 16);
-        assert!((scale - 1.0).abs() < f32::EPSILON);
-
-        for r in 0..16 {
-            for c in 0..16 {
-                assert_eq!(tensor.get(r, c), Ternary::Zero, "({r},{c})");
-            }
-        }
-    }
+    // end_to_end_tq2_tensor and end_to_end_tq1_tensor deleted —
+    // ternary tensor loading lives in ternary-rs.
 
     #[test]
     fn alignment_padding() {
@@ -1801,41 +1248,8 @@ mod tests {
         assert_eq!(gguf.tensor_data_offset % DEFAULT_ALIGNMENT as u64, 0);
     }
 
-    #[test]
-    fn end_to_end_mixed_tensors() {
-        let mut b = GgufBuilder::new();
-
-        // F32 embedding
-        let embed_data: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        b.add_tensor("embed", &[2, 2], GgmlType::F32 as u32, embed_data);
-
-        // TQ2_0 weight
-        let mut tq2_block = vec![0u8; TQ2_BLOCK_BYTES];
-        for i in 0..64 {
-            tq2_block[i] = 0xAA; // all Pos
-        }
-        tq2_block[64] = 0x00;
-        tq2_block[65] = 0x3C; // scale = 1.0
-        b.add_tensor("weight", &[16, 16], GgmlType::TQ2_0 as u32, tq2_block);
-
-        let data = b.build();
-        let gguf = GgufFile::open_reader(Cursor::new(data.clone())).unwrap();
-
-        // Load both
-        let ft = gguf
-            .load_float_from_reader("embed", Cursor::new(data.clone()))
-            .unwrap();
-        assert_eq!(ft.data(), &[1.0, 2.0, 3.0, 4.0]);
-
-        let (tt, scale) = gguf
-            .load_ternary_from_reader("weight", Cursor::new(data))
-            .unwrap();
-        assert_eq!(tt.rows(), 16);
-        assert!((scale - 1.0).abs() < f32::EPSILON);
-    }
+    // end_to_end_mixed_tensors deleted (referenced TQ2_0). The float
+    // tensor load path is exercised by other tests.
 
     #[test]
     fn default_alignment_when_missing() {
