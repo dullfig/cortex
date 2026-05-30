@@ -208,20 +208,7 @@ pub struct BlockScratch {
     pub up: wgpu::Buffer,        // [n_tokens, intermediate]
     pub activated: wgpu::Buffer, // [n_tokens, intermediate] SiLU(gate)*up
     pub projected: wgpu::Buffer, // [n_tokens, embed_dim] both attn-out-proj and FFN-down output reuse this
-    /// Scratch for the bitnet batch matmul path (#bn-5). Sized for the
-    /// widest input dim across Q/K/V projections (embed_dim) and FFN
-    /// (intermediate, for the gate/up projection in_features = embed_dim;
-    /// Vestigial scratch from the BitNet path. Kept as an empty marker
-    /// struct so the dispatch_linear_batch_* signatures don't churn;
-    /// will be removed in a follow-up that simplifies dispatchers
-    /// further.
-    pub ternary: TernaryScratch,
 }
-
-/// Vestigial — was the BitNet i8-activation scratch. Empty after the
-/// 2026-05-29 un-merge. The field stays on `BlockScratch` to avoid
-/// rippling signature changes; both members are zero-byte placeholders.
-pub struct TernaryScratch;
 
 impl BlockScratch {
     /// Allocate scratch buffers sized for a single forward of `n_tokens`.
@@ -244,7 +231,6 @@ impl BlockScratch {
             })
         };
         let f32_bytes = std::mem::size_of::<f32>() as u64;
-        let ternary = TernaryScratch;
         Self {
             // Phase C1: scratch.normed packed f16 (half bytes).
             normed:    mk((n_tokens * embed_dim * 2) as u64, "scratch.normed"),
@@ -274,7 +260,6 @@ impl BlockScratch {
             // f32 under Option E to fix BitNet's matmul saturation, but
             // BitNet is gone post-2026-05-29 un-merge.)
             projected: mk((n_tokens * embed_dim * 2) as u64, "scratch.projected"),
-            ternary,
         }
     }
 }
@@ -1019,7 +1004,6 @@ impl GpuEngine {
         in_packed_buf: &wgpu::Buffer,
         out_packed_buf: &wgpu::Buffer,
         n_tokens: usize,
-        _ternary_scratch: &TernaryScratch,
     ) {
         let float = layer
             .as_any()
@@ -1108,13 +1092,12 @@ impl GpuEngine {
         in_buf: &wgpu::Buffer,
         out_buf: &wgpu::Buffer,
         n_tokens: usize,
-        ternary_scratch: &TernaryScratch,
     ) {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("gpu_engine.linear_batch.pass"),
             timestamp_writes: None,
         });
-        self.dispatch_linear_batch_in_pass(&mut pass, layer, in_buf, out_buf, n_tokens, ternary_scratch);
+        self.dispatch_linear_batch_in_pass(&mut pass, layer, in_buf, out_buf, n_tokens);
     }
 
     /// Phase C2 encoder-level wrapper for packed-IO linear-batch.
@@ -1125,13 +1108,12 @@ impl GpuEngine {
         in_packed_buf: &wgpu::Buffer,
         out_packed_buf: &wgpu::Buffer,
         n_tokens: usize,
-        ternary_scratch: &TernaryScratch,
     ) {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("gpu_engine.linear_batch_packed_io.pass"),
             timestamp_writes: None,
         });
-        self.dispatch_linear_batch_packed_io_in_pass(&mut pass, layer, in_packed_buf, out_packed_buf, n_tokens, ternary_scratch);
+        self.dispatch_linear_batch_packed_io_in_pass(&mut pass, layer, in_packed_buf, out_packed_buf, n_tokens);
     }
 
     /// Phase C2 encoder-level wrapper for packed gate_mul.
@@ -1160,13 +1142,12 @@ impl GpuEngine {
         in_packed_buf: &wgpu::Buffer,
         out_buf: &wgpu::Buffer,
         n_tokens: usize,
-        ternary_scratch: &TernaryScratch,
     ) {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("gpu_engine.linear_batch_packed_input.pass"),
             timestamp_writes: None,
         });
-        self.dispatch_linear_batch_packed_input_in_pass(&mut pass, layer, in_packed_buf, out_buf, n_tokens, ternary_scratch);
+        self.dispatch_linear_batch_packed_input_in_pass(&mut pass, layer, in_packed_buf, out_buf, n_tokens);
     }
 
     /// In-pass variant. See `dispatch_linear_batch_into`. Float-only.
@@ -1177,7 +1158,6 @@ impl GpuEngine {
         in_buf: &wgpu::Buffer,
         out_buf: &wgpu::Buffer,
         n_tokens: usize,
-        _ternary_scratch: &TernaryScratch,
     ) {
         self.dispatch_matmul_in_pass(pass, layer, in_buf, out_buf, n_tokens);
     }
@@ -1190,7 +1170,6 @@ impl GpuEngine {
         in_packed_buf: &wgpu::Buffer,
         out_buf: &wgpu::Buffer,
         n_tokens: usize,
-        _ternary_scratch: &TernaryScratch,
     ) {
         self.dispatch_matmul_packed_input_in_pass(pass, layer, in_packed_buf, out_buf, n_tokens);
     }
@@ -2610,15 +2589,15 @@ impl GpuEngine {
             // 2-4. Q, K, V projections (+ optional Qwen-style biases).
             // C3: scratch.q/k/v packed → packed_io dispatcher; bias add
             // and RoPE use their packed variants.
-            self.dispatch_linear_batch_packed_io_in_pass(&mut pass, attn.q_proj(), &scratch.normed, &scratch.q, n_tokens, &scratch.ternary);
+            self.dispatch_linear_batch_packed_io_in_pass(&mut pass, attn.q_proj(), &scratch.normed, &scratch.q, n_tokens);
             if let Some(buf) = block_gpu.q_bias_buf.as_ref() {
                 self.dispatch_bias_add_packed_in_pass(&mut pass, &scratch.q, buf, q_dim, n_tokens);
             }
-            self.dispatch_linear_batch_packed_io_in_pass(&mut pass, attn.k_proj(), &scratch.normed, &scratch.k, n_tokens, &scratch.ternary);
+            self.dispatch_linear_batch_packed_io_in_pass(&mut pass, attn.k_proj(), &scratch.normed, &scratch.k, n_tokens);
             if let Some(buf) = block_gpu.k_bias_buf.as_ref() {
                 self.dispatch_bias_add_packed_in_pass(&mut pass, &scratch.k, buf, kv_dim, n_tokens);
             }
-            self.dispatch_linear_batch_packed_io_in_pass(&mut pass, attn.v_proj(), &scratch.normed, &scratch.v, n_tokens, &scratch.ternary);
+            self.dispatch_linear_batch_packed_io_in_pass(&mut pass, attn.v_proj(), &scratch.normed, &scratch.v, n_tokens);
             if let Some(buf) = block_gpu.v_bias_buf.as_ref() {
                 self.dispatch_bias_add_packed_in_pass(&mut pass, &scratch.v, buf, kv_dim, n_tokens);
             }
@@ -2676,7 +2655,7 @@ impl GpuEngine {
             // 7. O projection — C3 restored: packed attn_out → packed projected.
             // (BitNet sub-norm branches removed with the 2026-05-29 un-merge;
             // float models never had o_sub_norm_weight_buf set.)
-            self.dispatch_linear_batch_packed_io_in_pass(&mut pass, attn.o_proj(), &scratch.attn_out, &scratch.projected, n_tokens, &scratch.ternary);
+            self.dispatch_linear_batch_packed_io_in_pass(&mut pass, attn.o_proj(), &scratch.attn_out, &scratch.projected, n_tokens);
 
             // 8. Residual: hidden (packed) += projected (packed) — C3.
             self.dispatch_add_packed_in_pass(&mut pass, hidden_buf, &scratch.projected, embed_dim, n_tokens);
@@ -2698,8 +2677,8 @@ impl GpuEngine {
                 &scratch.normed, &scratch.gate, &scratch.up, n_tokens,
             );
             if !fused_ok {
-                self.dispatch_linear_batch_packed_io_in_pass(&mut pass, swiglu.gate_proj(), &scratch.normed, &scratch.gate, n_tokens, &scratch.ternary);
-                self.dispatch_linear_batch_packed_io_in_pass(&mut pass, swiglu.up_proj(),   &scratch.normed, &scratch.up,   n_tokens, &scratch.ternary);
+                self.dispatch_linear_batch_packed_io_in_pass(&mut pass, swiglu.gate_proj(), &scratch.normed, &scratch.gate, n_tokens);
+                self.dispatch_linear_batch_packed_io_in_pass(&mut pass, swiglu.up_proj(),   &scratch.normed, &scratch.up,   n_tokens);
             }
 
             // 12. silu(gate) * up — packed in C2.
@@ -2708,7 +2687,7 @@ impl GpuEngine {
             // 13. Down projection — C3: packed input, packed output.
             // (BitNet ffn_sub_norm branch removed with the 2026-05-29 un-merge;
             // float models never had ffn_sub_norm_weight_buf set.)
-            self.dispatch_linear_batch_packed_io_in_pass(&mut pass, swiglu.down_proj(), &scratch.activated, &scratch.projected, n_tokens, &scratch.ternary);
+            self.dispatch_linear_batch_packed_io_in_pass(&mut pass, swiglu.down_proj(), &scratch.activated, &scratch.projected, n_tokens);
 
             // 14. Residual: hidden (packed) += projected (packed) — C3.
             self.dispatch_add_packed_in_pass(&mut pass, hidden_buf, &scratch.projected, embed_dim, n_tokens);
@@ -2803,15 +2782,15 @@ impl GpuEngine {
         );
 
         // 2-4. Q, K, V projections — C3: packed input AND packed output.
-        self.dispatch_linear_batch_packed_io_into(encoder, attn.q_proj(), &scratch.normed, &scratch.q, n_tokens, &scratch.ternary);
+        self.dispatch_linear_batch_packed_io_into(encoder, attn.q_proj(), &scratch.normed, &scratch.q, n_tokens);
         if let Some(buf) = block_gpu.q_bias_buf.as_ref() {
             self.dispatch_bias_add_packed_into(encoder, &scratch.q, buf, n_heads * head_dim, n_tokens);
         }
-        self.dispatch_linear_batch_packed_io_into(encoder, attn.k_proj(), &scratch.normed, &scratch.k, n_tokens, &scratch.ternary);
+        self.dispatch_linear_batch_packed_io_into(encoder, attn.k_proj(), &scratch.normed, &scratch.k, n_tokens);
         if let Some(buf) = block_gpu.k_bias_buf.as_ref() {
             self.dispatch_bias_add_packed_into(encoder, &scratch.k, buf, kv_dim, n_tokens);
         }
-        self.dispatch_linear_batch_packed_io_into(encoder, attn.v_proj(), &scratch.normed, &scratch.v, n_tokens, &scratch.ternary);
+        self.dispatch_linear_batch_packed_io_into(encoder, attn.v_proj(), &scratch.normed, &scratch.v, n_tokens);
         if let Some(buf) = block_gpu.v_bias_buf.as_ref() {
             self.dispatch_bias_add_packed_into(encoder, &scratch.v, buf, kv_dim, n_tokens);
         }
@@ -2896,7 +2875,7 @@ impl GpuEngine {
         );
 
         // 7. O projection — C3: packed attn_out → packed projected.
-        self.dispatch_linear_batch_packed_io_into(encoder, attn.o_proj(), &scratch.attn_out, &scratch.projected, n_tokens, &scratch.ternary);
+        self.dispatch_linear_batch_packed_io_into(encoder, attn.o_proj(), &scratch.attn_out, &scratch.projected, n_tokens);
 
         // 8. Residual — C3: hidden packed += projected packed.
         self.dispatch_add_packed_into(encoder, hidden_buf, &scratch.projected, embed_dim, n_tokens);
@@ -2909,12 +2888,12 @@ impl GpuEngine {
             embed_dim, n_tokens, block_gpu.ffn_norm_eps,
         );
         // C2 polar: gate/up/activated packed; use packed-IO router.
-        self.dispatch_linear_batch_packed_io_into(encoder, swiglu.gate_proj(), &scratch.normed, &scratch.gate, n_tokens, &scratch.ternary);
-        self.dispatch_linear_batch_packed_io_into(encoder, swiglu.up_proj(),   &scratch.normed, &scratch.up,   n_tokens, &scratch.ternary);
+        self.dispatch_linear_batch_packed_io_into(encoder, swiglu.gate_proj(), &scratch.normed, &scratch.gate, n_tokens);
+        self.dispatch_linear_batch_packed_io_into(encoder, swiglu.up_proj(),   &scratch.normed, &scratch.up,   n_tokens);
         self.dispatch_gate_mul_packed_into(encoder, &scratch.gate, &scratch.up, &scratch.activated, intermediate, n_tokens, swiglu.activation());
 
         // C3 down_proj: packed input, packed output.
-        self.dispatch_linear_batch_packed_io_into(encoder, swiglu.down_proj(), &scratch.activated, &scratch.projected, n_tokens, &scratch.ternary);
+        self.dispatch_linear_batch_packed_io_into(encoder, swiglu.down_proj(), &scratch.activated, &scratch.projected, n_tokens);
         // C3: hidden packed += projected packed.
         self.dispatch_add_packed_into(encoder, hidden_buf, &scratch.projected, embed_dim, n_tokens);
 
