@@ -223,15 +223,6 @@ pub struct Pipelines {
     /// Phase C3: packed residual add (both sides packed —
     /// hidden_buf += scratch.projected when projected is packed).
     pub add_inplace_batch_packed: wgpu::ComputePipeline,
-    /// Option E (BitNet fix): residual add with f32 `a` (hidden_buf
-    /// reverted to f32) and packed-f16 `b` (scratch.projected stays packed).
-    pub add_inplace_batch_f32a_packedb: wgpu::ComputePipeline,
-    /// Option E: fully-f32 broadcast add for the injection shim hook.
-    pub add_broadcast_batch_f32: wgpu::ComputePipeline,
-    /// Option E (extended): fully-f32 residual add. Used when both
-    /// hidden_buf AND scratch.projected revert to f32 (BitNet matmul
-    /// outputs exceed f16 ceiling, so projected can't stay packed).
-    pub add_inplace_batch_f32: wgpu::ComputePipeline,
     /// Fused gate + up SwiGLU projection. One dispatch reads input once,
     /// computes both gate and up outputs (2 rows × 2 projections per
     /// thread). Halves the input HBM bandwidth for the gate/up pair.
@@ -315,9 +306,6 @@ impl Pipelines {
             rope_batch_packed: make(include_str!("shaders/rope_batch_packed.wgsl"), "rope_batch_packed"),
             bias_add_batch_packed: make(include_str!("shaders/bias_add_batch_packed.wgsl"), "bias_add_batch_packed"),
             add_inplace_batch_packed: make(include_str!("shaders/add_inplace_batch_packed.wgsl"), "add_inplace_batch_packed"),
-            add_inplace_batch_f32a_packedb: make(include_str!("shaders/add_inplace_batch_f32a_packedb.wgsl"), "add_inplace_batch_f32a_packedb"),
-            add_broadcast_batch_f32: make(include_str!("shaders/add_broadcast_batch_f32.wgsl"), "add_broadcast_batch_f32"),
-            add_inplace_batch_f32: make(include_str!("shaders/add_inplace_batch_f32.wgsl"), "add_inplace_batch_f32"),
             matmul_gate_up_shared: make(include_str!("shaders/matmul_gate_up_shared.wgsl"), "matmul_gate_up_shared"),
             rmsnorm_batch: make(include_str!("shaders/rmsnorm_batch.wgsl"), "rmsnorm_batch"),
             rmsnorm_batch_packed_to_f32: make(include_str!("shaders/rmsnorm_batch_packed_to_f32.wgsl"), "rmsnorm_batch_packed_to_f32"),
