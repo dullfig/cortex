@@ -254,6 +254,11 @@ pub struct Pipelines {
     pub attn_score_batch: wgpu::ComputePipeline,
     pub softmax_batch: wgpu::ComputePipeline,
     pub attn_value_batch: wgpu::ComputePipeline,
+    /// Fused score+softmax+value (FlashAttention-1, online softmax).
+    /// Replaces the 3-shader path for production chat completion.
+    /// The 3-shader path stays compiled because it's needed by the
+    /// retrieval trace mode (pre_softmax_capture).
+    pub attn_fused_batch: wgpu::ComputePipeline,
     // Broadcast bias add (Q/K/V biases for Qwen-family)
     pub bias_add_batch: wgpu::ComputePipeline,
 }
@@ -327,6 +332,7 @@ impl Pipelines {
             attn_score_batch: make(include_str!("shaders/attn_score_batch.wgsl"), "attn_score_batch"),
             softmax_batch: make(include_str!("shaders/softmax_batch.wgsl"), "softmax_batch"),
             attn_value_batch: make(include_str!("shaders/attn_value_batch.wgsl"), "attn_value_batch"),
+            attn_fused_batch: make(include_str!("shaders/attn_fused_batch.wgsl"), "attn_fused_batch"),
             bias_add_batch: make(include_str!("shaders/bias_add_batch.wgsl"), "bias_add_batch"),
         }
     }

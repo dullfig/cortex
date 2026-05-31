@@ -3131,6 +3131,54 @@ impl GpuEngine {
         let kv_dim = n_kv_heads * head_dim;
         let scale = 1.0 / (head_dim as f32).sqrt();
 
+        // Dual-path routing.
+        //
+        // Legacy 3-shader path is the DEFAULT — it parallelizes
+        // massively across (tok, head, t) (millions of threads on a
+        // 2000-token prefill) and was heavily tuned through the
+        // C-series work. The FlashAttention-1 fused shader exists for
+        // numerical-parity experiments and as infrastructure for
+        // future split-K / FA2 optimization, but at current per-tile
+        // barrier overhead it's ~2x slower than legacy on RTX 4080
+        // Laptop at 500w (132ms vs 60ms cumulative attention).
+        //
+        // Opt-in via CORTEX_ATTN_BACKEND=fused. Forced to legacy
+        // (regardless of env) when pre_softmax_capture is set, because
+        // the fused path can't materialize the full scores matrix that
+        // retrieval trace mode needs.
+        let force_fused = std::env::var("CORTEX_ATTN_BACKEND")
+            .as_deref() == Ok("fused");
+        let needs_capture = pre_softmax_capture.is_some();
+        let use_fused = head_dim == 128 && !needs_capture && force_fused;
+        if use_fused {
+            let params = AttnScoreBatchParams {
+                n_heads: n_heads as u32,
+                n_kv_heads: n_kv_heads as u32,
+                head_dim: head_dim as u32,
+                start_pos: start_pos as u32,
+                max_seq: max_seq as u32,
+                heads_per_kv: heads_per_kv as u32,
+                kv_dim: kv_dim as u32,
+                scale,
+                n_tokens: n_tokens as u32,
+                _p1: 0, _p2: 0, _p3: 0,
+            };
+            let params_buf = self.gpu.create_params_buffer(&params);
+            let pipeline = &self.gpu.pipelines.attn_fused_batch;
+            let bind = self.gpu.make_bind_group(
+                pipeline,
+                &[q_buf, k_buf, v_buf, out_buf, &params_buf],
+            );
+            let mut pass = self.begin_timed_pass(encoder, "attn_fused");
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            // Dispatch: one workgroup per (head, tok).
+            pass.dispatch_workgroups(n_heads as u32, n_tokens as u32, 1);
+            return;
+        }
+
+        // ---- Legacy 3-shader path (trace mode / fallback) ----
+
         // Bisect within attention (attn-3 followup): env-gated skip of
         // individual stages, to identify which of score/softmax/value
         // actually dominates wall time. Stage that, when skipped, gives
