@@ -136,6 +136,30 @@ struct AddInplaceBatchParams {
     n_tokens: u32,
 }
 
+/// Params struct for the argmax_vocab shader. Two u32s.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct ArgmaxVocabParams {
+    n: u32,
+    _pad: u32,
+}
+
+/// Resident LM-head weights for the GPU greedy decode path.
+///
+/// Materialized once at engine init from whichever `OutputProjection`
+/// variant the loader produced. For `Linear(GpuFloatLinear)` (the common
+/// case when GPU is available) the buffer is cloned from the existing
+/// layer's resident weights — `wgpu::Buffer` is internally `Arc`-wrapped
+/// so no GPU memory is duplicated. For `Float`/`TiedEmbedding` we pack
+/// the f32 weights to f16 and upload a fresh buffer. `None` if the
+/// projection isn't a shape the GPU shader can handle (odd in_features
+/// can't be packed, etc.) — the caller falls through to the CPU path.
+pub(crate) struct LmHead {
+    pub(crate) weight_buf: wgpu::Buffer,
+    pub(crate) vocab_size: usize,
+    pub(crate) embed_dim: usize,
+}
+
 /// Per-block GPU resources extracted at construction time. Holds resident
 /// rmsnorm weights for the two norms inside a `TransformerBlock`. The matvec
 /// weights are accessed lazily via the CPU model's block at dispatch time
@@ -303,6 +327,10 @@ pub struct GpuEngine {
     /// `None`, passes open as regular untimed passes — the prefill
     /// resets this back to None at end-of-forward.
     pass_timer: std::sync::Mutex<Option<PassTimerState>>,
+    /// Resident LM-head weights for the GPU greedy decode fast path.
+    /// `None` when the projection isn't GPU-able (e.g. odd in_features
+    /// that the packed-f16 shaders can't handle).
+    lm_head: Option<LmHead>,
 }
 
 /// GPU-side timestamp tracing. One QuerySet sized for the longest
@@ -446,6 +474,51 @@ impl GpuEngine {
             None
         };
 
+        // Materialize the LM-head as a single resident packed-f16 buffer
+        // so the greedy decode path can dispatch matmul + argmax without
+        // a vocab-sized readback. For the common GPU-loader case (Linear
+        // wrapping a GpuFloatLinear), we clone the existing buffer
+        // (wgpu::Buffer is Arc-wrapped — no GPU memory duplicated). For
+        // TiedEmbedding / Float we pack f32 → f16 and upload a fresh
+        // buffer. Odd in_features can't be packed, in which case the
+        // fast path is unavailable and lm_head stays None — callers
+        // fall through to CPU finalize_logits.
+        let vocab_size = cpu.vocab_size();
+        let lm_head: Option<LmHead> = if embed_dim % 2 == 0 {
+            match cpu.output_proj() {
+                crate::layers::model::OutputProjection::Linear(layer) => {
+                    layer
+                        .as_any()
+                        .downcast_ref::<crate::layers::gpu_floatlinear::GpuFloatLinear>()
+                        .map(|gpu_layer| LmHead {
+                            weight_buf: gpu_layer.weight_buffer().clone(),
+                            vocab_size,
+                            embed_dim,
+                        })
+                }
+                crate::layers::model::OutputProjection::Float(tensor) => {
+                    let packed = GpuDevice::pack_f16(tensor.data());
+                    let buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("gpu_engine.lm_head.float"),
+                        contents: bytemuck::cast_slice(&packed),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    });
+                    Some(LmHead { weight_buf: buf, vocab_size, embed_dim })
+                }
+                crate::layers::model::OutputProjection::TiedEmbedding => {
+                    let packed = GpuDevice::pack_f16(cpu.embedding_data());
+                    let buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("gpu_engine.lm_head.tied"),
+                        contents: bytemuck::cast_slice(&packed),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    });
+                    Some(LmHead { weight_buf: buf, vocab_size, embed_dim })
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             cpu,
             gpu,
@@ -458,6 +531,7 @@ impl GpuEngine {
             rope_max_seq: max_seq,
             timer,
             pass_timer: std::sync::Mutex::new(None),
+            lm_head,
         }
     }
 
@@ -2365,6 +2439,248 @@ impl GpuEngine {
             "fwd_cache stage timings",
         );
         normed
+    }
+
+    /// Internal: matmul of the resident LM-head weights against an input
+    /// packed-f16 buffer. Same wiring as `dispatch_matmul_pin_inner_in_pass`
+    /// but takes raw (buffer, rows, cols) rather than a `GpuFloatLinear`
+    /// reference — the LM-head is stored on the engine, not behind the
+    /// LinearLayer trait. n_tokens is always 1 in the greedy path (we
+    /// project just the last token's slice).
+    fn dispatch_lm_head_matmul_pin_in_pass(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        lm_head: &LmHead,
+        in_packed_buf: &wgpu::Buffer,
+        out_buf: &wgpu::Buffer,
+    ) {
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct MatmulParams { rows: u32, cols: u32, n_tokens: u32, _pad: u32 }
+        let params = MatmulParams {
+            rows: lm_head.vocab_size as u32,
+            cols: lm_head.embed_dim as u32,
+            n_tokens: 1,
+            _pad: 0,
+        };
+        let params_buf = self.gpu.create_params_buffer(&params);
+        let pipeline = &self.gpu.pipelines.matmul_pin;
+        let bind = self.gpu.make_bind_group(
+            pipeline,
+            &[&lm_head.weight_buf, in_packed_buf, out_buf, &params_buf],
+        );
+        // matmul_pin uses (wid.x + wid.y * 65535) row indexing — Qwen
+        // 151k vocab requires dy = 3.
+        let rows = lm_head.vocab_size;
+        let dx = (rows.min(65535)) as u32;
+        let dy = ((rows + 65534) / 65535) as u32;
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(dx, dy, 1);
+    }
+
+    /// Internal: single-WG argmax reduction over `logits_buf` (length
+    /// `vocab_size` f32). Writes one u32 to `out_id_buf[0]`.
+    fn dispatch_argmax_vocab_in_pass(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        logits_buf: &wgpu::Buffer,
+        out_id_buf: &wgpu::Buffer,
+        vocab_size: usize,
+    ) {
+        let params = ArgmaxVocabParams { n: vocab_size as u32, _pad: 0 };
+        let params_buf = self.gpu.create_params_buffer(&params);
+        let pipeline = &self.gpu.pipelines.argmax_vocab;
+        let bind = self.gpu.make_bind_group(
+            pipeline, &[logits_buf, out_id_buf, &params_buf],
+        );
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+
+    /// GPU greedy fast-path: runs the full forward like
+    /// `forward_full_gpu_with_cache_inject_returning_hidden`, then
+    /// projects ONLY the last token through the LM head and runs
+    /// argmax — all on GPU, with a 4-byte readback instead of the
+    /// usual ~1.2 MB logits readback.
+    ///
+    /// Returns `None` if the LM-head isn't GPU-resident (engine init
+    /// couldn't materialize a packed-f16 buffer for the projection)
+    /// — callers should fall through to the CPU sampler path.
+    /// Otherwise returns `Some(token_id)`.
+    ///
+    /// Only valid for greedy sampling (`temperature <= 0` with
+    /// `top_k <= 1` and no repetition penalty). Callers must not use
+    /// this when stochastic sampling is requested.
+    pub fn forward_full_gpu_with_cache_inject_argmax_greedy(
+        &self,
+        tokens: &[u32],
+        cache: &mut crate::layers::gpu_kv_cache::GpuKvCache,
+        inject_deltas: &[Option<wgpu::Buffer>],
+    ) -> Option<u32> {
+        let lm_head = self.lm_head.as_ref()?;
+
+        let n_tokens = tokens.len();
+        assert!(n_tokens > 0, "must have at least one token");
+
+        let n_layers = self.cpu.n_layers();
+        assert_eq!(n_layers, cache.n_layers(), "cache layer count mismatch");
+
+        let attn0 = self.cpu.blocks()[0].attention();
+        assert_eq!(cache.n_kv_heads(), attn0.n_kv_heads(), "cache n_kv_heads mismatch");
+        assert_eq!(cache.head_dim(), attn0.head_dim(), "cache head_dim mismatch");
+
+        let start_pos = cache.seq_len();
+        assert!(
+            start_pos + n_tokens <= cache.max_seq_len(),
+            "cache overflow: {} + {} > {}",
+            start_pos, n_tokens, cache.max_seq_len(),
+        );
+
+        // Embedding (CPU, same as the returning_hidden path).
+        let embed_data = self.cpu.embedding_data();
+        let vocab_size = self.cpu.vocab_size();
+        let mut hidden_init: Vec<f32> = Vec::with_capacity(n_tokens * self.embed_dim);
+        for &tok in tokens {
+            assert!((tok as usize) < vocab_size, "token {tok} out of vocab");
+            let off = tok as usize * self.embed_dim;
+            hidden_init.extend_from_slice(&embed_data[off..off + self.embed_dim]);
+        }
+
+        let packed_bytes = (hidden_init.len() * 2) as u64;
+        let hidden_packed = GpuDevice::pack_f16(&hidden_init);
+        let hidden_buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("forward_with_cache_argmax.hidden"),
+            contents: bytemuck::cast_slice(&hidden_packed),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let normed_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("forward_with_cache_argmax.normed"),
+            size: packed_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let intermediate = self.cpu.blocks()[0].ffn().as_any()
+            .downcast_ref::<crate::layers::swiglu::SwiGLU>()
+            .unwrap_or_else(|| panic!("forward_with_cache_argmax requires SwiGLU FFN"))
+            .intermediate_size();
+
+        let attn_max_seq = start_pos + n_tokens;
+        let scratch = BlockScratch::allocate(
+            &self.gpu, n_tokens, self.embed_dim,
+            attn0.n_heads(), attn0.n_kv_heads(), attn0.head_dim(),
+            intermediate, attn_max_seq,
+        );
+
+        if !inject_deltas.is_empty() {
+            assert_eq!(
+                inject_deltas.len(), n_layers,
+                "inject_deltas must be empty or have length n_layers ({})", n_layers,
+            );
+        }
+
+        // Last-token slice buffer (packed f16, [embed_dim/2] u32s).
+        let last_token_bytes = (self.embed_dim * 2) as u64;
+        let last_token_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("forward_with_cache_argmax.last_token_packed"),
+            size: last_token_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // Vocab-sized f32 logits buffer.
+        let logits_bytes = (lm_head.vocab_size * std::mem::size_of::<f32>()) as u64;
+        let logits_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("forward_with_cache_argmax.logits"),
+            size: logits_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        // 4-byte argmax output + matching staging.
+        let token_id_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("forward_with_cache_argmax.token_id"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging = self.gpu.create_staging_buffer(4);
+
+        let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("forward_with_cache_argmax.encoder"),
+        });
+
+        // All N blocks. Same call shape as the returning_hidden path
+        // minus the per-block hidden-state finite capture.
+        for i in 0..n_layers {
+            let target = (cache.k_layer(i), cache.v_layer(i));
+            let inject = inject_deltas.get(i).and_then(|opt| opt.as_ref());
+            self.forward_block_gpu_inner(
+                &mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch,
+                None, Some(target), None, inject,
+            );
+        }
+
+        // Final norm: packed → packed.
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("forward_with_cache_argmax.final_norm.pass"),
+                timestamp_writes: None,
+            });
+            self.dispatch_rmsnorm_packed_to_packed_in_pass(
+                &mut pass, &hidden_buf, &self.final_norm_weight_buf, &normed_buf,
+                self.embed_dim, n_tokens, self.final_norm_eps,
+            );
+        }
+
+        // Copy the last token's packed row out of normed_buf.
+        // normed_buf layout: [n_tokens, embed_dim/2] u32, so the last
+        // token starts at byte offset (n_tokens-1) * embed_dim * 2.
+        let last_token_offset = ((n_tokens - 1) * self.embed_dim * 2) as u64;
+        encoder.copy_buffer_to_buffer(
+            &normed_buf, last_token_offset,
+            &last_token_buf, 0,
+            last_token_bytes,
+        );
+
+        // LM-head matmul: 1 × vocab_size logits.
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("forward_with_cache_argmax.lm_head.pass"),
+                timestamp_writes: None,
+            });
+            self.dispatch_lm_head_matmul_pin_in_pass(
+                &mut pass, lm_head, &last_token_buf, &logits_buf,
+            );
+        }
+
+        // Argmax → 4-byte token id.
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("forward_with_cache_argmax.argmax.pass"),
+                timestamp_writes: None,
+            });
+            self.dispatch_argmax_vocab_in_pass(
+                &mut pass, &logits_buf, &token_id_buf, lm_head.vocab_size,
+            );
+        }
+        encoder.copy_buffer_to_buffer(&token_id_buf, 0, &staging, 0, 4);
+
+        self.gpu.queue.submit(Some(encoder.finish()));
+
+        // 4-byte readback (vs ~1.2 MB on the legacy path for Qwen 3B).
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+        self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+        rx.recv().expect("token-id readback failed").expect("token-id map failed");
+        let data = slice.get_mapped_range();
+        let token_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        drop(data);
+        staging.unmap();
+
+        cache.advance(n_tokens);
+        Some(token_id)
     }
 
     /// **Phase 1 close — full forward on GPU.** Embedding lookup runs CPU

@@ -1201,13 +1201,26 @@ fn generate_with_cache(
     eos: u32,
     max_tokens: usize,
 ) -> Vec<u32> {
-    let mut sampler = Sampler::new(sampler_config, seed);
+    let mut sampler = Sampler::new(sampler_config.clone(), seed);
+    let greedy_gpu = lm_head_greedy_eligible(&sampler_config);
 
-    let prefill_logits = engine.forward_full_gpu_with_cache(prompt_tokens, cache);
-    let vocab = engine.vocab_size();
-    let last_logits_start = (prompt_tokens.len() - 1) * vocab;
-    let last_logits = &prefill_logits[last_logits_start..last_logits_start + vocab];
-    let mut next_token = sampler.sample(last_logits);
+    let mut next_token = if greedy_gpu {
+        if let Some(tok) = engine.forward_full_gpu_with_cache_inject_argmax_greedy(
+            prompt_tokens, cache, &[],
+        ) {
+            tok
+        } else {
+            let prefill_logits = engine.forward_full_gpu_with_cache(prompt_tokens, cache);
+            let vocab = engine.vocab_size();
+            let last_logits_start = (prompt_tokens.len() - 1) * vocab;
+            sampler.sample(&prefill_logits[last_logits_start..last_logits_start + vocab])
+        }
+    } else {
+        let prefill_logits = engine.forward_full_gpu_with_cache(prompt_tokens, cache);
+        let vocab = engine.vocab_size();
+        let last_logits_start = (prompt_tokens.len() - 1) * vocab;
+        sampler.sample(&prefill_logits[last_logits_start..last_logits_start + vocab])
+    };
 
     let mut out = Vec::new();
     if next_token == eos {
@@ -1216,14 +1229,39 @@ fn generate_with_cache(
     out.push(next_token);
 
     for _ in 1..max_tokens {
-        let logits = engine.forward_full_gpu_with_cache(&[next_token], cache);
-        next_token = sampler.sample(&logits);
+        next_token = if greedy_gpu {
+            if let Some(tok) = engine.forward_full_gpu_with_cache_inject_argmax_greedy(
+                &[next_token], cache, &[],
+            ) {
+                tok
+            } else {
+                let logits = engine.forward_full_gpu_with_cache(&[next_token], cache);
+                sampler.sample(&logits)
+            }
+        } else {
+            let logits = engine.forward_full_gpu_with_cache(&[next_token], cache);
+            sampler.sample(&logits)
+        };
         if next_token == eos {
             break;
         }
         out.push(next_token);
     }
     out
+}
+
+/// Greedy fast-path eligibility: the GPU LM-head + argmax shader can
+/// supply the next token directly (4-byte readback) only when the
+/// sampler config reduces to plain argmax — no temperature scaling,
+/// no top-k/p, no repetition penalty. `CORTEX_LM_HEAD=cpu` forces the
+/// legacy CPU path even for greedy requests (rollback switch).
+fn lm_head_greedy_eligible(cfg: &SamplerConfig) -> bool {
+    if std::env::var("CORTEX_LM_HEAD").as_deref() == Ok("cpu") {
+        return false;
+    }
+    let greedy = cfg.temperature <= 0.0 || cfg.top_k == 1;
+    let no_rep_penalty = cfg.repetition_penalty <= 1.0;
+    greedy && no_rep_penalty
 }
 
 /// Stateless GPU generation with optional steer + inject support.
@@ -1247,9 +1285,13 @@ fn generate_stateless_gpu(
     inject_deltas: &[Option<wgpu::Buffer>],
 ) -> Vec<u32> {
     let mut cache = engine.create_gpu_kv_cache(max_seq_len);
-    let mut sampler = Sampler::new(sampler_config, seed);
+    let mut sampler = Sampler::new(sampler_config.clone(), seed);
     let embed_dim = engine.embed_dim();
     let has_steers = !steers.is_empty();
+    // Greedy GPU LM-head fast path is incompatible with steers (steers
+    // mutate hidden BEFORE the projection, so we still need the full
+    // hidden readback for them).
+    let greedy_gpu = !has_steers && lm_head_greedy_eligible(&sampler_config);
 
     // Prefill: get [n_prompt * embed_dim] hidden (with inject), take
     // last token's slice, apply steers (if any), project, sample.
@@ -1262,6 +1304,22 @@ fn generate_stateless_gpu(
         apply_steers_inplace(steers, last_slice);
         let last_logits = engine.cpu().finalize_logits(last_slice, 1);
         sampler.sample(&last_logits)
+    } else if greedy_gpu {
+        // GPU greedy: forward + LM head + argmax all on device, 4-byte
+        // readback. Falls back to the CPU path if lm_head isn't resident.
+        if let Some(tok) = engine.forward_full_gpu_with_cache_inject_argmax_greedy(
+            prompt_tokens, &mut cache, inject_deltas,
+        ) {
+            tok
+        } else {
+            let prefill_hidden = engine.forward_full_gpu_with_cache_inject_returning_hidden(
+                prompt_tokens, &mut cache, inject_deltas,
+            );
+            let last_off = (prompt_tokens.len() - 1) * embed_dim;
+            let last_slice = &prefill_hidden[last_off..last_off + embed_dim];
+            let last_logits = engine.cpu().finalize_logits(last_slice, 1);
+            sampler.sample(&last_logits)
+        }
     } else {
         // Read hidden, project only the LAST token's slice through the
         // LM head. The previous version called forward_full_gpu_with_cache_inject
@@ -1283,21 +1341,33 @@ fn generate_stateless_gpu(
     out.push(next_token);
 
     for _ in 1..max_tokens {
-        let logits = if has_steers {
+        next_token = if has_steers {
             let mut hidden = engine.forward_full_gpu_with_cache_inject_returning_hidden(
                 &[next_token], &mut cache, inject_deltas,
             );
             apply_steers_inplace(steers, &mut hidden);
-            engine.cpu().finalize_logits(&hidden, 1)
+            let logits = engine.cpu().finalize_logits(&hidden, 1);
+            sampler.sample(&logits)
+        } else if greedy_gpu {
+            if let Some(tok) = engine.forward_full_gpu_with_cache_inject_argmax_greedy(
+                &[next_token], &mut cache, inject_deltas,
+            ) {
+                tok
+            } else {
+                let logits = engine.forward_full_gpu_with_cache_inject(
+                    &[next_token], &mut cache, inject_deltas,
+                );
+                sampler.sample(&logits)
+            }
         } else {
             // Decode: n_tokens=1, so forward_full_gpu_with_cache_inject's
             // internal finalize_logits is already only one token — no
             // wasted projection here. Keep the simple direct-logits path.
-            engine.forward_full_gpu_with_cache_inject(
+            let logits = engine.forward_full_gpu_with_cache_inject(
                 &[next_token], &mut cache, inject_deltas,
-            )
+            );
+            sampler.sample(&logits)
         };
-        next_token = sampler.sample(&logits);
         if next_token == eos {
             break;
         }
@@ -2141,14 +2211,19 @@ async fn chat_completions_stream(
     let inject_for_gen = inject_deltas;
     tokio::task::spawn_blocking(move || {
         let mut cache = state_for_gen.engine.create_gpu_kv_cache(state_for_gen.max_seq_len);
-        let mut sampler = Sampler::new(sampler_config, seed);
+        let mut sampler = Sampler::new(sampler_config.clone(), seed);
         let embed_dim = state_for_gen.engine.embed_dim();
         let has_steers = !steers_for_gen.is_empty();
+        // Greedy GPU LM-head fast path is incompatible with steers
+        // (which mutate hidden BEFORE the projection — they still need
+        // the full hidden readback).
+        let greedy_gpu = !has_steers && lm_head_greedy_eligible(&sampler_config);
 
-        // Prefill + first token. Three modes:
+        // Prefill + first token. Four modes:
         //  - steers (with or without inject): forward returns hidden,
         //    apply each steer's hidden_delta to last token, re-project,
         //    sample.
+        //  - no steers, greedy: GPU LM-head + argmax, 4-byte readback.
         //  - no steers, no inject: existing direct-projection fast path.
         //  - no steers, has inject: inject-aware forward returns logits
         //    directly (one projection inside), sample.
@@ -2161,6 +2236,20 @@ async fn chat_completions_stream(
             apply_steers_inplace(&steers_for_gen, last_slice);
             let logits = state_for_gen.engine.cpu().finalize_logits(last_slice, 1);
             sampler.sample(&logits)
+        } else if greedy_gpu {
+            if let Some(tok) = state_for_gen.engine.forward_full_gpu_with_cache_inject_argmax_greedy(
+                &prompt_tokens, &mut cache, &inject_for_gen,
+            ) {
+                tok
+            } else {
+                let prefill_hidden = state_for_gen.engine.forward_full_gpu_with_cache_inject_returning_hidden(
+                    &prompt_tokens, &mut cache, &inject_for_gen,
+                );
+                let last_off = (prompt_tokens.len() - 1) * embed_dim;
+                let last_slice = &prefill_hidden[last_off..last_off + embed_dim];
+                let last_logits = state_for_gen.engine.cpu().finalize_logits(last_slice, 1);
+                sampler.sample(&last_logits)
+            }
         } else {
             // Read hidden, only project the LAST token's slice through
             // the LM head. The previous version called
@@ -2208,18 +2297,30 @@ async fn chat_completions_stream(
             }
 
             for _ in 1..max_tokens {
-                let logits = if has_steers {
+                next_token = if has_steers {
                     let mut hidden = state_for_gen.engine.forward_full_gpu_with_cache_inject_returning_hidden(
                         &[next_token], &mut cache, &inject_for_gen,
                     );
                     apply_steers_inplace(&steers_for_gen, &mut hidden);
-                    state_for_gen.engine.cpu().finalize_logits(&hidden, 1)
-                } else {
-                    state_for_gen.engine.forward_full_gpu_with_cache_inject(
+                    let logits = state_for_gen.engine.cpu().finalize_logits(&hidden, 1);
+                    sampler.sample(&logits)
+                } else if greedy_gpu {
+                    if let Some(tok) = state_for_gen.engine.forward_full_gpu_with_cache_inject_argmax_greedy(
                         &[next_token], &mut cache, &inject_for_gen,
-                    )
+                    ) {
+                        tok
+                    } else {
+                        let logits = state_for_gen.engine.forward_full_gpu_with_cache_inject(
+                            &[next_token], &mut cache, &inject_for_gen,
+                        );
+                        sampler.sample(&logits)
+                    }
+                } else {
+                    let logits = state_for_gen.engine.forward_full_gpu_with_cache_inject(
+                        &[next_token], &mut cache, &inject_for_gen,
+                    );
+                    sampler.sample(&logits)
                 };
-                next_token = sampler.sample(&logits);
                 if next_token == eos {
                     break;
                 }

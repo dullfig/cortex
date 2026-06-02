@@ -261,6 +261,10 @@ pub struct Pipelines {
     pub attn_fused_batch: wgpu::ComputePipeline,
     // Broadcast bias add (Q/K/V biases for Qwen-family)
     pub bias_add_batch: wgpu::ComputePipeline,
+    /// Single-workgroup argmax reduction over an f32 logits buffer.
+    /// Used by the GPU LM-head greedy decode path to produce a 4-byte
+    /// token id without reading back the full vocab logits.
+    pub argmax_vocab: wgpu::ComputePipeline,
 }
 
 impl Pipelines {
@@ -334,6 +338,7 @@ impl Pipelines {
             attn_value_batch: make(include_str!("shaders/attn_value_batch.wgsl"), "attn_value_batch"),
             attn_fused_batch: make(include_str!("shaders/attn_fused_batch.wgsl"), "attn_fused_batch"),
             bias_add_batch: make(include_str!("shaders/bias_add_batch.wgsl"), "bias_add_batch"),
+            argmax_vocab: make(include_str!("shaders/argmax_vocab.wgsl"), "argmax_vocab"),
         }
     }
 }
@@ -419,7 +424,7 @@ impl GpuDevice {
         }
 
         let pipelines = Pipelines::compile(&device);
-        tracing::info!("compiled 31 GPU compute pipelines");
+        tracing::info!("compiled 32 GPU compute pipelines");
 
         Some(Self { device, queue, pipelines })
     }
