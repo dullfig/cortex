@@ -102,14 +102,17 @@ const SINK_TOKENS: usize = 4;
 
 /// Per-cache metadata stored alongside the KV cache in the pool.
 struct CacheEntry {
-    cache: GpuKvCache,
-    /// Optional PolarQuant-compressed K/V parallel to `cache`. Populated
-    /// once at cache_load time (via `populate_from_f32_cache_gpu`) when
-    /// `--enable-polar-cache` is set. Single-shard /v1/retrieve queries
-    /// against this entry use the polar trace forward; chat and
-    /// multi-shard paths continue to use `cache`. Memory cost: parallel
-    /// (both caches resident); a future refinement can drop the f32
-    /// cache once the chat path supports polar too.
+    /// f32 KV cache. `None` for polar-only shards (loaded with
+    /// `polar_only=true` so the f32 copy is dropped after the polar
+    /// cache is materialized — ~7x VRAM win per shard). Polar-only
+    /// shards reject chat and append operations with 409 since both
+    /// require the f32 cache today; only `/v1/retrieve` is supported.
+    cache: Option<GpuKvCache>,
+    /// Optional PolarQuant-compressed K/V. Populated once at cache_load
+    /// time (via `populate_from_f32_cache_gpu`) when `--enable-polar-cache`
+    /// is set. Single-shard `/v1/retrieve` queries route through this
+    /// when present; multi-shard composition replays from `tokens`
+    /// regardless. When `cache` is `None`, this is the only KV storage.
     polar: Option<cortex::layers::gpu_polar_kv_cache::GpuPolarKvCache>,
     /// Token history that built this cache. Stored so shards can be composed
     /// by replaying tokens in sequence (which gives correct RoPE positions).
@@ -993,6 +996,15 @@ struct CacheLoadRequest {
     /// eviction, this is the full conversation history from sled.
     #[serde(default)]
     tokens: Vec<u32>,
+    /// When true, build the polar-compressed cache and drop the f32 KV
+    /// copy. The resulting shard is read-only: only `/v1/retrieve`
+    /// works against it; chat (`cache_shards`) and `cache_append`
+    /// reject it with 409 Conflict. Requires the server to be started
+    /// with `--enable-polar-cache`; otherwise the request is rejected
+    /// with 400. ~7x VRAM reduction per shard for retrieval-only use
+    /// cases (RAG corpora, knowledge bases).
+    #[serde(default)]
+    polar_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1803,7 +1815,12 @@ async fn chat_completions(
                 });
                 (q, b, cache_seq)
             } else {
-                let cache_ref = &entry.cache;
+                // Polar absent → f32 cache must be present. Polar-only
+                // shards are validated to require --enable-polar-cache,
+                // which guarantees polar=Some, so this branch is only
+                // reached for shards that still have the f32 cache.
+                let cache_ref = entry.cache.as_ref()
+                    .expect("shard with no polar must have f32 cache");
                 let cache_seq = cache_ref.seq_len();
                 info!(
                     shard = %shards[0],
@@ -1986,6 +2003,26 @@ async fn chat_completions(
             }
         }
 
+        // Polar-only shards can't be chat targets — the chat path needs
+        // the f32 cache that those shards dropped at load. Reject early.
+        for shard_name in &shards {
+            if pool.get(shard_name).map(|e| e.cache.is_none()).unwrap_or(false) {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": {
+                            "type": "shard_is_polar_only",
+                            "message": format!(
+                                "shard '{}' was loaded with polar_only=true; only /v1/retrieve is supported for these shards.",
+                                shard_name,
+                            ),
+                            "cache_id": shard_name,
+                        }
+                    })),
+                ));
+            }
+        }
+
         if shards.len() == 1 {
             // Single shard: use the existing cache directly (fast path,
             // no copying or replaying). This is the common case.
@@ -1994,7 +2031,7 @@ async fn chat_completions(
                 generate_with_cache(
                     &state.engine,
                     &prompt_tokens,
-                    &mut entry.cache,
+                    entry.cache.as_mut().expect("polar-only rejected above"),
                     sampler_config,
                     seed,
                     eos,
@@ -2501,6 +2538,21 @@ async fn cache_load(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let mut _telemetry = metrics::RequestTimer::new(state.metrics.clone(), metrics::Endpoint::CacheLoad);
 
+    // polar_only requires the server to have polar caching enabled —
+    // otherwise the shard would have NO storage at all after the drop.
+    if req.polar_only && !state.polar_cache_enabled {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "polar_cache_disabled",
+                    "message": "polar_only=true requires the server to be started with --enable-polar-cache",
+                    "cache_id": req.cache_id,
+                }
+            })),
+        ));
+    }
+
     // Pre-flight overflow check (Bug 1): return a structured 400 instead
     // of letting `forward_full_gpu_with_cache_returning_hidden` panic
     // inside `block_in_place`.
@@ -2569,6 +2621,18 @@ async fn cache_load(
     };
 
     let seq_len = cache.seq_len();
+    // polar_only: drop the f32 cache now that polar is populated. The
+    // GpuKvCache's wgpu::Buffers release on drop, freeing ~150 MB per
+    // Qwen 3B shard at max_seq=4096. Reject at the validation step
+    // above guarantees polar is Some here, so the shard still has
+    // storage.
+    let cache_opt = if req.polar_only {
+        debug_assert!(polar.is_some(), "polar_only validated to require polar_cache_enabled");
+        drop(cache);
+        None
+    } else {
+        Some(cache)
+    };
     let now = Instant::now();
 
     let mut pool = state.cache_pool.lock().await;
@@ -2579,7 +2643,7 @@ async fn cache_load(
     pool.insert(
         req.cache_id.clone(),
         CacheEntry {
-            cache,
+            cache: cache_opt,
             polar,
             tokens: all_tokens,
             version: next_version,
@@ -2690,24 +2754,44 @@ async fn cache_append(
     // responsive while the forward runs.
     {
         let pool = state.cache_pool.lock().await;
-        if !pool.contains_key(&req.cache_id) {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": {
-                        "type": "cache_not_found",
-                        "message": format!("cache_id '{}' not found", req.cache_id),
-                        "cache_id": req.cache_id,
-                    }
-                })),
-            ));
+        match pool.get(&req.cache_id) {
+            None => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": {
+                            "type": "cache_not_found",
+                            "message": format!("cache_id '{}' not found", req.cache_id),
+                            "cache_id": req.cache_id,
+                        }
+                    })),
+                ));
+            }
+            Some(e) if e.cache.is_none() => {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": {
+                            "type": "shard_is_polar_only",
+                            "message": format!(
+                                "cache '{}' was loaded with polar_only=true; cannot append. Reload the shard with polar_only=false.",
+                                req.cache_id,
+                            ),
+                            "cache_id": req.cache_id,
+                        }
+                    })),
+                ));
+            }
+            Some(_) => {}
         }
     }
 
     let final_seq_len = if req.tokens.is_empty() {
         // Re-acquire briefly to read current seq_len for the response.
         let pool = state.cache_pool.lock().await;
-        pool.get(&req.cache_id).map(|e| e.cache.seq_len()).unwrap_or(0)
+        pool.get(&req.cache_id)
+            .and_then(|e| e.cache.as_ref().map(|c| c.seq_len()))
+            .unwrap_or(0)
     } else {
         // Pre-flight overflow check using a snapshot of current seq_len.
         // The actual cache may grow concurrently if other appends race
@@ -2717,7 +2801,8 @@ async fn cache_append(
         let (start_seq, max_seq) = {
             let pool = state.cache_pool.lock().await;
             let e = pool.get(&req.cache_id).unwrap();
-            (e.cache.seq_len(), e.cache.max_seq_len())
+            let c = e.cache.as_ref().expect("polar-only rejected above");
+            (c.seq_len(), c.max_seq_len())
         };
         if start_seq + req.tokens.len() > max_seq {
             return Err((
@@ -2774,16 +2859,18 @@ async fn cache_append(
                 })),
             ))?;
             let chunk_t0 = Instant::now();
+            // Polar-only was rejected at handler entry, so cache must be Some.
+            let entry_cache = entry.cache.as_mut().expect("polar-only rejected above");
             tokio::task::block_in_place(|| {
                 state.engine.forward_full_gpu_with_cache_advance_only(
-                    chunk, &mut entry.cache,
+                    chunk, entry_cache,
                 );
             });
             entry.tokens.extend_from_slice(chunk);
             entry.version += 1;
             entry.polar = None;
             entry.last_used = Instant::now();
-            current_start = entry.cache.seq_len();
+            current_start = entry.cache.as_ref().expect("polar-only rejected above").seq_len();
             let chunk_ms = chunk_t0.elapsed().as_millis() as u64;
             drop(pool);
 
@@ -2841,9 +2928,14 @@ async fn cache_get(
         )
     })?;
 
+    // seq_len from whichever storage the shard has. Polar-only shards
+    // dropped the f32 cache but retain the polar one with the same seq_len.
+    let seq_len = entry.cache.as_ref().map(|c| c.seq_len())
+        .or_else(|| entry.polar.as_ref().map(|p| p.seq_len()))
+        .unwrap_or(0);
     Ok(Json(CacheInfoResponse {
         cache_id,
-        seq_len: entry.cache.seq_len(),
+        seq_len,
         max_seq_len: state.max_seq_len,
     }))
 }
@@ -3558,7 +3650,15 @@ async fn health(
     // Reporting "(busy)" is much better than letting health probes hang
     // — orchestrators (memex, AgentOS) need timely liveness signals.
     let (pool_size, total_tokens) = match state.cache_pool.try_lock() {
-        Ok(pool) => (pool.len(), pool.values().map(|e| e.cache.seq_len()).sum()),
+        Ok(pool) => (
+            pool.len(),
+            pool.values().map(|e| {
+                // Polar-only shards report seq_len from polar; f32 shards from cache.
+                e.cache.as_ref().map(|c| c.seq_len())
+                    .or_else(|| e.polar.as_ref().map(|p| p.seq_len()))
+                    .unwrap_or(0)
+            }).sum(),
+        ),
         Err(_) => (0, 0), // pool busy; report zeros rather than hang
     };
     Json(HealthResponse {
