@@ -1844,9 +1844,15 @@ impl GpuEngine {
             let off = tok as usize * self.embed_dim;
             hidden_init.extend_from_slice(&embed_data[off..off + self.embed_dim]);
         }
+        // Phase 0 fix (2026-06-03): forward_block_gpu_polar_inner reads
+        // hidden_buf via rmsnorm_packed_to_packed (packed-f16 u32 array).
+        // Previously this passed raw f32 bytes — the block was reading
+        // misaligned data and producing garbage scores. Mirror the chat
+        // orchestrator's pack-then-upload pattern.
+        let hidden_packed = GpuDevice::pack_f16(&hidden_init);
         let hidden_buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("forward_polar_traced.hidden"),
-            contents: bytemuck::cast_slice(&hidden_init),
+            contents: bytemuck::cast_slice(&hidden_packed),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
 
