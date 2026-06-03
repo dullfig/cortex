@@ -2689,6 +2689,197 @@ impl GpuEngine {
         Some(token_id)
     }
 
+    /// Polar-cache chat fast path: same shape as
+    /// `forward_full_gpu_with_cache_inject_argmax_greedy` but runs the
+    /// polar block forward (which compresses new K/V into the polar
+    /// cache as it goes) and advances `polar_cache.set_len(...)` on
+    /// success. 4-byte token-id readback.
+    ///
+    /// Quality target without QJL: ~0.84 cosine on attention output vs
+    /// f32 path. Phase 3 adds GPU QJL to close to ~0.95. Use only for
+    /// greedy sampling — see `lm_head_greedy_eligible` in cortex-cloud
+    /// for the gate.
+    ///
+    /// Returns `None` if `lm_head` isn't GPU-resident — callers fall
+    /// through to the legacy logits-readback path.
+    pub fn forward_full_gpu_polar_with_cache_inject_argmax_greedy(
+        &self,
+        tokens: &[u32],
+        polar_cache: &mut crate::layers::gpu_polar_kv_cache::GpuPolarKvCache,
+        inject_deltas: &[Option<wgpu::Buffer>],
+    ) -> Option<u32> {
+        let lm_head = self.lm_head.as_ref()?;
+
+        let n_tokens = tokens.len();
+        assert!(n_tokens > 0, "must have at least one token");
+
+        let n_layers = self.cpu.n_layers();
+        assert_eq!(n_layers, polar_cache.n_layers(), "polar cache layer count mismatch");
+
+        let attn0 = self.cpu.blocks()[0].attention();
+        assert_eq!(polar_cache.n_kv_heads(), attn0.n_kv_heads(),
+            "polar cache n_kv_heads mismatch");
+        assert_eq!(polar_cache.head_dim(), attn0.head_dim(),
+            "polar cache head_dim mismatch");
+
+        let start_pos = polar_cache.seq_len();
+        let attn_max_seq = start_pos + n_tokens;
+        assert!(attn_max_seq <= polar_cache.max_seq_len(),
+            "polar cache overflow: {} + {} > {}",
+            start_pos, n_tokens, polar_cache.max_seq_len());
+
+        // Embedding (CPU) — pack to f16 for packed hidden_buf.
+        let embed_data = self.cpu.embedding_data();
+        let vocab_size = self.cpu.vocab_size();
+        let mut hidden_init: Vec<f32> = Vec::with_capacity(n_tokens * self.embed_dim);
+        for &tok in tokens {
+            assert!((tok as usize) < vocab_size, "token {tok} out of vocab");
+            let off = tok as usize * self.embed_dim;
+            hidden_init.extend_from_slice(&embed_data[off..off + self.embed_dim]);
+        }
+
+        let packed_bytes = (hidden_init.len() * 2) as u64;
+        let hidden_packed = GpuDevice::pack_f16(&hidden_init);
+        let hidden_buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("forward_polar_argmax.hidden"),
+            contents: bytemuck::cast_slice(&hidden_packed),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let normed_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("forward_polar_argmax.normed"),
+            size: packed_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let intermediate = self.cpu.blocks()[0].ffn().as_any()
+            .downcast_ref::<crate::layers::swiglu::SwiGLU>()
+            .unwrap_or_else(|| panic!("forward_polar_argmax requires SwiGLU FFN"))
+            .intermediate_size();
+
+        let n_heads = attn0.n_heads();
+        let head_dim = attn0.head_dim();
+        let scratch = BlockScratch::allocate(
+            &self.gpu, n_tokens, self.embed_dim,
+            n_heads, attn0.n_kv_heads(), head_dim,
+            intermediate, attn_max_seq,
+        );
+
+        // Polar scratch: rotated_buf reused as both rq (post-rotate_q) and
+        // weighted_rotated_V (pre-derotate) inside each block. One
+        // allocation per call, not per block.
+        let rotated_bytes = (n_tokens * n_heads * head_dim * std::mem::size_of::<f32>()) as u64;
+        let rotated_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("forward_polar_argmax.rotated"),
+            size: rotated_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        if !inject_deltas.is_empty() {
+            assert_eq!(
+                inject_deltas.len(), n_layers,
+                "inject_deltas must be empty or have length n_layers ({})", n_layers,
+            );
+        }
+
+        // Last-token slice buffer (packed f16, [embed_dim/2] u32s).
+        let last_token_bytes = (self.embed_dim * 2) as u64;
+        let last_token_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("forward_polar_argmax.last_token_packed"),
+            size: last_token_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let logits_bytes = (lm_head.vocab_size * std::mem::size_of::<f32>()) as u64;
+        let logits_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("forward_polar_argmax.logits"),
+            size: logits_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let token_id_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("forward_polar_argmax.token_id"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging = self.gpu.create_staging_buffer(4);
+
+        let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("forward_polar_argmax.encoder"),
+        });
+
+        // All N blocks via the polar block forward — which compresses
+        // new K/V into polar_cache at [start_pos, start_pos+n_tokens) as
+        // it goes (line 3126 in forward_block_gpu_polar_inner).
+        for i in 0..n_layers {
+            let inject = inject_deltas.get(i).and_then(|opt| opt.as_ref());
+            self.forward_block_gpu_polar_inner(
+                &mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch,
+                &rotated_buf, &*polar_cache, None, None, inject,
+            );
+        }
+
+        // Final norm: packed → packed.
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("forward_polar_argmax.final_norm.pass"),
+                timestamp_writes: None,
+            });
+            self.dispatch_rmsnorm_packed_to_packed_in_pass(
+                &mut pass, &hidden_buf, &self.final_norm_weight_buf, &normed_buf,
+                self.embed_dim, n_tokens, self.final_norm_eps,
+            );
+        }
+
+        // Slice the last token's packed row out of normed_buf.
+        let last_token_offset = ((n_tokens - 1) * self.embed_dim * 2) as u64;
+        encoder.copy_buffer_to_buffer(
+            &normed_buf, last_token_offset,
+            &last_token_buf, 0,
+            last_token_bytes,
+        );
+
+        // LM head matmul: 1 × vocab_size logits.
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("forward_polar_argmax.lm_head.pass"),
+                timestamp_writes: None,
+            });
+            self.dispatch_lm_head_matmul_pin_in_pass(
+                &mut pass, lm_head, &last_token_buf, &logits_buf,
+            );
+        }
+
+        // Argmax → 4-byte token id.
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("forward_polar_argmax.argmax.pass"),
+                timestamp_writes: None,
+            });
+            self.dispatch_argmax_vocab_in_pass(
+                &mut pass, &logits_buf, &token_id_buf, lm_head.vocab_size,
+            );
+        }
+        encoder.copy_buffer_to_buffer(&token_id_buf, 0, &staging, 0, 4);
+
+        self.gpu.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+        self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+        rx.recv().expect("token-id readback failed").expect("token-id map failed");
+        let data = slice.get_mapped_range();
+        let token_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        drop(data);
+        staging.unmap();
+
+        polar_cache.set_len(start_pos + n_tokens);
+        Some(token_id)
+    }
+
     /// **Phase 1 close — full forward on GPU.** Embedding lookup runs CPU
     /// (cheap; saves an embedding-gather shader for now), then ALL N blocks
     /// chain into one command encoder against resident weights, then
