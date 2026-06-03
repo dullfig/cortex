@@ -630,38 +630,18 @@ fn softmax_inplace(values: &mut [f32]) {
 // Tests
 // ---------------------------------------------------------------------------
 
-// Tests in this module used BitLinear/TernaryTensor for fixtures and
-// were disabled with the 2026-05-29 BitNet un-merge. Float-equivalent
-// tests can be reconstructed using FloatLinear; until then the module
-// is gated off.
-#[cfg(any())]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layers::bitlinear::BitLinear;
-    use crate::tensor::{Ternary, TernaryTensor};
+    use crate::layers::floatlinear::FloatLinear;
 
-    // Helper: create a BitLinear with specific ternary weights.
-    fn make_bitlinear(weights: &[i8], rows: usize, cols: usize, scale: f32) -> BitLinear {
-        let ternary: Vec<Ternary> = weights
-            .iter()
-            .map(|&v| match v {
-                -1 => Ternary::Neg,
-                0 => Ternary::Zero,
-                1 => Ternary::Pos,
-                _ => panic!("not ternary"),
-            })
-            .collect();
-        BitLinear::new(TernaryTensor::pack(&ternary, rows, cols), scale)
-    }
-
-    // Helper: identity-ish projection (diagonal of +1, rest 0).
+    // Helper: identity-ish projection (diagonal of +1.0, rest 0.0).
     fn make_identity_proj(dim: usize) -> Box<dyn LinearLayer> {
-        let mut weights = vec![0i8; dim * dim];
+        let mut weights = vec![0.0f32; dim * dim];
         for i in 0..dim {
-            weights[i * dim + i] = 1;
+            weights[i * dim + i] = 1.0;
         }
-        Box::new(make_bitlinear(&weights, dim, dim, 1.0))
+        Box::new(FloatLinear::new(weights, dim, dim))
     }
 
     // Helper: build a basic MHA for testing.
@@ -675,14 +655,14 @@ mod tests {
         let q_proj = make_identity_proj(embed_dim);
         // K, V: embed_dim → kv_dim (truncated identity)
         let k_weights = {
-            let mut w = vec![0i8; kv_dim * embed_dim];
+            let mut w = vec![0.0f32; kv_dim * embed_dim];
             for i in 0..kv_dim.min(embed_dim) {
-                w[i * embed_dim + i] = 1;
+                w[i * embed_dim + i] = 1.0;
             }
             w
         };
-        let k_proj: Box<dyn LinearLayer> = Box::new(make_bitlinear(&k_weights, kv_dim, embed_dim, 1.0));
-        let v_proj: Box<dyn LinearLayer> = Box::new(make_bitlinear(&k_weights, kv_dim, embed_dim, 1.0));
+        let k_proj: Box<dyn LinearLayer> = Box::new(FloatLinear::new(k_weights.clone(), kv_dim, embed_dim));
+        let v_proj: Box<dyn LinearLayer> = Box::new(FloatLinear::new(k_weights, kv_dim, embed_dim));
         // O: q_dim → embed_dim
         let o_proj = make_identity_proj(embed_dim);
 

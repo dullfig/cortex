@@ -556,34 +556,19 @@ impl std::fmt::Debug for TransformerModel {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(any())]
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::layers::attention::MultiHeadAttention;
-    use crate::layers::bitlinear::BitLinear;
+    use crate::layers::floatlinear::FloatLinear;
     use crate::layers::swiglu::SwiGLU;
-    use crate::tensor::{Ternary, TernaryTensor};
-
-    fn make_bitlinear(weights: &[i8], rows: usize, cols: usize, scale: f32) -> BitLinear {
-        let ternary: Vec<Ternary> = weights
-            .iter()
-            .map(|&v| match v {
-                -1 => Ternary::Neg,
-                0 => Ternary::Zero,
-                1 => Ternary::Pos,
-                _ => panic!("not ternary"),
-            })
-            .collect();
-        BitLinear::new(TernaryTensor::pack(&ternary, rows, cols), scale)
-    }
 
     fn make_identity_proj(out_dim: usize, in_dim: usize) -> Box<dyn LinearLayer> {
-        let mut weights = vec![0i8; out_dim * in_dim];
+        let mut weights = vec![0.0f32; out_dim * in_dim];
         for i in 0..out_dim.min(in_dim) {
-            weights[i * in_dim + i] = 1;
+            weights[i * in_dim + i] = 1.0;
         }
-        Box::new(make_bitlinear(&weights, out_dim, in_dim, 1.0))
+        Box::new(FloatLinear::new(weights, out_dim, in_dim))
     }
 
     fn make_test_block(embed_dim: usize, n_heads: usize, n_kv_heads: usize, intermediate: usize) -> TransformerBlock {
@@ -592,14 +577,14 @@ mod tests {
 
         let q_proj = make_identity_proj(embed_dim, embed_dim);
         let k_weights = {
-            let mut w = vec![0i8; kv_dim * embed_dim];
+            let mut w = vec![0.0f32; kv_dim * embed_dim];
             for i in 0..kv_dim.min(embed_dim) {
-                w[i * embed_dim + i] = 1;
+                w[i * embed_dim + i] = 1.0;
             }
             w
         };
-        let k_proj: Box<dyn LinearLayer> = Box::new(make_bitlinear(&k_weights, kv_dim, embed_dim, 1.0));
-        let v_proj: Box<dyn LinearLayer> = Box::new(make_bitlinear(&k_weights.clone(), kv_dim, embed_dim, 1.0));
+        let k_proj: Box<dyn LinearLayer> = Box::new(FloatLinear::new(k_weights.clone(), kv_dim, embed_dim));
+        let v_proj: Box<dyn LinearLayer> = Box::new(FloatLinear::new(k_weights, kv_dim, embed_dim));
         let o_proj = make_identity_proj(embed_dim, embed_dim);
 
         let attention = MultiHeadAttention::new(

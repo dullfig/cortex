@@ -4126,31 +4126,33 @@ impl std::fmt::Debug for GpuEngine {
     }
 }
 
+// gpu_engine tests partially reconstructed post-BitNet-excision: the
+// BitNet-specific helpers (`toy_ternary_block_pair`) and tests
+// (`forward_block_gpu_matches_cpu_bitnet_block`) were deleted. The rest
+// stays gated — several CPU-vs-GPU parity tests drifted during C2/C3
+// activation packing and aren't passing today (sign-flips on logits,
+// not just precision tolerance). Each needs individual investigation
+// against the current packed-scratch forward path.
 #[cfg(any())]
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::layers::attention::MultiHeadAttention;
-    use crate::layers::bitlinear::BitLinear;
     use crate::layers::ffn::FeedForward;
+    use crate::layers::floatlinear::FloatLinear;
     use crate::layers::model::OutputProjection;
     use crate::layers::rmsnorm::RmsNorm;
     use crate::layers::swiglu::SwiGLU;
     use crate::layers::transformer::TransformerBlock;
-    use crate::tensor::{FloatTensor, Ternary, TernaryTensor};
+    use crate::tensor::FloatTensor;
 
-    /// Build a tiny ternary BitLinear from raw i8 values for tests.
-    fn bitlinear(values: &[i8], rows: usize, cols: usize, scale: f32) -> BitLinear {
-        let ternary: Vec<Ternary> = values
-            .iter()
-            .map(|&v| match v {
-                -1 => Ternary::Neg,
-                0 => Ternary::Zero,
-                1 => Ternary::Pos,
-                _ => panic!("not ternary"),
-            })
-            .collect();
-        BitLinear::new(TernaryTensor::pack(&ternary, rows, cols), scale)
+    /// Build a FloatLinear from raw i8 ternary-style values × scale. The
+    /// original tests used BitLinear (post-2026-05-29 un-merge: gone);
+    /// since i8 weights in {-1, 0, +1} dequantize exactly, FloatLinear
+    /// gives bit-identical forward output to BitLinear-on-CPU here.
+    fn floatlinear(values: &[i8], rows: usize, cols: usize, scale: f32) -> FloatLinear {
+        let weights: Vec<f32> = values.iter().map(|&v| (v as f32) * scale).collect();
+        FloatLinear::new(weights, rows, cols)
     }
 
     /// Build a single-block, single-head, vocab=4 toy model. Same shape as
@@ -4168,19 +4170,19 @@ mod tests {
             vec![vocab_size, embed_dim],
         );
 
-        let q = bitlinear(&[1, 0, -1, 0, 0, 1, 0, -1, 1, 1, 0, 0, 0, 0, 1, -1], embed_dim, embed_dim, 0.1);
-        let k = bitlinear(&[0, 1, 0, -1, 1, 0, -1, 0, 0, -1, 1, 0, -1, 0, 0, 1], embed_dim, embed_dim, 0.1);
-        let v = bitlinear(&[1, -1, 1, -1, 0, 1, 0, 1, -1, 0, 1, 0, 0, 0, -1, 1], embed_dim, embed_dim, 0.1);
-        let o = bitlinear(&[1, 0, 0, 1, 0, 1, 1, 0, -1, 0, 1, 0, 0, -1, 0, 1], embed_dim, embed_dim, 0.1);
+        let q = floatlinear(&[1, 0, -1, 0, 0, 1, 0, -1, 1, 1, 0, 0, 0, 0, 1, -1], embed_dim, embed_dim, 0.1);
+        let k = floatlinear(&[0, 1, 0, -1, 1, 0, -1, 0, 0, -1, 1, 0, -1, 0, 0, 1], embed_dim, embed_dim, 0.1);
+        let v = floatlinear(&[1, -1, 1, -1, 0, 1, 0, 1, -1, 0, 1, 0, 0, 0, -1, 1], embed_dim, embed_dim, 0.1);
+        let o = floatlinear(&[1, 0, 0, 1, 0, 1, 1, 0, -1, 0, 1, 0, 0, -1, 0, 1], embed_dim, embed_dim, 0.1);
 
         let attention = MultiHeadAttention::new(
             Box::new(q), Box::new(k), Box::new(v), Box::new(o),
             n_heads, n_heads, head_dim, 10000.0,
         );
 
-        let gate = bitlinear(&[1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1], intermediate, embed_dim, 0.1);
-        let up = bitlinear(&[0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0], intermediate, embed_dim, 0.1);
-        let down = bitlinear(&[1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1], embed_dim, intermediate, 0.1);
+        let gate = floatlinear(&[1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1], intermediate, embed_dim, 0.1);
+        let up = floatlinear(&[0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0], intermediate, embed_dim, 0.1);
+        let down = floatlinear(&[1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1], embed_dim, intermediate, 0.1);
         let ffn: Box<dyn FeedForward> = Box::new(SwiGLU::new(Box::new(gate), Box::new(up), Box::new(down)));
 
         let attn_norm = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
@@ -6265,171 +6267,11 @@ mod tests {
         );
     }
 
-    /// Build a matched (CPU, GPU) toy block pair backed by ternary
-    /// `BitLinear` / `GpuBitLinear` layers with shared weights. Used by
-    /// `forward_block_gpu_matches_cpu_bitnet_block` to validate the new
-    /// batched ternary matmul path against the CPU reference.
-    fn toy_ternary_block_pair(gpu: Arc<GpuDevice>)
-        -> (TransformerModel, TransformerModel)
-    {
-        use crate::layers::attention::MultiHeadAttention;
-        use crate::layers::bitlinear::BitLinear;
-        use crate::layers::ffn::FeedForward;
-        use crate::layers::gpu_bitlinear::GpuBitLinear;
-        use crate::layers::model::OutputProjection;
-        use crate::layers::rmsnorm::RmsNorm;
-        use crate::layers::swiglu::SwiGLU;
-        use crate::layers::transformer::TransformerBlock;
-        use crate::tensor::TernaryTensor;
-
-        let embed_dim = 8;
-        let n_heads = 1;
-        let head_dim = embed_dim;
-        let intermediate = 16;
-        let vocab_size = 4;
-
-        let mut rng: u64 = 0xBADD_F00D_FACE_BEEF;
-        fn step(rng: &mut u64) -> u64 {
-            *rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-            *rng
-        }
-        let roll_ternary = |rng: &mut u64| -> crate::tensor::Ternary {
-            let r = step(rng);
-            match ((r >> 33) % 3) as i8 {
-                0 => crate::tensor::Ternary::Neg,
-                1 => crate::tensor::Ternary::Zero,
-                _ => crate::tensor::Ternary::Pos,
-            }
-        };
-        let roll_f32 = |rng: &mut u64| -> f32 {
-            let r = step(rng);
-            ((r >> 33) as i32 % 200 - 100) as f32 * 0.01
-        };
-
-        let mk_pair = |rng: &mut u64, rows: usize, cols: usize, scale: f32|
-            -> (Box<dyn crate::layers::linear::LinearLayer>, Box<dyn crate::layers::linear::LinearLayer>) {
-            let values: Vec<crate::tensor::Ternary> = (0..rows * cols).map(|_| roll_ternary(rng)).collect();
-            let tensor = TernaryTensor::pack(&values, rows, cols);
-            let cpu_layer: Box<dyn crate::layers::linear::LinearLayer> =
-                Box::new(BitLinear::new(tensor.clone(), scale));
-            let gpu_layer: Box<dyn crate::layers::linear::LinearLayer> =
-                Box::new(GpuBitLinear::from_weights(gpu.clone(), tensor, scale));
-            (cpu_layer, gpu_layer)
-        };
-
-        let embed_data: Vec<f32> = (0..vocab_size * embed_dim)
-            .map(|_| roll_f32(&mut rng)).collect();
-        let embedding = FloatTensor::new(embed_data, vec![vocab_size, embed_dim]);
-
-        let mut cpu_blocks = Vec::new();
-        let mut gpu_blocks = Vec::new();
-        let scale = 0.02f32;
-        // One block is enough to exercise all six linear call sites.
-        for _ in 0..1 {
-            let (q_c, q_g) = mk_pair(&mut rng, embed_dim, embed_dim, scale);
-            let (k_c, k_g) = mk_pair(&mut rng, embed_dim, embed_dim, scale);
-            let (v_c, v_g) = mk_pair(&mut rng, embed_dim, embed_dim, scale);
-            let (o_c, o_g) = mk_pair(&mut rng, embed_dim, embed_dim, scale);
-            let attn_c = MultiHeadAttention::with_rope_layout(
-                q_c, k_c, v_c, o_c, n_heads, n_heads, head_dim, 10000.0,
-                crate::layers::rope::RoPELayout::Halved,
-            );
-            let attn_g = MultiHeadAttention::with_rope_layout(
-                q_g, k_g, v_g, o_g, n_heads, n_heads, head_dim, 10000.0,
-                crate::layers::rope::RoPELayout::Halved,
-            );
-            let (gate_c, gate_g) = mk_pair(&mut rng, intermediate, embed_dim, scale);
-            let (up_c, up_g)     = mk_pair(&mut rng, intermediate, embed_dim, scale);
-            let (down_c, down_g) = mk_pair(&mut rng, embed_dim, intermediate, scale);
-            let ffn_c: Box<dyn FeedForward> = Box::new(SwiGLU::new(gate_c, up_c, down_c));
-            let ffn_g: Box<dyn FeedForward> = Box::new(SwiGLU::new(gate_g, up_g, down_g));
-            let an_c = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
-            let an_g = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
-            let fn_c = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
-            let fn_g = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
-            cpu_blocks.push(TransformerBlock::new(an_c, attn_c, fn_c, ffn_c));
-            gpu_blocks.push(TransformerBlock::new(an_g, attn_g, fn_g, ffn_g));
-        }
-
-        let final_norm_c = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
-        let final_norm_g = RmsNorm::new(vec![1.0; embed_dim], 1e-6);
-        let out_proj = FloatTensor::new(
-            (0..vocab_size * embed_dim).map(|_| roll_f32(&mut rng)).collect(),
-            vec![vocab_size, embed_dim],
-        );
-        let cpu_model = TransformerModel::new(
-            embedding.clone(), cpu_blocks, final_norm_c, OutputProjection::Float(out_proj.clone()),
-        );
-        let gpu_model = TransformerModel::new(
-            embedding, gpu_blocks, final_norm_g, OutputProjection::Float(out_proj),
-        );
-        (cpu_model, gpu_model)
-    }
-
-    #[test]
-    fn forward_block_gpu_matches_cpu_bitnet_block() {
-        let Some(gpu) = GpuDevice::try_new() else { return };
-        let gpu = Arc::new(gpu);
-
-        let (cpu_model, gpu_model) = toy_ternary_block_pair(gpu.clone());
-
-        let n_tokens = 4;
-        let embed_dim = cpu_model.embed_dim();
-
-        // Random f32 hidden state input (not embedded — direct injection).
-        let mut rng: u64 = 0xAA11_BB22_CC33_DD44;
-        let hidden_in: Vec<f32> = (0..n_tokens * embed_dim).map(|_| {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-            ((rng >> 33) as i32 % 200 - 100) as f32 * 0.01
-        }).collect();
-
-        // CPU reference.
-        let cpu_out = cpu_model.blocks()[0].forward(&hidden_in, n_tokens, /*start_pos*/ 0);
-
-        // GPU path.
-        let engine = GpuEngine::with_max_seq(gpu_model, gpu.clone(), 16);
-
-        // Option E: hidden_buf is f32 (reverted from Phase B packing).
-        let bytes = (n_tokens * embed_dim * std::mem::size_of::<f32>()) as u64;
-        let hidden_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("test.bitnet.hidden"),
-            contents: bytemuck::cast_slice(&hidden_in),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
-        let staging = gpu.create_staging_buffer(bytes);
-
-        let attn0 = engine.cpu().blocks()[0].attention();
-        let intermediate = engine.cpu().blocks()[0].ffn().as_any()
-            .downcast_ref::<crate::layers::swiglu::SwiGLU>().unwrap()
-            .intermediate_size();
-        let scratch = BlockScratch::allocate(
-            &gpu, n_tokens, embed_dim,
-            attn0.n_heads(), attn0.n_kv_heads(), attn0.head_dim(),
-            intermediate, /*max_seq*/ n_tokens,
-        );
-
-        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("test.bitnet.encoder"),
-        });
-        engine.forward_block_gpu(&mut encoder, 0, &hidden_buf, n_tokens, 0, &scratch);
-        encoder.copy_buffer_to_buffer(&hidden_buf, 0, &staging, 0, bytes);
-        gpu.queue.submit(Some(encoder.finish()));
-
-        // Option E: hidden_buf f32 readback (no f16 unpack).
-        let gpu_out = read_back_buffer(&gpu, &staging, bytes as usize);
-
-        // Tolerance: per-token absmax quantization rounding accumulates
-        // through Q/K/V/attention/o_proj/gate/up/down + packed scratch
-        // rounding. Loosened to 5e-2.
-        assert_eq!(cpu_out.len(), gpu_out.len(), "shape mismatch");
-        for (i, (c, g)) in cpu_out.iter().zip(&gpu_out).enumerate() {
-            assert!(
-                (c - g).abs() < 5e-2,
-                "bitnet block elem {i}: cpu={c} gpu={g} (diff={})",
-                (c - g).abs()
-            );
-        }
-    }
+    // `toy_ternary_block_pair` and `forward_block_gpu_matches_cpu_bitnet_block`
+    // were removed with the 2026-05-29 BitNet un-merge — they validated
+    // `BitLinear` / `GpuBitLinear` (now in ternary-rs). The float side of
+    // the equivalent forward-block-matches-cpu coverage is provided by
+    // `forward_block_gpu_matches_cpu_block` above.
 
     #[test]
     fn dispatch_silu_mul_matches_cpu() {

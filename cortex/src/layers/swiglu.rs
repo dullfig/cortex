@@ -264,32 +264,17 @@ fn apply_activation(x: f32, act: GateActivation) -> f32 {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(any())]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layers::bitlinear::BitLinear;
-    use crate::tensor::{Ternary, TernaryTensor};
-
-    fn make_bitlinear(weights: &[i8], rows: usize, cols: usize, scale: f32) -> BitLinear {
-        let ternary: Vec<Ternary> = weights
-            .iter()
-            .map(|&v| match v {
-                -1 => Ternary::Neg,
-                0 => Ternary::Zero,
-                1 => Ternary::Pos,
-                _ => panic!("not ternary"),
-            })
-            .collect();
-        BitLinear::new(TernaryTensor::pack(&ternary, rows, cols), scale)
-    }
+    use crate::layers::floatlinear::FloatLinear;
 
     fn make_identity_proj(out_dim: usize, in_dim: usize) -> Box<dyn LinearLayer> {
-        let mut weights = vec![0i8; out_dim * in_dim];
+        let mut weights = vec![0.0f32; out_dim * in_dim];
         for i in 0..out_dim.min(in_dim) {
-            weights[i * in_dim + i] = 1;
+            weights[i * in_dim + i] = 1.0;
         }
-        Box::new(make_bitlinear(&weights, out_dim, in_dim, 1.0))
+        Box::new(FloatLinear::new(weights, out_dim, in_dim))
     }
 
     fn make_test_swiglu(embed_dim: usize, intermediate: usize) -> SwiGLU {
