@@ -80,6 +80,22 @@ struct Cli {
     #[arg(long)]
     enable_polar_cache: bool,
 
+    /// Number of QJL (Quantized Johnson-Lindenstrauss) projections for
+    /// K-residual correction when a shard is loaded with `qjl: true`.
+    /// 32 is the standard tradeoff (matches CPU default); brings polar
+    /// attention output cosine from ~0.84 to ~0.95 vs f32 at ~32 KB
+    /// extra per layer at Qwen 3B / max_seq=4096. Max 32 in current
+    /// shader (single u32 sign word per entry).
+    #[arg(long, default_value_t = 32)]
+    qjl_projections: usize,
+
+    /// Seed base for per-layer QJL projection matrices. Layer i uses
+    /// `qjl_seed + i`. Kept separate from `--polar-rotation-seed`
+    /// because rotation matrices are square orthonormal and QJL
+    /// projections are rectangular Gaussian-normalized.
+    #[arg(long, default_value_t = 0xDEADBEEFCAFEF00Du64)]
+    qjl_seed: u64,
+
     /// Enable shim registry endpoints (PUT/GET/DELETE /v1/shims/{id},
     /// GET /v1/shims/, POST /v1/shims/infer). Shims are small ONNX
     /// modules used as classifiers / gates / steers per the v1 shim API
@@ -789,6 +805,14 @@ struct ServerState {
     /// seeding scheme — required for cross-cache compatibility (e.g.
     /// multi-shard polar composition, future).
     polar_rotation_seed: u64,
+    /// Number of QJL projections per K residual when a polar cache is
+    /// loaded with `qjl: true`. Comes from `--qjl-projections` (default
+    /// 32). 0 disables QJL even if the request asks for it (not
+    /// currently used — CLI default is 32).
+    qjl_projections: usize,
+    /// Seed base for per-layer QJL projection matrices. From `--qjl-seed`.
+    /// Independent of `polar_rotation_seed` — see CLI docs.
+    qjl_seed: u64,
     /// Shim registry: hot-resident ONNX shims keyed by id. Empty unless
     /// `shims_enabled` is true. `Arc` so handlers can clone-into-handler
     /// without holding the registry lock through inference.
@@ -1014,13 +1038,20 @@ struct CacheLoadRequest {
     /// When true, mark the shard as chattable via the polar path:
     /// greedy chat against this shard routes through the polar
     /// orchestrator (compresses new K/V into the polar cache as it
-    /// generates). Requires `--enable-polar-cache`. Mutually exclusive
-    /// with `polar_only` in Phase 2 (the f32 cache stays resident for
-    /// non-greedy fallback). Append remains 409 — Phase 4b will add a
-    /// polar-aware append helper. Quality without QJL: ~0.84 cosine
-    /// vs f32 baseline; Phase 3 will add GPU QJL for ~0.95.
+    /// generates). Requires `--enable-polar-cache`. Append remains
+    /// 409 — Phase 4b will add a polar-aware append helper. Can be
+    /// combined with `polar_only` to drop the f32 cache entirely
+    /// (chat goes via polar, retrieve goes via polar — minimum VRAM).
     #[serde(default)]
     polar_chat: bool,
+    /// When true, the polar cache is built with K-residual QJL
+    /// correction enabled (`--qjl-projections` projections per layer,
+    /// seeded from `--qjl-seed`). Brings polar attention output
+    /// cosine from ~0.84 to ~0.95 vs f32 at small storage cost (~1.1
+    /// MB extra for Qwen 3B). Requires `--enable-polar-cache`. Has
+    /// no effect when neither `polar_only` nor `polar_chat` is set.
+    #[serde(default)]
+    qjl: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2058,23 +2089,27 @@ async fn chat_completions(
             }
         }
 
-        // Polar-only shards can't be chat targets — the chat path needs
-        // the f32 cache that those shards dropped at load. Reject early.
+        // Polar-only shards can't be chat targets via the f32 path.
+        // BUT: polar_only + polar_chat together is allowed — chat goes
+        // via the polar orchestrator which doesn't need entry.cache.
+        // Only reject when neither polar_chat nor cache is available.
         for shard_name in &shards {
-            if pool.get(shard_name).map(|e| e.cache.is_none()).unwrap_or(false) {
-                return Err((
-                    StatusCode::CONFLICT,
-                    Json(serde_json::json!({
-                        "error": {
-                            "type": "shard_is_polar_only",
-                            "message": format!(
-                                "shard '{}' was loaded with polar_only=true; only /v1/retrieve is supported for these shards.",
-                                shard_name,
-                            ),
-                            "cache_id": shard_name,
-                        }
-                    })),
-                ));
+            if let Some(e) = pool.get(shard_name) {
+                if e.cache.is_none() && !e.polar_chat {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": {
+                                "type": "shard_is_polar_only",
+                                "message": format!(
+                                    "shard '{}' was loaded with polar_only=true and polar_chat=false; only /v1/retrieve is supported.",
+                                    shard_name,
+                                ),
+                                "cache_id": shard_name,
+                            }
+                        })),
+                    ));
+                }
             }
         }
 
@@ -2106,22 +2141,39 @@ async fn chat_completions(
             };
             let generated = if let Some(g) = polar_generated {
                 g
-            } else {
-                // Either not polar_chat, or non-greedy: fall through
-                // to the f32 path. (For polar_chat + non-greedy this
-                // diverges semantics — see plan Phase 2 notes. Phase
-                // 4a unifies cache types.)
+            } else if entry.cache.is_some() {
+                // Either not polar_chat, or non-greedy with f32 fallback
+                // available: use the f32 path. (For polar_chat + non-greedy
+                // this diverges semantics across turns — see plan Phase 2
+                // notes.)
                 tokio::task::block_in_place(|| {
                     generate_with_cache(
                         &state.engine,
                         &prompt_tokens,
-                        entry.cache.as_mut().expect("polar-only rejected above"),
+                        entry.cache.as_mut().expect("checked is_some above"),
                         sampler_config,
                         seed,
                         eos,
                         max_tokens,
                     )
                 })
+            } else {
+                // polar_chat + polar_only + non-greedy: no path exists.
+                // Polar orchestrator only supports greedy today; f32
+                // fallback unavailable since polar_only dropped it.
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": {
+                            "type": "polar_chat_non_greedy_unsupported",
+                            "message": format!(
+                                "shard '{}' was loaded with polar_chat=true + polar_only=true. Non-greedy sampling against it isn't supported yet (the f32 fallback was dropped, and the polar orchestrator is greedy-only). Use temperature=0 / top_k=1, or reload with polar_only=false to keep the f32 fallback.",
+                                shards[0],
+                            ),
+                            "cache_id": shards[0],
+                        }
+                    })),
+                ));
             };
             entry.tokens.extend_from_slice(&prompt_tokens);
             entry.tokens.extend_from_slice(&generated);
@@ -2656,16 +2708,14 @@ async fn cache_load(
             })),
         ));
     }
-    // Phase 2: polar_chat keeps the f32 cache around for non-greedy
-    // fallback and append, so combining with polar_only (which drops
-    // f32) is rejected. Phase 4a unifies these.
-    if req.polar_chat && req.polar_only {
+    // qjl only meaningful when polar is enabled.
+    if req.qjl && !state.polar_cache_enabled {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": {
-                    "type": "polar_chat_and_polar_only_mutually_exclusive",
-                    "message": "polar_chat and polar_only cannot both be true in this phase. Use polar_only for read-only retrieval shards; use polar_chat for chat-capable shards.",
+                    "type": "polar_cache_disabled",
+                    "message": "qjl=true requires the server to be started with --enable-polar-cache",
                     "cache_id": req.cache_id,
                 }
             })),
@@ -2727,11 +2777,23 @@ async fn cache_load(
 
     // If polar caching is enabled, build a parallel polar cache from the
     // f32 prefill output via the GPU compress shader. No CPU round-trip.
+    // When qjl=true is requested, construct via the QJL variant so the
+    // populate path also writes K residual signs (handled inside
+    // populate_from_f32_cache_gpu via qjl_encode_k_layer).
     let polar = if state.polar_cache_enabled {
         tokio::task::block_in_place(|| {
-            let mut p = state.engine.create_gpu_polar_kv_cache(
-                state.max_seq_len, state.polar_rotation_seed,
-            );
+            let mut p = if req.qjl {
+                state.engine.create_gpu_polar_kv_cache_with_qjl(
+                    state.max_seq_len,
+                    state.polar_rotation_seed,
+                    state.qjl_projections,
+                    state.qjl_seed,
+                )
+            } else {
+                state.engine.create_gpu_polar_kv_cache(
+                    state.max_seq_len, state.polar_rotation_seed,
+                )
+            };
             p.populate_from_f32_cache_gpu(&cache);
             Some(p)
         })
@@ -3882,6 +3944,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         retrieve_enabled,
         polar_cache_enabled,
         polar_rotation_seed,
+        qjl_projections: cli.qjl_projections,
+        qjl_seed: cli.qjl_seed,
         shims: Mutex::new(HashMap::new()),
         shims_enabled: cli.enable_shims,
         metrics: Arc::new(metrics::Metrics::new(
