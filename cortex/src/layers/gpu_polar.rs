@@ -775,6 +775,118 @@ pub fn compress_layer_into_polar(
     );
 }
 
+/// Params for `kv_qjl_encode.wgsl`. 32 bytes std140-friendly.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct KvQjlEncodeParams {
+    n_tokens: u32,
+    start_pos: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    n_pairs: u32,
+    n_proj: u32,
+    max_seq: u32,
+    _pad: u32,
+}
+
+/// Encode QJL sign bits for the K residual at positions
+/// `start_pos..start_pos + n_tokens`. Must be called AFTER
+/// `dispatch_kv_compress_polar` for the same K input — this shader
+/// reads the freshly-written angles + radius to compute the
+/// dequantized K, then writes signs of projection dot products of
+/// `(rotated_K - dequantized_K)` into the signs buffer.
+///
+/// Bit layout matches `cortex::ops::qjl::QjlProjection::encode_signs`:
+/// for `n_proj <= 32`, one u32 word per (pos, head) entry; bit j of
+/// the u32 == CPU `signs[j/8]` bit `j%8`.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_kv_qjl_encode(
+    gpu: &Arc<GpuDevice>,
+    encoder: &mut wgpu::CommandEncoder,
+    k_in_buf: &wgpu::Buffer,
+    rotation_buf: &wgpu::Buffer,
+    k_angles_buf: &wgpu::Buffer,
+    k_radius_buf: &wgpu::Buffer,
+    projection_buf: &wgpu::Buffer,
+    signs_buf: &wgpu::Buffer,
+    lut_buf: &wgpu::Buffer,
+    n_tokens: usize,
+    start_pos: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    n_proj: usize,
+    max_seq: usize,
+) {
+    assert!(
+        head_dim % 8 == 0,
+        "kv_qjl_encode requires head_dim divisible by 8 (got {head_dim})"
+    );
+    assert!(head_dim <= 128, "kv_qjl_encode shader register array sized for head_dim <= 128");
+    assert!(n_proj <= 32, "kv_qjl_encode currently supports n_proj <= 32 (single u32 sign word)");
+    assert!(start_pos + n_tokens <= max_seq);
+
+    let n_pairs = head_dim / 2;
+    let params = KvQjlEncodeParams {
+        n_tokens: n_tokens as u32,
+        start_pos: start_pos as u32,
+        n_kv_heads: n_kv_heads as u32,
+        head_dim: head_dim as u32,
+        n_pairs: n_pairs as u32,
+        n_proj: n_proj as u32,
+        max_seq: max_seq as u32,
+        _pad: 0,
+    };
+    let params_buf = gpu.create_params_buffer(&params);
+
+    let pipeline = &gpu.pipelines.kv_qjl_encode;
+    let bind = gpu.make_bind_group(
+        pipeline,
+        &[
+            k_in_buf, rotation_buf, k_angles_buf, k_radius_buf,
+            projection_buf, signs_buf, lut_buf, &params_buf,
+        ],
+    );
+
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("kv_qjl_encode.dispatch"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, &bind, &[]);
+    let threads = (n_tokens * n_kv_heads) as u32;
+    let groups = (threads + 63) / 64;
+    pass.dispatch_workgroups(groups, 1, 1);
+}
+
+/// Convenience: encode QJL signs for one layer of a polar cache. No-op
+/// if the cache was constructed without QJL (`n_qjl_proj() == 0`).
+/// Must be called AFTER `compress_layer_into_polar` for the same
+/// `(layer, n_tokens, start_pos)` so angles + radius are up to date.
+pub fn qjl_encode_k_layer(
+    gpu: &Arc<GpuDevice>,
+    encoder: &mut wgpu::CommandEncoder,
+    cache: &GpuPolarKvCache,
+    layer: usize,
+    k_in_buf: &wgpu::Buffer,
+    n_tokens: usize,
+    start_pos: usize,
+) {
+    if cache.n_qjl_proj() == 0 { return; }
+    let signs_buf = cache.k_qjl_signs_layer(layer)
+        .expect("k_qjl_signs_layer must exist when n_qjl_proj > 0");
+    let proj_buf = cache.k_qjl_projection_layer(layer)
+        .expect("k_qjl_projection_layer must exist when n_qjl_proj > 0");
+    dispatch_kv_qjl_encode(
+        gpu, encoder,
+        k_in_buf, cache.rotation_layer(layer),
+        cache.k_angles_layer(layer), cache.k_radius_layer(layer),
+        proj_buf, signs_buf, cache.lut_buffer(),
+        n_tokens, start_pos,
+        cache.n_kv_heads(), cache.head_dim(), cache.n_qjl_proj(),
+        cache.max_seq_len(),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Resident dispatchers — read directly from a `GpuPolarKvCache`.
 // ---------------------------------------------------------------------------
@@ -2005,5 +2117,130 @@ mod tests {
             mae_qjl < mae_polar * 1.05,
             "QJL did not reduce dot-product error (mae_polar={mae_polar:.4}, mae_qjl={mae_qjl:.4})",
         );
+    }
+
+    /// Bit-exact parity: GPU `kv_qjl_encode` produces the same sign bits
+    /// as CPU `QjlProjection::encode_signs(rotated - dequantized)` on
+    /// the same input. The match must be exact — QJL is sign-only, so
+    /// any rounding mismatch in the rotated/dequantized math would flip
+    /// a bit and fail. Also pins the bit-pack layout (u32 bit j ↔ CPU
+    /// `signs[j/8]` bit `j%8`).
+    #[test]
+    fn qjl_encode_matches_cpu_encode_signs() {
+        use crate::compute::wgpu_backend::GpuDevice;
+        use crate::layers::gpu_polar_kv_cache::GpuPolarKvCache;
+        use crate::ops::{polar, qjl::QjlProjection};
+        use std::sync::Arc;
+
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        // Small fixture but realistic shape: head_dim must be a multiple
+        // of 8 (compress shader assertion). n_proj = 32 so signs pack
+        // into one u32 word per (pos, head) entry.
+        let n_kv_heads = 2usize;
+        let head_dim = 8usize;
+        let max_seq = 4usize;
+        let n_tokens = 3usize;
+        let n_proj = 32usize;
+        let rot_seed = 7u64;
+        let qjl_seed = 17u64;
+        let layer = 0usize;
+
+        // GPU cache with QJL enabled.
+        let cache = GpuPolarKvCache::new_with_qjl(
+            gpu.clone(),
+            /*n_layers*/ 1, n_kv_heads, head_dim, max_seq,
+            rot_seed, n_proj, qjl_seed,
+        );
+
+        // Deterministic-but-non-trivial K input (n_tokens × n_kv_heads × head_dim f32).
+        let kv_dim = n_kv_heads * head_dim;
+        let mut k_data = Vec::with_capacity(n_tokens * kv_dim);
+        for t in 0..n_tokens {
+            for c in 0..kv_dim {
+                k_data.push((((t as f32 * 0.31) + c as f32 * 0.13).sin() * 0.7) as f32);
+            }
+        }
+
+        // Pack f32 K → packed f16 u32 for the shader input.
+        let k_packed = GpuDevice::pack_f16(&k_data);
+        let k_in_buf = gpu.create_storage_buffer(
+            bytemuck::cast_slice(&k_packed), "test.qjl_encode.k_in"
+        );
+
+        // Run compress (writes angles + radius) followed by qjl_encode
+        // (writes signs) in one encoder.
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test.qjl_encode.encoder"),
+        });
+        dispatch_kv_compress_polar(
+            &gpu, &mut encoder,
+            &k_in_buf, cache.rotation_layer(layer),
+            cache.k_angles_layer(layer), cache.k_radius_layer(layer),
+            n_tokens, /*start_pos*/ 0,
+            n_kv_heads, head_dim, max_seq,
+        );
+        qjl_encode_k_layer(
+            &gpu, &mut encoder, &cache, layer,
+            &k_in_buf, n_tokens, /*start_pos*/ 0,
+        );
+
+        // Stage signs for readback.
+        let signs_bytes = (max_seq * n_kv_heads * std::mem::size_of::<u32>()) as u64;
+        let staging = gpu.create_staging_buffer(signs_bytes);
+        encoder.copy_buffer_to_buffer(
+            cache.k_qjl_signs_layer(layer).unwrap(),
+            0, &staging, 0, signs_bytes,
+        );
+        gpu.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+        gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+        rx.recv().expect("signs readback").expect("signs map");
+        let raw = slice.get_mapped_range();
+        let gpu_signs_u32: Vec<u32> = raw.chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        drop(raw);
+        staging.unmap();
+
+        // CPU reference. Build the same rotation matrix + QJL projection
+        // the cache materializes (per-layer seeds = base + layer_idx; we
+        // use layer 0 so the seeds are just the base values).
+        let r_matrix = polar::generate_rotation_matrix(head_dim, rot_seed);
+        let qjl_cpu = QjlProjection::with_n_projections(head_dim, n_proj, qjl_seed);
+        let lut = polar::AngleLUT::new();
+
+        for t in 0..n_tokens {
+            for h in 0..n_kv_heads {
+                // Slice this token-head's f32 K vector.
+                let k_off = t * kv_dim + h * head_dim;
+                let k_slice = &k_data[k_off..k_off + head_dim];
+
+                // CPU pipeline: rotate → quantize → dequantize → residual → signs.
+                let mut rotated = vec![0.0f32; head_dim];
+                polar::rotate(&r_matrix, k_slice, &mut rotated);
+                let (angles, radius) = polar::to_polar_quantized(&rotated);
+                let dq = polar::from_polar_quantized(&angles, radius, &lut);
+                let residual: Vec<f32> = rotated.iter().zip(&dq).map(|(a, b)| a - b).collect();
+                let cpu_signs_bytes = qjl_cpu.encode_signs(&residual);
+
+                // GPU signs word at this entry. Compare its little-endian
+                // bytes against CPU sign bytes — must be bit-exact since
+                // QJL is sign-only.
+                let entry_idx = t * n_kv_heads + h;
+                let gpu_word = gpu_signs_u32[entry_idx];
+                let gpu_bytes = gpu_word.to_le_bytes();
+                for (b, (g, c)) in gpu_bytes.iter().zip(cpu_signs_bytes.iter()).enumerate() {
+                    assert_eq!(
+                        g, c,
+                        "byte {b} at (t={t}, h={h}): gpu=0b{g:08b} cpu=0b{c:08b} (full u32 gpu=0x{gpu_word:08x})",
+                    );
+                }
+            }
+        }
     }
 }

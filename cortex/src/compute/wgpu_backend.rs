@@ -265,6 +265,10 @@ pub struct Pipelines {
     /// Used by the GPU LM-head greedy decode path to produce a 4-byte
     /// token id without reading back the full vocab logits.
     pub argmax_vocab: wgpu::ComputePipeline,
+    /// QJL (Quantized Johnson-Lindenstrauss) encoder for K residuals.
+    /// One u32 word of sign bits per (pos, head) entry. Dispatched
+    /// after `kv_compress_polar` when a polar cache has QJL enabled.
+    pub kv_qjl_encode: wgpu::ComputePipeline,
 }
 
 impl Pipelines {
@@ -339,6 +343,7 @@ impl Pipelines {
             attn_fused_batch: make(include_str!("shaders/attn_fused_batch.wgsl"), "attn_fused_batch"),
             bias_add_batch: make(include_str!("shaders/bias_add_batch.wgsl"), "bias_add_batch"),
             argmax_vocab: make(include_str!("shaders/argmax_vocab.wgsl"), "argmax_vocab"),
+            kv_qjl_encode: make(include_str!("shaders/kv_qjl_encode.wgsl"), "kv_qjl_encode"),
         }
     }
 }
@@ -424,7 +429,7 @@ impl GpuDevice {
         }
 
         let pipelines = Pipelines::compile(&device);
-        tracing::info!("compiled 32 GPU compute pipelines");
+        tracing::info!("compiled 33 GPU compute pipelines");
 
         Some(Self { device, queue, pipelines })
     }
