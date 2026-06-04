@@ -592,6 +592,94 @@ pub fn dispatch_attn_score_polar_batch(
     pass.dispatch_workgroups(groups_x, groups_y, 1);
 }
 
+/// Params for `attn_score_polar_qjl_batch.wgsl`. 48 bytes std140-friendly.
+/// Extends `AttnScorePolarBatchParams` with `n_proj`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct AttnScorePolarQjlBatchParams {
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    start_pos: u32,
+    max_seq: u32,
+    heads_per_kv: u32,
+    n_pairs: u32,
+    scale: f32,
+    n_tokens: u32,
+    n_proj: u32,
+    _p2: u32,
+    _p3: u32,
+}
+
+/// Encode an `attn_score_polar_qjl_batch` dispatch — same shape and
+/// dispatch as `dispatch_attn_score_polar_batch`, with QJL correction
+/// added per cell. Caller must supply the K QJL signs and projection
+/// buffers (typically `cache.k_qjl_signs_layer(i)` /
+/// `cache.k_qjl_projection_layer(i)`).
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_attn_score_polar_qjl_batch(
+    gpu: &Arc<GpuDevice>,
+    encoder: &mut wgpu::CommandEncoder,
+    rq_buf: &wgpu::Buffer,
+    k_angles_buf: &wgpu::Buffer,
+    k_radius_buf: &wgpu::Buffer,
+    scores_buf: &wgpu::Buffer,
+    k_qjl_signs_buf: &wgpu::Buffer,
+    projections_buf: &wgpu::Buffer,
+    lut_buf: &wgpu::Buffer,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    start_pos: usize,
+    n_tokens: usize,
+    max_seq: usize,
+    n_proj: usize,
+) {
+    assert!(head_dim % 2 == 0);
+    assert!(n_heads % n_kv_heads == 0);
+    assert!(n_proj > 0 && n_proj <= 32, "QJL n_proj must be in 1..=32");
+    assert!(start_pos + n_tokens <= max_seq);
+
+    let n_pairs = head_dim / 2;
+    let heads_per_kv = (n_heads / n_kv_heads) as u32;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let params = AttnScorePolarQjlBatchParams {
+        n_heads: n_heads as u32,
+        n_kv_heads: n_kv_heads as u32,
+        head_dim: head_dim as u32,
+        start_pos: start_pos as u32,
+        max_seq: max_seq as u32,
+        heads_per_kv,
+        n_pairs: n_pairs as u32,
+        scale,
+        n_tokens: n_tokens as u32,
+        n_proj: n_proj as u32,
+        _p2: 0, _p3: 0,
+    };
+    let params_buf = gpu.create_params_buffer(&params);
+
+    let pipeline = &gpu.pipelines.attn_score_polar_qjl_batch;
+    let bind = gpu.make_bind_group(
+        pipeline,
+        &[
+            rq_buf, k_angles_buf, k_radius_buf, scores_buf,
+            k_qjl_signs_buf, projections_buf, &params_buf, lut_buf,
+        ],
+    );
+
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("attn_score_polar_qjl_batch.dispatch"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, &bind, &[]);
+    let inner_threads = (n_heads * max_seq) as u32;
+    let groups_x = (inner_threads + 255) / 256;
+    let groups_y = n_tokens as u32;
+    pass.dispatch_workgroups(groups_x, groups_y, 1);
+}
+
 /// Params for `attn_value_polar_batch.wgsl`. 32 bytes std140-friendly.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -2117,6 +2205,217 @@ mod tests {
             mae_qjl < mae_polar * 1.05,
             "QJL did not reduce dot-product error (mae_polar={mae_polar:.4}, mae_qjl={mae_qjl:.4})",
         );
+    }
+
+    /// Numerical parity: GPU `attn_score_polar_qjl_batch` produces the
+    /// same per-cell scores as the CPU primitives compose (polar dot via
+    /// `to_polar_quantized` + `from_polar_quantized`, QJL correction via
+    /// `QjlProjection::correction_dot`). Also confirms the QJL term is
+    /// active — by checking the QJL scores differ from polar-only scores
+    /// for the same cache state.
+    #[test]
+    fn qjl_attn_score_matches_cpu_qjl_dot() {
+        use crate::compute::wgpu_backend::GpuDevice;
+        use crate::layers::gpu_polar_kv_cache::GpuPolarKvCache;
+        use crate::ops::{polar, qjl::QjlProjection};
+        use std::sync::Arc;
+
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        // Small fixture: 4 cached K positions, 1 query token attending
+        // to all 4 (start_pos=3, causal allows t∈[0,4)).
+        let n_kv_heads = 2usize;
+        let n_heads = 2usize; // MHA, heads_per_kv=1 → simpler reference
+        let head_dim = 8usize;
+        let max_seq = 4usize;
+        let k_n_tokens = 4usize;
+        let q_n_tokens = 1usize;
+        let start_pos = 3usize; // query attends to K positions 0..4
+        let n_proj = 32usize;
+        let rot_seed = 7u64;
+        let qjl_seed = 17u64;
+        let layer = 0usize;
+
+        let cache = GpuPolarKvCache::new_with_qjl(
+            gpu.clone(),
+            /*n_layers*/ 1, n_kv_heads, head_dim, max_seq,
+            rot_seed, n_proj, qjl_seed,
+        );
+
+        // K data (k_n_tokens × n_kv_heads × head_dim) and Q data (1 × n_heads × head_dim).
+        let kv_dim = n_kv_heads * head_dim;
+        let q_dim = n_heads * head_dim;
+        let mut k_data = Vec::with_capacity(k_n_tokens * kv_dim);
+        for t in 0..k_n_tokens {
+            for c in 0..kv_dim {
+                k_data.push((((t as f32 * 0.31) + c as f32 * 0.13).sin() * 0.7) as f32);
+            }
+        }
+        let mut q_data = vec![0.0f32; q_n_tokens * q_dim];
+        for c in 0..q_dim {
+            q_data[c] = (((c as f32) * 0.27).cos() * 0.5) as f32;
+        }
+
+        // Upload K (packed f16) + compress + encode QJL.
+        let k_packed = GpuDevice::pack_f16(&k_data);
+        let k_in_buf = gpu.create_storage_buffer(
+            bytemuck::cast_slice(&k_packed), "test.qjl_attn.k_in"
+        );
+
+        // Build rotated Q on CPU (the score shader expects rq in rotated
+        // space). Per-layer rotation matrix derived from rot_seed + layer.
+        let r_matrix = polar::generate_rotation_matrix(head_dim, rot_seed);
+        let mut rq_data = vec![0.0f32; q_n_tokens * q_dim];
+        for tok in 0..q_n_tokens {
+            for h in 0..n_heads {
+                let q_off = tok * q_dim + h * head_dim;
+                let q_slice = &q_data[q_off..q_off + head_dim];
+                let mut rotated = vec![0.0f32; head_dim];
+                polar::rotate(&r_matrix, q_slice, &mut rotated);
+                rq_data[q_off..q_off + head_dim].copy_from_slice(&rotated);
+            }
+        }
+        let rq_buf = gpu.create_storage_buffer(
+            bytemuck::cast_slice(&rq_data), "test.qjl_attn.rq"
+        );
+
+        // Allocate scores buffers (one for polar-only, one for polar+QJL).
+        let scores_bytes = (q_n_tokens * n_heads * max_seq * std::mem::size_of::<f32>()) as u64;
+        let scores_polar = gpu.create_empty_buffer(scores_bytes, "test.qjl_attn.scores_polar");
+        let scores_qjl = gpu.create_empty_buffer(scores_bytes, "test.qjl_attn.scores_qjl");
+
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test.qjl_attn.encoder"),
+        });
+        // 1) Compress K + encode QJL.
+        dispatch_kv_compress_polar(
+            &gpu, &mut encoder,
+            &k_in_buf, cache.rotation_layer(layer),
+            cache.k_angles_layer(layer), cache.k_radius_layer(layer),
+            k_n_tokens, /*start_pos*/ 0,
+            n_kv_heads, head_dim, max_seq,
+        );
+        qjl_encode_k_layer(
+            &gpu, &mut encoder, &cache, layer,
+            &k_in_buf, k_n_tokens, /*start_pos*/ 0,
+        );
+        // 2) Two attention dispatches against the same K cache.
+        dispatch_attn_score_polar_batch(
+            &gpu, &mut encoder,
+            &rq_buf,
+            cache.k_angles_layer(layer), cache.k_radius_layer(layer),
+            &scores_polar, cache.lut_buffer(),
+            n_heads, n_kv_heads, head_dim, start_pos, q_n_tokens, max_seq,
+        );
+        dispatch_attn_score_polar_qjl_batch(
+            &gpu, &mut encoder,
+            &rq_buf,
+            cache.k_angles_layer(layer), cache.k_radius_layer(layer),
+            &scores_qjl,
+            cache.k_qjl_signs_layer(layer).unwrap(),
+            cache.k_qjl_projection_layer(layer).unwrap(),
+            cache.lut_buffer(),
+            n_heads, n_kv_heads, head_dim, start_pos, q_n_tokens, max_seq,
+            n_proj,
+        );
+
+        // Stage both scores buffers for readback.
+        let staging_polar = gpu.create_staging_buffer(scores_bytes);
+        let staging_qjl = gpu.create_staging_buffer(scores_bytes);
+        encoder.copy_buffer_to_buffer(&scores_polar, 0, &staging_polar, 0, scores_bytes);
+        encoder.copy_buffer_to_buffer(&scores_qjl, 0, &staging_qjl, 0, scores_bytes);
+        gpu.queue.submit(Some(encoder.finish()));
+
+        let read = |staging: &wgpu::Buffer| -> Vec<f32> {
+            let slice = staging.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+            gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+            rx.recv().expect("readback").expect("map");
+            let raw = slice.get_mapped_range();
+            let v: Vec<f32> = raw.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            drop(raw);
+            staging.unmap();
+            v
+        };
+        let gpu_polar = read(&staging_polar);
+        let gpu_qjl = read(&staging_qjl);
+
+        // CPU reference (matches CPU `quantized_kv_cache::dot_key` math).
+        let qjl_cpu = QjlProjection::with_n_projections(head_dim, n_proj, qjl_seed);
+        let lut = polar::AngleLUT::new();
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let heads_per_kv = n_heads / n_kv_heads;
+
+        // Precompute per-K-position polar (angles, radius) + signs.
+        let mut per_t: Vec<Vec<(Vec<u8>, f32, Vec<u8>)>> = (0..k_n_tokens)
+            .map(|_| Vec::with_capacity(n_kv_heads))
+            .collect();
+        for t in 0..k_n_tokens {
+            for h in 0..n_kv_heads {
+                let k_off = t * kv_dim + h * head_dim;
+                let k_slice = &k_data[k_off..k_off + head_dim];
+                let mut rotated = vec![0.0f32; head_dim];
+                polar::rotate(&r_matrix, k_slice, &mut rotated);
+                let (angles, radius) = polar::to_polar_quantized(&rotated);
+                let dq = polar::from_polar_quantized(&angles, radius, &lut);
+                let residual: Vec<f32> = rotated.iter().zip(&dq).map(|(a, b)| a - b).collect();
+                let signs = qjl_cpu.encode_signs(&residual);
+                per_t[t].push((angles, radius, signs));
+            }
+        }
+
+        // For the one query token (tok=0) at logical position start_pos=3,
+        // compute expected scores at every (head, t) cell.
+        let mut any_qjl_differs_from_polar = false;
+        for tok in 0..q_n_tokens {
+            let logical_q_pos = start_pos + tok;
+            for head in 0..n_heads {
+                let kv_h = head / heads_per_kv;
+                let q_off = tok * q_dim + head * head_dim;
+                let rq = &rq_data[q_off..q_off + head_dim];
+
+                for t in 0..max_seq {
+                    let cell_idx = tok * n_heads * max_seq + head * max_seq + t;
+                    if t > logical_q_pos {
+                        // Causal-masked: both shaders write -1e30.
+                        assert!(gpu_polar[cell_idx] < -1e29);
+                        assert!(gpu_qjl[cell_idx] < -1e29);
+                        continue;
+                    }
+                    let (angles, radius, signs) = &per_t[t][kv_h];
+                    let mut polar_dot = 0.0f32;
+                    for i in 0..head_dim / 2 {
+                        let b = angles[i] as usize;
+                        polar_dot += rq[2 * i] * lut.cos[b] + rq[2 * i + 1] * lut.sin[b];
+                    }
+                    let cpu_polar_score = polar_dot * radius * scale;
+                    let correction = qjl_cpu.correction_dot(signs, rq);
+                    let cpu_qjl_score = (polar_dot * radius + correction) * scale;
+
+                    let g_polar = gpu_polar[cell_idx];
+                    let g_qjl = gpu_qjl[cell_idx];
+                    assert!(
+                        (g_polar - cpu_polar_score).abs() < 1e-4,
+                        "polar mismatch tok={tok} head={head} t={t}: gpu={g_polar} cpu={cpu_polar_score}"
+                    );
+                    assert!(
+                        (g_qjl - cpu_qjl_score).abs() < 1e-4,
+                        "qjl mismatch tok={tok} head={head} t={t}: gpu={g_qjl} cpu={cpu_qjl_score} (correction={correction})"
+                    );
+                    if (g_qjl - g_polar).abs() > 1e-6 {
+                        any_qjl_differs_from_polar = true;
+                    }
+                }
+            }
+        }
+        // QJL must actually contribute — if every cell matched polar-only,
+        // the correction path is dead code.
+        assert!(any_qjl_differs_from_polar,
+            "QJL scores were identical to polar-only — correction path is inactive");
     }
 
     /// Bit-exact parity: GPU `kv_qjl_encode` produces the same sign bits

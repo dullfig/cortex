@@ -269,6 +269,10 @@ pub struct Pipelines {
     /// One u32 word of sign bits per (pos, head) entry. Dispatched
     /// after `kv_compress_polar` when a polar cache has QJL enabled.
     pub kv_qjl_encode: wgpu::ComputePipeline,
+    /// Batch attention scores against polar K WITH QJL correction.
+    /// Drop-in for `attn_score_polar_batch` when the polar cache has
+    /// QJL signs. Brings ~0.84 → ~0.95 cosine vs f32 attention.
+    pub attn_score_polar_qjl_batch: wgpu::ComputePipeline,
 }
 
 impl Pipelines {
@@ -344,6 +348,7 @@ impl Pipelines {
             bias_add_batch: make(include_str!("shaders/bias_add_batch.wgsl"), "bias_add_batch"),
             argmax_vocab: make(include_str!("shaders/argmax_vocab.wgsl"), "argmax_vocab"),
             kv_qjl_encode: make(include_str!("shaders/kv_qjl_encode.wgsl"), "kv_qjl_encode"),
+            attn_score_polar_qjl_batch: make(include_str!("shaders/attn_score_polar_qjl_batch.wgsl"), "attn_score_polar_qjl_batch"),
         }
     }
 }
@@ -429,7 +434,7 @@ impl GpuDevice {
         }
 
         let pipelines = Pipelines::compile(&device);
-        tracing::info!("compiled 33 GPU compute pipelines");
+        tracing::info!("compiled 34 GPU compute pipelines");
 
         Some(Self { device, queue, pipelines })
     }
