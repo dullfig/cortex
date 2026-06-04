@@ -373,6 +373,18 @@ impl GpuPolarKvCache {
                 n_tokens,
                 /*start_pos*/ 0,
             );
+            // When QJL is enabled, encode K residual signs right after
+            // compress (which wrote the angles + radius this step reads
+            // for dequantization). No-op when n_qjl_proj == 0.
+            crate::layers::gpu_polar::qjl_encode_k_layer(
+                &self.gpu,
+                &mut encoder,
+                self,
+                layer,
+                f32_cache.k_layer(layer),
+                n_tokens,
+                /*start_pos*/ 0,
+            );
         }
         self.gpu.queue.submit(Some(encoder.finish()));
         self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
