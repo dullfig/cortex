@@ -2118,6 +2118,95 @@ impl GpuEngine {
         );
     }
 
+    /// Polar counterpart to `forward_full_gpu_with_cache_advance_only`.
+    /// Runs all blocks against the polar cache (compressing new K/V at
+    /// `[start_pos, start_pos+n_tokens)` via the existing polar block
+    /// forward, including QJL encode when the cache has it enabled),
+    /// then advances `polar_cache.set_len(...)`. No final RMSNorm, no
+    /// readback, no LM head.
+    ///
+    /// Used by `cache_append` for polar_chat shards — fire-and-forget
+    /// extension that doesn't pay the readback cost.
+    pub fn forward_full_gpu_polar_with_cache_advance_only(
+        &self,
+        tokens: &[u32],
+        polar_cache: &mut crate::layers::gpu_polar_kv_cache::GpuPolarKvCache,
+    ) {
+        let n_tokens = tokens.len();
+        assert!(n_tokens > 0, "must have at least one token");
+
+        let n_layers = self.cpu.n_layers();
+        assert_eq!(n_layers, polar_cache.n_layers(), "polar cache layer count mismatch");
+
+        let attn0 = self.cpu.blocks()[0].attention();
+        assert_eq!(polar_cache.n_kv_heads(), attn0.n_kv_heads(),
+            "polar cache n_kv_heads mismatch");
+        assert_eq!(polar_cache.head_dim(), attn0.head_dim(),
+            "polar cache head_dim mismatch");
+
+        let start_pos = polar_cache.seq_len();
+        let attn_max_seq = start_pos + n_tokens;
+        assert!(attn_max_seq <= polar_cache.max_seq_len(),
+            "polar cache overflow: {} + {} > {}",
+            start_pos, n_tokens, polar_cache.max_seq_len());
+
+        // Embedding (CPU) — pack to f16 for packed hidden_buf.
+        let embed_data = self.cpu.embedding_data();
+        let vocab_size = self.cpu.vocab_size();
+        let mut hidden_init: Vec<f32> = Vec::with_capacity(n_tokens * self.embed_dim);
+        for &tok in tokens {
+            assert!((tok as usize) < vocab_size, "token {tok} out of vocab");
+            let off = tok as usize * self.embed_dim;
+            hidden_init.extend_from_slice(&embed_data[off..off + self.embed_dim]);
+        }
+
+        let hidden_packed = GpuDevice::pack_f16(&hidden_init);
+        let hidden_buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("forward_polar_advance_only.hidden"),
+            contents: bytemuck::cast_slice(&hidden_packed),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+
+        let intermediate = self.cpu.blocks()[0].ffn().as_any()
+            .downcast_ref::<crate::layers::swiglu::SwiGLU>()
+            .unwrap_or_else(|| panic!("forward_polar_advance_only requires SwiGLU FFN"))
+            .intermediate_size();
+
+        let n_heads = attn0.n_heads();
+        let head_dim = attn0.head_dim();
+        let scratch = BlockScratch::allocate(
+            &self.gpu, n_tokens, self.embed_dim,
+            n_heads, attn0.n_kv_heads(), head_dim,
+            intermediate, attn_max_seq,
+        );
+
+        // Polar scratch: shared rotated_buf for rq + weighted V across blocks.
+        let rotated_bytes = (n_tokens * n_heads * head_dim * std::mem::size_of::<f32>()) as u64;
+        let rotated_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("forward_polar_advance_only.rotated"),
+            size: rotated_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("forward_polar_advance_only.encoder"),
+        });
+        for i in 0..n_layers {
+            self.forward_block_gpu_polar_inner(
+                &mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch,
+                &rotated_buf, &*polar_cache, None, None, None,
+            );
+        }
+        self.gpu.queue.submit(Some(encoder.finish()));
+
+        if std::env::var("CORTEX_SYNC_AFTER_ADVANCE").as_deref() == Ok("1") {
+            self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+        }
+
+        polar_cache.set_len(start_pos + n_tokens);
+    }
+
     /// Inject-aware variant of `forward_full_gpu_with_cache_returning_hidden`.
     /// `inject_deltas` is either empty (no injection — same path as the
     /// no-inject variant) or has length `n_layers()` with `Some(buf)` for

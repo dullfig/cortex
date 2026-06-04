@@ -2949,29 +2949,17 @@ async fn cache_append(
                     })),
                 ));
             }
-            Some(e) if e.cache.is_none() => {
+            // Retrieval-only shards (polar_only=true AND polar_chat=false)
+            // still 409. Everything with polar_chat=true now supports
+            // append via the polar advance path (Phase 4b).
+            Some(e) if e.cache.is_none() && !e.polar_chat => {
                 return Err((
                     StatusCode::CONFLICT,
                     Json(serde_json::json!({
                         "error": {
                             "type": "shard_is_polar_only",
                             "message": format!(
-                                "cache '{}' was loaded with polar_only=true; cannot append. Reload the shard with polar_only=false.",
-                                req.cache_id,
-                            ),
-                            "cache_id": req.cache_id,
-                        }
-                    })),
-                ));
-            }
-            Some(e) if e.polar_chat => {
-                return Err((
-                    StatusCode::CONFLICT,
-                    Json(serde_json::json!({
-                        "error": {
-                            "type": "shard_polar_chat_no_append",
-                            "message": format!(
-                                "cache '{}' was loaded with polar_chat=true; append is not supported in Phase 2 (polar / f32 caches would diverge). A polar-aware append helper will land in Phase 4b.",
+                                "cache '{}' was loaded with polar_only=true and polar_chat=false; cannot append. Reload the shard with polar_chat=true (and optionally polar_only=true) to enable appendable polar mode.",
                                 req.cache_id,
                             ),
                             "cache_id": req.cache_id,
@@ -2985,21 +2973,28 @@ async fn cache_append(
 
     let final_seq_len = if req.tokens.is_empty() {
         // Re-acquire briefly to read current seq_len for the response.
+        // Prefer the f32 cache when present; fall back to polar (Phase 4b
+        // polar-only-appendable shards have cache=None but polar populated).
         let pool = state.cache_pool.lock().await;
         pool.get(&req.cache_id)
-            .and_then(|e| e.cache.as_ref().map(|c| c.seq_len()))
+            .map(|e| {
+                e.cache.as_ref().map(|c| c.seq_len())
+                    .or_else(|| e.polar.as_ref().map(|p| p.seq_len()))
+                    .unwrap_or(0)
+            })
             .unwrap_or(0)
     } else {
         // Pre-flight overflow check using a snapshot of current seq_len.
-        // The actual cache may grow concurrently if other appends race
-        // (no protection here in v1; cache_append is single-writer per
-        // shard by convention), but this catches the common case.
+        // Uses f32 cache when present, else polar.
         let n_heads = state.engine.cpu().blocks()[0].attention().n_heads();
         let (start_seq, max_seq) = {
             let pool = state.cache_pool.lock().await;
             let e = pool.get(&req.cache_id).unwrap();
-            let c = e.cache.as_ref().expect("polar-only rejected above");
-            (c.seq_len(), c.max_seq_len())
+            match (e.cache.as_ref(), e.polar.as_ref()) {
+                (Some(c), _) => (c.seq_len(), c.max_seq_len()),
+                (None, Some(p)) => (p.seq_len(), p.max_seq_len()),
+                (None, None) => unreachable!("entry validated to have at least one cache above"),
+            }
         };
         if start_seq + req.tokens.len() > max_seq {
             return Err((
@@ -3056,18 +3051,39 @@ async fn cache_append(
                 })),
             ))?;
             let chunk_t0 = Instant::now();
-            // Polar-only was rejected at handler entry, so cache must be Some.
-            let entry_cache = entry.cache.as_mut().expect("polar-only rejected above");
+            // Three modes:
+            //  (cache=Some, polar_chat=false): legacy f32-only path.
+            //    polar (if present) is invalidated since the f32 cache
+            //    is the canonical state and polar is now stale.
+            //  (cache=Some, polar_chat=true):  update BOTH f32 and polar.
+            //    Keeps the f32 fallback in sync for non-greedy chat;
+            //    polar stays canonical for greedy chat.
+            //  (cache=None,  polar_chat=true): polar-only path. f32 was
+            //    dropped at load (polar_only=true).
             tokio::task::block_in_place(|| {
-                state.engine.forward_full_gpu_with_cache_advance_only(
-                    chunk, entry_cache,
-                );
+                if let Some(c) = entry.cache.as_mut() {
+                    state.engine.forward_full_gpu_with_cache_advance_only(chunk, c);
+                }
+                if entry.polar_chat {
+                    if let Some(p) = entry.polar.as_mut() {
+                        state.engine.forward_full_gpu_polar_with_cache_advance_only(chunk, p);
+                    }
+                }
             });
             entry.tokens.extend_from_slice(chunk);
             entry.version += 1;
-            entry.polar = None;
+            // Invalidate polar only when this shard isn't polar-chat-tracked
+            // (the existing path that nukes polar on every append). For
+            // polar_chat shards, polar IS being kept in sync above.
+            if !entry.polar_chat {
+                entry.polar = None;
+            }
             entry.last_used = Instant::now();
-            current_start = entry.cache.as_ref().expect("polar-only rejected above").seq_len();
+            current_start = match (entry.cache.as_ref(), entry.polar.as_ref()) {
+                (Some(c), _) => c.seq_len(),
+                (None, Some(p)) => p.seq_len(),
+                (None, None) => unreachable!("validated at handler entry"),
+            };
             let chunk_ms = chunk_t0.elapsed().as_millis() as u64;
             drop(pool);
 
