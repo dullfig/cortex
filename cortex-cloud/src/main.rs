@@ -114,6 +114,12 @@ struct CacheEntry {
     /// when present; multi-shard composition replays from `tokens`
     /// regardless. When `cache` is `None`, this is the only KV storage.
     polar: Option<cortex::layers::gpu_polar_kv_cache::GpuPolarKvCache>,
+    /// When true (set via `polar_chat=true` at cache_load), greedy
+    /// chat against this shard routes through the polar orchestrator
+    /// (compresses new K/V into the polar cache as it generates).
+    /// Non-greedy / steered chat falls through to the f32 path during
+    /// Phase 2. Append still 409s.
+    polar_chat: bool,
     /// Token history that built this cache. Stored so shards can be composed
     /// by replaying tokens in sequence (which gives correct RoPE positions).
     tokens: Vec<u32>,
@@ -1005,6 +1011,16 @@ struct CacheLoadRequest {
     /// cases (RAG corpora, knowledge bases).
     #[serde(default)]
     polar_only: bool,
+    /// When true, mark the shard as chattable via the polar path:
+    /// greedy chat against this shard routes through the polar
+    /// orchestrator (compresses new K/V into the polar cache as it
+    /// generates). Requires `--enable-polar-cache`. Mutually exclusive
+    /// with `polar_only` in Phase 2 (the f32 cache stays resident for
+    /// non-greedy fallback). Append remains 409 — Phase 4b will add a
+    /// polar-aware append helper. Quality without QJL: ~0.84 cosine
+    /// vs f32 baseline; Phase 3 will add GPU QJL for ~0.95.
+    #[serde(default)]
+    polar_chat: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1260,6 +1276,45 @@ fn generate_with_cache(
         out.push(next_token);
     }
     out
+}
+
+/// Polar chat generation: greedy-only prefill + decode loop against a
+/// `GpuPolarKvCache`. Returns `None` if non-greedy (caller falls back
+/// to the f32 path) or if the engine's LM-head isn't GPU-resident.
+/// `polar_cache.set_len(...)` advances inside the engine on each
+/// call, so successive token generations see the growing prefix.
+fn generate_with_polar_cache(
+    engine: &GpuEngine,
+    prompt_tokens: &[u32],
+    polar_cache: &mut cortex::layers::gpu_polar_kv_cache::GpuPolarKvCache,
+    sampler_config: SamplerConfig,
+    _seed: u64,
+    eos: u32,
+    max_tokens: usize,
+) -> Option<Vec<u32>> {
+    if !lm_head_greedy_eligible(&sampler_config) {
+        return None;
+    }
+    let mut next_token = engine.forward_full_gpu_polar_with_cache_inject_argmax_greedy(
+        prompt_tokens, polar_cache, &[],
+    )?;
+
+    let mut out: Vec<u32> = Vec::new();
+    if next_token == eos {
+        return Some(out);
+    }
+    out.push(next_token);
+
+    for _ in 1..max_tokens {
+        next_token = engine.forward_full_gpu_polar_with_cache_inject_argmax_greedy(
+            &[next_token], polar_cache, &[],
+        )?;
+        if next_token == eos {
+            break;
+        }
+        out.push(next_token);
+    }
+    Some(out)
 }
 
 /// Greedy fast-path eligibility: the GPU LM-head + argmax shader can
@@ -2027,23 +2082,58 @@ async fn chat_completions(
             // Single shard: use the existing cache directly (fast path,
             // no copying or replaying). This is the common case.
             let entry = pool.get_mut(&shards[0]).unwrap();
-            let generated = tokio::task::block_in_place(|| {
-                generate_with_cache(
-                    &state.engine,
-                    &prompt_tokens,
-                    entry.cache.as_mut().expect("polar-only rejected above"),
-                    sampler_config,
-                    seed,
-                    eos,
-                    max_tokens,
-                )
-            });
+            // Polar-chat fast path: if the shard was loaded with
+            // polar_chat=true AND the request is greedy, route through
+            // the polar orchestrator. New K/V land directly in the
+            // polar cache; f32 cache stays unchanged (Phase 2 keeps
+            // it for non-greedy fallback only).
+            let polar_generated: Option<Vec<u32>> = if entry.polar_chat {
+                entry.polar.as_mut().and_then(|polar| {
+                    tokio::task::block_in_place(|| {
+                        generate_with_polar_cache(
+                            &state.engine,
+                            &prompt_tokens,
+                            polar,
+                            sampler_config.clone(),
+                            seed,
+                            eos,
+                            max_tokens,
+                        )
+                    })
+                })
+            } else {
+                None
+            };
+            let generated = if let Some(g) = polar_generated {
+                g
+            } else {
+                // Either not polar_chat, or non-greedy: fall through
+                // to the f32 path. (For polar_chat + non-greedy this
+                // diverges semantics — see plan Phase 2 notes. Phase
+                // 4a unifies cache types.)
+                tokio::task::block_in_place(|| {
+                    generate_with_cache(
+                        &state.engine,
+                        &prompt_tokens,
+                        entry.cache.as_mut().expect("polar-only rejected above"),
+                        sampler_config,
+                        seed,
+                        eos,
+                        max_tokens,
+                    )
+                })
+            };
             entry.tokens.extend_from_slice(&prompt_tokens);
             entry.tokens.extend_from_slice(&generated);
             entry.version += 1;
-            // Chat extends the f32 cache with prompt + generated K/V.
-            // Any polar snapshot is now stale.
-            entry.polar = None;
+            // Chat extends the f32 cache with prompt + generated K/V
+            // (the f32 path) OR the polar cache (the polar_chat path).
+            // For non-polar-chat shards, any polar snapshot is now
+            // stale; clear it. For polar_chat shards, polar IS the
+            // canonical state — keep it.
+            if !entry.polar_chat {
+                entry.polar = None;
+            }
             entry.last_used = Instant::now();
             let len = generated.len() as u32;
             (generated, len)
@@ -2552,6 +2642,35 @@ async fn cache_load(
             })),
         ));
     }
+    // polar_chat needs the polar cache to actually exist for the chat
+    // path to route through it.
+    if req.polar_chat && !state.polar_cache_enabled {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "polar_cache_disabled",
+                    "message": "polar_chat=true requires the server to be started with --enable-polar-cache",
+                    "cache_id": req.cache_id,
+                }
+            })),
+        ));
+    }
+    // Phase 2: polar_chat keeps the f32 cache around for non-greedy
+    // fallback and append, so combining with polar_only (which drops
+    // f32) is rejected. Phase 4a unifies these.
+    if req.polar_chat && req.polar_only {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "polar_chat_and_polar_only_mutually_exclusive",
+                    "message": "polar_chat and polar_only cannot both be true in this phase. Use polar_only for read-only retrieval shards; use polar_chat for chat-capable shards.",
+                    "cache_id": req.cache_id,
+                }
+            })),
+        ));
+    }
 
     // Pre-flight overflow check (Bug 1): return a structured 400 instead
     // of letting `forward_full_gpu_with_cache_returning_hidden` panic
@@ -2645,6 +2764,7 @@ async fn cache_load(
         CacheEntry {
             cache: cache_opt,
             polar,
+            polar_chat: req.polar_chat,
             tokens: all_tokens,
             version: next_version,
             created_at: now,
@@ -2775,6 +2895,21 @@ async fn cache_append(
                             "type": "shard_is_polar_only",
                             "message": format!(
                                 "cache '{}' was loaded with polar_only=true; cannot append. Reload the shard with polar_only=false.",
+                                req.cache_id,
+                            ),
+                            "cache_id": req.cache_id,
+                        }
+                    })),
+                ));
+            }
+            Some(e) if e.polar_chat => {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": {
+                            "type": "shard_polar_chat_no_append",
+                            "message": format!(
+                                "cache '{}' was loaded with polar_chat=true; append is not supported in Phase 2 (polar / f32 caches would diverge). A polar-aware append helper will land in Phase 4b.",
                                 req.cache_id,
                             ),
                             "cache_id": req.cache_id,
