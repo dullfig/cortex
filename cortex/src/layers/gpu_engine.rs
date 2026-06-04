@@ -4241,6 +4241,29 @@ impl GpuEngine {
         )
     }
 
+    /// Same as `create_gpu_polar_kv_cache` but enables QJL correction
+    /// for K residuals (`n_qjl_proj > 0`). `qjl_seed_base` selects the
+    /// per-layer projection matrices.
+    pub fn create_gpu_polar_kv_cache_with_qjl(
+        &self,
+        max_seq_len: usize,
+        rotation_seed_base: u64,
+        n_qjl_proj: usize,
+        qjl_seed_base: u64,
+    ) -> crate::layers::gpu_polar_kv_cache::GpuPolarKvCache {
+        let attn0 = self.cpu.blocks()[0].attention();
+        crate::layers::gpu_polar_kv_cache::GpuPolarKvCache::new_with_qjl(
+            self.gpu.clone(),
+            self.cpu.n_layers(),
+            attn0.n_kv_heads(),
+            attn0.head_dim(),
+            max_seq_len,
+            rotation_seed_base,
+            n_qjl_proj,
+            qjl_seed_base,
+        )
+    }
+
     pub fn forward(&self, tokens: &[u32], start_pos: usize) -> Vec<f32> {
         self.cpu.forward(tokens, start_pos)
     }

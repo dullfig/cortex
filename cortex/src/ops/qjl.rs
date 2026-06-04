@@ -66,6 +66,13 @@ impl QjlProjection {
         (self.n_proj + 7) / 8
     }
 
+    /// Raw projection matrix — `[n_proj, dim]` row-major f32. Exposed
+    /// so callers (like `GpuPolarKvCache`) can upload it to a GPU
+    /// storage buffer for shader use.
+    pub fn projections(&self) -> &[f32] {
+        &self.projections
+    }
+
     /// Encode the residual as packed sign bits.
     ///
     /// `residual`: the quantization error vector (rotated - dequantized) of

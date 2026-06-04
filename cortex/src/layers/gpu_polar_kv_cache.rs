@@ -55,10 +55,39 @@ pub struct GpuPolarKvCache {
     /// Shared angle LUT uniform: vec4<f32>[8] (cos, sin, _, _) per bucket.
     lut_buffer: wgpu::Buffer,
 
+    /// Per-layer QJL sign-bit storage for K residuals. Empty when QJL
+    /// is disabled (`n_qjl_proj == 0`). Each buffer holds
+    /// `max_seq_len * n_kv_heads * sign_words_per_entry` u32 words.
+    /// `sign_words_per_entry = ceil(n_qjl_proj / 32)`. For the default
+    /// `n_qjl_proj = 32`, one u32 per (pos, head) entry — the j-th
+    /// bit of the word is the sign for projection j (matches CPU
+    /// `QjlProjection::encode_signs` bit layout).
+    k_qjl_signs_buffers: Vec<wgpu::Buffer>,
+
+    /// Per-layer QJL projection matrices (deterministic from
+    /// `qjl_seed_base + layer_idx`). Empty when QJL is disabled. Each
+    /// buffer is `n_qjl_proj * head_dim * 4` bytes (row-major f32).
+    /// Uploaded once at construction, read-only thereafter.
+    k_qjl_projection_buffers: Vec<wgpu::Buffer>,
+
     n_layers: usize,
     n_kv_heads: usize,
     head_dim: usize,
     max_seq_len: usize,
+    /// Number of QJL projections per K residual. 0 = QJL disabled.
+    /// Typical: 32 (matches CPU `QjlProjection` default). When > 0 the
+    /// engine's polar block forward will dispatch the QJL encode shader
+    /// after `compress_layer_into_polar` and route attention through
+    /// the QJL-corrected score shader. Brings ~0.84 → ~0.95 cosine on
+    /// attention output vs f32.
+    n_qjl_proj: usize,
+    /// Per-layer QJL projection seed base. Layer `i` uses seed
+    /// `qjl_seed_base + i`. Kept separate from `rotation_seed_base`
+    /// because rotation matrices are square orthonormal whereas QJL
+    /// projections are rectangular Gaussian-normalized — sharing a
+    /// seed would create confusing implicit dependencies.
+    #[allow(dead_code)]
+    qjl_seed_base: u64,
     /// Number of positions currently filled. Per design, all layers advance
     /// in lockstep — like `GpuKvCache` — so a single `len` is correct.
     len: usize,
@@ -76,8 +105,43 @@ impl GpuPolarKvCache {
         max_seq_len: usize,
         rotation_seed_base: u64,
     ) -> Self {
+        // Backward-compatible delegate. QJL disabled.
+        Self::new_with_qjl(
+            gpu, n_layers, n_kv_heads, head_dim, max_seq_len,
+            rotation_seed_base, /*n_qjl_proj*/ 0, /*qjl_seed_base*/ 0,
+        )
+    }
+
+    /// Allocate a fresh compressed cache with optional QJL correction
+    /// for K. When `n_qjl_proj > 0`, additionally allocates per-layer
+    /// QJL signs (read_write) and projection (read-only) buffers; the
+    /// engine's polar forward then dispatches the QJL encode and
+    /// QJL-corrected attention shaders. `n_qjl_proj == 0` disables
+    /// QJL entirely (identical to `new`).
+    ///
+    /// QJL improves polar attention output cosine from ~0.84 to ~0.95
+    /// at a per-layer storage cost of ~32 KB (signs) + ~16 KB
+    /// (projections) for Qwen 3B at `n_qjl_proj=32`, `max_seq=4096`.
+    ///
+    /// Currently supports `n_qjl_proj <= 32` only (sign storage is
+    /// one u32 per (pos, head) entry — wider QJL would need multi-word
+    /// signs); shader changes can lift this if needed.
+    pub fn new_with_qjl(
+        gpu: Arc<GpuDevice>,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        rotation_seed_base: u64,
+        n_qjl_proj: usize,
+        qjl_seed_base: u64,
+    ) -> Self {
         assert!(head_dim % 2 == 0, "head_dim must be even");
         assert!(n_layers > 0 && n_kv_heads > 0 && head_dim > 0 && max_seq_len > 0);
+        assert!(
+            n_qjl_proj <= 32,
+            "n_qjl_proj > 32 not yet supported (current sign storage is one u32 per entry)"
+        );
 
         let n_pairs = head_dim / 2;
         let angles_total = max_seq_len * n_kv_heads * n_pairs;
@@ -139,6 +203,44 @@ impl GpuPolarKvCache {
         });
         gpu.queue.write_buffer(&lut_buffer, 0, bytemuck::cast_slice(&lut));
 
+        // QJL buffers — only allocated when QJL is enabled.
+        let (k_qjl_signs_buffers, k_qjl_projection_buffers) = if n_qjl_proj > 0 {
+            let sign_words_per_entry = (n_qjl_proj + 31) / 32; // = 1 for n_qjl_proj <= 32
+            let signs_bytes = (max_seq_len * n_kv_heads * sign_words_per_entry
+                * std::mem::size_of::<u32>()) as u64;
+
+            let mut signs = Vec::with_capacity(n_layers);
+            let mut projs = Vec::with_capacity(n_layers);
+            for layer in 0..n_layers {
+                // Signs: zero-initialized storage, written by the QJL
+                // encode shader. COPY_DST so we can clear via host
+                // writes if needed; COPY_SRC for test readback.
+                signs.push(gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("polar_kv.k_qjl_signs.layer{layer}")),
+                    size: signs_bytes,
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_DST
+                        | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                }));
+
+                // Projection matrix: deterministic from (qjl_seed_base + layer).
+                // Same RNG seed scheme as rotation matrices, but a separate
+                // seed base — QJL projections are rectangular Gaussian, not
+                // square orthonormal.
+                let qjl = crate::ops::qjl::QjlProjection::with_n_projections(
+                    head_dim, n_qjl_proj, qjl_seed_base + layer as u64,
+                );
+                projs.push(gpu.create_storage_buffer(
+                    bytemuck::cast_slice(qjl.projections()),
+                    &format!("polar_kv.k_qjl_projection.layer{layer}"),
+                ));
+            }
+            (signs, projs)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
         Self {
             gpu,
             k_angles_buffers,
@@ -147,10 +249,14 @@ impl GpuPolarKvCache {
             v_radius_buffers,
             rotation_buffers,
             lut_buffer,
+            k_qjl_signs_buffers,
+            k_qjl_projection_buffers,
             n_layers,
             n_kv_heads,
             head_dim,
             max_seq_len,
+            n_qjl_proj,
+            qjl_seed_base,
             len: 0,
         }
     }
@@ -301,14 +407,47 @@ impl GpuPolarKvCache {
     pub fn rotation_layer(&self, idx: usize) -> &wgpu::Buffer { &self.rotation_buffers[idx] }
     pub fn lut_buffer(&self) -> &wgpu::Buffer { &self.lut_buffer }
 
-    /// VRAM bytes used (compressed K+V + rotation; LUT excluded).
+    /// Number of QJL projections. 0 means QJL is disabled.
+    pub fn n_qjl_proj(&self) -> usize { self.n_qjl_proj }
+
+    /// Bytes per (pos, head) entry for the signs buffer. Always a
+    /// multiple of 4 (u32-aligned). Returns 0 when QJL is disabled.
+    pub fn qjl_sign_bytes_per_entry(&self) -> usize {
+        if self.n_qjl_proj == 0 {
+            0
+        } else {
+            ((self.n_qjl_proj + 31) / 32) * std::mem::size_of::<u32>()
+        }
+    }
+
+    /// K QJL signs buffer for layer `idx`. `None` when QJL disabled.
+    pub fn k_qjl_signs_layer(&self, idx: usize) -> Option<&wgpu::Buffer> {
+        self.k_qjl_signs_buffers.get(idx)
+    }
+
+    /// K QJL projection matrix buffer for layer `idx`. `None` when
+    /// QJL disabled.
+    pub fn k_qjl_projection_layer(&self, idx: usize) -> Option<&wgpu::Buffer> {
+        self.k_qjl_projection_buffers.get(idx)
+    }
+
+    /// VRAM bytes used (compressed K+V + rotation + optional QJL;
+    /// LUT excluded).
     pub fn memory_bytes(&self) -> u64 {
         let n_pairs = self.head_dim / 2;
         let angles_per = (self.max_seq_len * self.n_kv_heads * n_pairs + 3) / 4 * 4;
         let radius_per = self.max_seq_len * self.n_kv_heads * 4;
         let kv_per_layer = (2 * angles_per + 2 * radius_per) as u64; // K + V
         let rot = (self.n_layers * self.head_dim * self.head_dim * 4) as u64;
-        kv_per_layer * self.n_layers as u64 + rot
+        let qjl = if self.n_qjl_proj > 0 {
+            let signs_per_layer = (self.max_seq_len * self.n_kv_heads
+                * self.qjl_sign_bytes_per_entry()) as u64;
+            let proj_per_layer = (self.n_qjl_proj * self.head_dim * 4) as u64;
+            (signs_per_layer + proj_per_layer) * self.n_layers as u64
+        } else {
+            0
+        };
+        kv_per_layer * self.n_layers as u64 + rot + qjl
     }
 
     /// f32-equivalent KV size for the same shape (rotation excluded).
@@ -529,6 +668,58 @@ mod tests {
             "compression ratio {ratio:.2}x below 6x floor (Qwen 3B shape)",
         );
         assert!(cache.memory_bytes() < cache.f32_equivalent_bytes());
+    }
+
+    /// QJL storage smoke test: constructing with `n_qjl_proj > 0` should
+    /// allocate per-layer signs + projection buffers, expose them via
+    /// the accessors, and bump `memory_bytes()` by the expected amount.
+    /// Constructing without QJL leaves all accessors returning None
+    /// and memory_bytes() unchanged from the non-QJL case.
+    #[test]
+    fn qjl_storage_optional() {
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let n_layers = 3;
+        let n_kv_heads = 2;
+        let head_dim = 8;
+        let max_seq = 16;
+        let rot_seed = 42u64;
+
+        // Without QJL: accessors return None, n_qjl_proj == 0.
+        let plain = GpuPolarKvCache::new(
+            gpu.clone(), n_layers, n_kv_heads, head_dim, max_seq, rot_seed,
+        );
+        assert_eq!(plain.n_qjl_proj(), 0);
+        assert_eq!(plain.qjl_sign_bytes_per_entry(), 0);
+        for i in 0..n_layers {
+            assert!(plain.k_qjl_signs_layer(i).is_none());
+            assert!(plain.k_qjl_projection_layer(i).is_none());
+        }
+
+        // With QJL (n_proj=32): per-layer buffers materialize.
+        let qjl_seed = 99u64;
+        let with_qjl = GpuPolarKvCache::new_with_qjl(
+            gpu, n_layers, n_kv_heads, head_dim, max_seq,
+            rot_seed, /*n_qjl_proj*/ 32, qjl_seed,
+        );
+        assert_eq!(with_qjl.n_qjl_proj(), 32);
+        // 32 bits → 4 bytes per (pos, head) entry.
+        assert_eq!(with_qjl.qjl_sign_bytes_per_entry(), 4);
+        for i in 0..n_layers {
+            assert!(with_qjl.k_qjl_signs_layer(i).is_some());
+            assert!(with_qjl.k_qjl_projection_layer(i).is_some());
+        }
+        // QJL must add memory: signs (max_seq * n_kv_heads * 4 bytes per layer)
+        // + projections (n_proj * head_dim * 4 bytes per layer).
+        let expected_signs_per = max_seq * n_kv_heads * 4;
+        let expected_proj_per = 32 * head_dim * 4;
+        let expected_qjl = (expected_signs_per + expected_proj_per) * n_layers;
+        assert_eq!(
+            with_qjl.memory_bytes() - plain.memory_bytes(),
+            expected_qjl as u64,
+            "memory_bytes delta should equal QJL signs+projections total"
+        );
     }
 
     /// Load-bearing phase 2c.4 test: build a populated f32 GpuKvCache and
