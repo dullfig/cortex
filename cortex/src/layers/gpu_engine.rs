@@ -3325,20 +3325,47 @@ impl GpuEngine {
             &scratch.k, &scratch.v, n_tokens, start_pos,
         );
 
+        // 5.6 If QJL is enabled, encode K residual signs for the freshly-
+        // compressed positions. Must run after compress (reads angles +
+        // radius written above). No-op when polar_cache.n_qjl_proj() == 0.
+        crate::layers::gpu_polar::qjl_encode_k_layer(
+            &self.gpu, encoder, polar_cache, block_idx,
+            &scratch.k, n_tokens, start_pos,
+        );
+
         // 6a. rotate_q: packed scratch.q → f32 rotated_buf.
         crate::layers::gpu_polar::dispatch_rotate_q_packed(
             &self.gpu, encoder, &scratch.q, polar_cache.rotation_layer(block_idx), rotated_buf,
             n_tokens, n_heads, head_dim,
         );
 
-        // 6b. attn_score_polar_batch: rotated_buf · K_polar → scratch.scores
-        crate::layers::gpu_polar::dispatch_attn_score_polar_batch(
-            &self.gpu, encoder, rotated_buf,
-            polar_cache.k_angles_layer(block_idx),
-            polar_cache.k_radius_layer(block_idx),
-            &scratch.scores, polar_cache.lut_buffer(),
-            n_heads, n_kv_heads, head_dim, start_pos, n_tokens, attn_max_seq,
-        );
+        // 6b. attn_score: rotated_buf · K_polar → scratch.scores.
+        // Use the QJL-corrected variant when the cache has QJL signs;
+        // otherwise the plain polar variant. Both write the same
+        // scratch.scores layout, so softmax + value paths are unchanged.
+        if polar_cache.n_qjl_proj() > 0 {
+            crate::layers::gpu_polar::dispatch_attn_score_polar_qjl_batch(
+                &self.gpu, encoder, rotated_buf,
+                polar_cache.k_angles_layer(block_idx),
+                polar_cache.k_radius_layer(block_idx),
+                &scratch.scores,
+                polar_cache.k_qjl_signs_layer(block_idx)
+                    .expect("k_qjl_signs_layer must exist when n_qjl_proj > 0"),
+                polar_cache.k_qjl_projection_layer(block_idx)
+                    .expect("k_qjl_projection_layer must exist when n_qjl_proj > 0"),
+                polar_cache.lut_buffer(),
+                n_heads, n_kv_heads, head_dim, start_pos, n_tokens, attn_max_seq,
+                polar_cache.n_qjl_proj(),
+            );
+        } else {
+            crate::layers::gpu_polar::dispatch_attn_score_polar_batch(
+                &self.gpu, encoder, rotated_buf,
+                polar_cache.k_angles_layer(block_idx),
+                polar_cache.k_radius_layer(block_idx),
+                &scratch.scores, polar_cache.lut_buffer(),
+                n_heads, n_kv_heads, head_dim, start_pos, n_tokens, attn_max_seq,
+            );
+        }
 
         // 6c. (optional) capture pre-softmax scores
         if let Some(capture_buf) = pre_softmax_capture {
