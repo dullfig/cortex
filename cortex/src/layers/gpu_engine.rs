@@ -2912,15 +2912,38 @@ impl GpuEngine {
             label: Some("forward_polar_argmax.encoder"),
         });
 
+        // Optional per-block hidden-state finite check, mirroring the
+        // f32 path's CORTEX_DEBUG_HIDDEN_FINITE. hidden_buf is packed
+        // f16 in C3 (n_tokens * embed_dim * 2 bytes); unpack to f32 on
+        // readback. Use to localize NaN/Inf propagation across layers
+        // for the polar chat gibberish hunt.
+        let debug_finite = std::env::var("CORTEX_DEBUG_POLAR_FINITE").is_ok();
+        let hidden_bytes = (n_tokens * self.embed_dim * 2) as u64;
+        let debug_captures: Vec<wgpu::Buffer> = if debug_finite {
+            (0..n_layers).map(|i| self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("polar_debug_finite.{}", i)),
+                size: hidden_bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })).collect()
+        } else { Vec::new() };
+        let debug_stagings: Vec<wgpu::Buffer> = if debug_finite {
+            (0..n_layers).map(|_| self.gpu.create_staging_buffer(hidden_bytes)).collect()
+        } else { Vec::new() };
+
         // All N blocks via the polar block forward — which compresses
         // new K/V into polar_cache at [start_pos, start_pos+n_tokens) as
         // it goes (line 3126 in forward_block_gpu_polar_inner).
         for i in 0..n_layers {
             let inject = inject_deltas.get(i).and_then(|opt| opt.as_ref());
+            let capture = if debug_finite { Some(&debug_captures[i]) } else { None };
             self.forward_block_gpu_polar_inner(
                 &mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch,
-                &rotated_buf, &*polar_cache, None, None, inject,
+                &rotated_buf, &*polar_cache, None, capture, inject,
             );
+            if debug_finite {
+                encoder.copy_buffer_to_buffer(&debug_captures[i], 0, &debug_stagings[i], 0, hidden_bytes);
+            }
         }
 
         // Final norm: packed → packed.
@@ -2967,6 +2990,38 @@ impl GpuEngine {
         encoder.copy_buffer_to_buffer(&token_id_buf, 0, &staging, 0, 4);
 
         self.gpu.queue.submit(Some(encoder.finish()));
+
+        // CORTEX_DEBUG_POLAR_FINITE: per-layer hidden-state scan.
+        if debug_finite {
+            tracing::info!(
+                n_tokens, embed_dim = self.embed_dim, n_layers, start_pos,
+                "CORTEX_DEBUG_POLAR_FINITE: per-block hidden-state scan",
+            );
+            for i in 0..n_layers {
+                let unpacked = read_back_buffer_f16_unpack(
+                    &self.gpu, &debug_stagings[i], hidden_bytes as usize,
+                );
+                let mut n_inf = 0usize;
+                let mut n_nan = 0usize;
+                let mut max_abs = 0.0f32;
+                let mut first_bad: Option<usize> = None;
+                for (idx, &v) in unpacked.iter().enumerate() {
+                    if v.is_nan() { n_nan += 1; if first_bad.is_none() { first_bad = Some(idx); } }
+                    else if v.is_infinite() { n_inf += 1; if first_bad.is_none() { first_bad = Some(idx); } }
+                    else if v.abs() > max_abs { max_abs = v.abs(); }
+                }
+                tracing::info!(
+                    layer = i, n_inf, n_nan, max_abs,
+                    first_bad = ?first_bad,
+                    total = unpacked.len(),
+                    "polar hidden state",
+                );
+                if n_inf + n_nan > 0 {
+                    tracing::warn!(layer = i, "polar: FIRST LAYER with non-finite values");
+                    break;
+                }
+            }
+        }
 
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
