@@ -78,6 +78,18 @@ pub struct Tokenizer {
     /// Whether to add BOS token by default (from `tokenizer.ggml.add_bos_token`).
     /// Default: true (LLaMA). Qwen2 sets this to false.
     add_bos_default: bool,
+    /// Control-type tokens (e.g. `<|im_start|>`, `<|im_end|>`, `<|endoftext|>`)
+    /// that must be preserved as single token IDs during encoding rather
+    /// than broken into BPE pieces. Populated from any vocab entry whose
+    /// `TokenType` is `Control`. Sorted by string length descending so
+    /// longest-match-wins behavior is natural during the encode pre-pass.
+    /// Empty strings filtered out.
+    ///
+    /// Without this pre-pass, `<|im_start|>` (id 151644 in Qwen 2.5) gets
+    /// tokenized as 7 separate characters via plain BPE — the model then
+    /// never sees a real chat-turn marker and produces gibberish for any
+    /// chat-template-formatted input.
+    special_tokens: Vec<(String, u32)>,
 }
 
 impl Tokenizer {
@@ -166,16 +178,23 @@ impl Tokenizer {
             Vec::new()
         };
 
-        // Special tokens
-        let bos_token_id = gguf
-            .get_metadata("tokenizer.ggml.bos_token_id")
-            .and_then(|v| v.as_u32())
-            .unwrap_or(1);
-
+        // Special tokens. Read EOS first so the BOS fallback can use
+        // it as a sane sentinel for models that don't define a BOS
+        // (e.g. Qwen 2.5 — chat-only, no BOS metadata). Previous
+        // fallback to magic id=1 produced whatever vocab entry happened
+        // to land there: in Qwen that's `"` (double-quote), which got
+        // repeated SINK_TOKENS times at cache start and broke chat by
+        // making the model parse 4 quote characters before the real
+        // chat-template markers.
         let eos_token_id = gguf
             .get_metadata("tokenizer.ggml.eos_token_id")
             .and_then(|v| v.as_u32())
             .unwrap_or(2);
+
+        let bos_token_id = gguf
+            .get_metadata("tokenizer.ggml.bos_token_id")
+            .and_then(|v| v.as_u32())
+            .unwrap_or(eos_token_id);
 
         // Check if model explicitly disables BOS token
         let add_bos_default = gguf
@@ -280,6 +299,18 @@ impl Tokenizer {
             }
         }
 
+        // Collect control-type tokens for the encode pre-pass. Sorted
+        // by length descending so when find_next_special compares matches
+        // at the same starting position, the longest wins naturally.
+        let mut special_tokens: Vec<(String, u32)> = vocab.iter().enumerate()
+            .filter(|(id, s)| {
+                !s.is_empty()
+                    && token_types.get(*id).copied() == Some(TokenType::Control)
+            })
+            .map(|(id, s)| (s.clone(), id as u32))
+            .collect();
+        special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
         Ok(Self {
             vocab,
             scores,
@@ -292,6 +323,7 @@ impl Tokenizer {
             pre_type,
             merge_ranks,
             add_bos_default: true,
+            special_tokens,
         })
     }
 
@@ -321,6 +353,13 @@ impl Tokenizer {
     }
 
     /// Encode text to token IDs.
+    ///
+    /// Pre-pass: any occurrence of a known Control-type token string
+    /// (e.g. `<|im_start|>`, `<|im_end|>`, `<|endoftext|>`) is emitted
+    /// as its single vocab ID rather than BPE-encoded into characters.
+    /// Standard behavior matching HuggingFace tokenizers, OpenAI
+    /// tiktoken, llama.cpp — required for chat templates to round-trip
+    /// to the IDs the model was trained on.
     pub fn encode(&self, text: &str, add_bos: bool) -> Vec<u32> {
         let mut tokens = Vec::new();
         if add_bos {
@@ -330,12 +369,68 @@ impl Tokenizer {
             return tokens;
         }
 
-        match self.mode {
-            BpeMode::SentencePiece => self.encode_sentencepiece(text, &mut tokens),
-            BpeMode::Gpt2 => self.encode_gpt2(text, &mut tokens),
+        // Fast path: no special tokens in vocab (test fixtures, very old
+        // models). Skip the scan entirely.
+        if self.special_tokens.is_empty() {
+            self.encode_segment(text, &mut tokens);
+            return tokens;
         }
 
+        // Split on special-token occurrences. Iteratively find the
+        // leftmost match (longest on ties); BPE-encode the run before
+        // it; emit the special token as a single ID; repeat on the tail.
+        let mut remaining = text;
+        while !remaining.is_empty() {
+            match self.find_next_special(remaining) {
+                Some((pos, tok_str, tok_id)) => {
+                    if pos > 0 {
+                        self.encode_segment(&remaining[..pos], &mut tokens);
+                    }
+                    tokens.push(tok_id);
+                    remaining = &remaining[pos + tok_str.len()..];
+                }
+                None => {
+                    self.encode_segment(remaining, &mut tokens);
+                    break;
+                }
+            }
+        }
         tokens
+    }
+
+    /// Dispatch a (non-special) text segment to the appropriate BPE
+    /// encoder. Shared between the top-level encode and the
+    /// inter-special-token segments.
+    fn encode_segment(&self, text: &str, tokens: &mut Vec<u32>) {
+        match self.mode {
+            BpeMode::SentencePiece => self.encode_sentencepiece(text, tokens),
+            BpeMode::Gpt2 => self.encode_gpt2(text, tokens),
+        }
+    }
+
+    /// Find the leftmost occurrence of any Control-type token string in
+    /// `text`. On ties (same starting position), prefer the longer
+    /// token. Returns `(byte_offset, token_string, token_id)` or None.
+    fn find_next_special<'a>(&'a self, text: &str) -> Option<(usize, &'a str, u32)> {
+        let mut best: Option<(usize, &'a str, u32)> = None;
+        for (tok_str, tok_id) in &self.special_tokens {
+            if let Some(rel_pos) = text.find(tok_str.as_str()) {
+                let candidate = (rel_pos, tok_str.as_str(), *tok_id);
+                best = Some(match best {
+                    None => candidate,
+                    Some(cur) => {
+                        if rel_pos < cur.0
+                            || (rel_pos == cur.0 && tok_str.len() > cur.1.len())
+                        {
+                            candidate
+                        } else {
+                            cur
+                        }
+                    }
+                });
+            }
+        }
+        best
     }
 
     /// Decode token IDs back to text.
@@ -1037,6 +1132,163 @@ mod tests {
         let tok = make_test_tokenizer();
         let tokens = tok.encode("hello world", false);
         assert_eq!(tokens, vec![259, 272, 278]);
+    }
+
+    /// Build a SentencePiece tokenizer that includes Qwen-style
+    /// chat-marker control tokens (`<|im_start|>`, `<|im_end|>`,
+    /// `<|endoftext|>`). Used to verify the encode pre-pass emits them
+    /// as single IDs rather than character soup.
+    fn make_test_tokenizer_with_specials() -> Tokenizer {
+        let mut vocab = Vec::new();
+        let mut scores = Vec::new();
+        let mut token_types = Vec::new();
+
+        // 0..258: same scaffold as make_test_tokenizer.
+        vocab.push("<unk>".to_string()); scores.push(0.0); token_types.push(TokenType::Unknown);
+        vocab.push("<s>".to_string());   scores.push(0.0); token_types.push(TokenType::Control);
+        vocab.push("</s>".to_string());  scores.push(0.0); token_types.push(TokenType::Control);
+        for b in 0..=255u8 {
+            vocab.push(format!("<0x{:02X}>", b));
+            scores.push(0.0);
+            token_types.push(TokenType::Byte);
+        }
+
+        // 259..278: "hello"/"world" merge ladder (same as base fixture).
+        let extra_tokens: Vec<(&str, f32)> = vec![
+            ("\u{2581}", 0.0), ("h", 0.0), ("e", 0.0), ("l", 0.0), ("o", 0.0),
+            ("w", 0.0), ("r", 0.0), ("d", 0.0),
+            ("he", 1.0), ("ll", 2.0), ("lo", 3.0),
+            ("hel", 4.0), ("hell", 5.0), ("hello", 6.0),
+            ("\u{2581}he", 7.0), ("wo", 8.0), ("wor", 9.0),
+            ("worl", 10.0), ("world", 11.0), ("\u{2581}world", 12.0),
+        ];
+        for (text, score) in extra_tokens {
+            vocab.push(text.to_string());
+            scores.push(score);
+            token_types.push(TokenType::Normal);
+        }
+
+        // 279, 280, 281: chat-marker control tokens.
+        vocab.push("<|im_start|>".to_string());   scores.push(0.0); token_types.push(TokenType::Control);
+        vocab.push("<|im_end|>".to_string());     scores.push(0.0); token_types.push(TokenType::Control);
+        vocab.push("<|endoftext|>".to_string());  scores.push(0.0); token_types.push(TokenType::Control);
+
+        Tokenizer::from_parts(vocab, scores, token_types, 1, 2).unwrap()
+    }
+
+    #[test]
+    fn special_token_at_start() {
+        let tok = make_test_tokenizer_with_specials();
+        let toks = tok.encode("<|im_start|>hello", false);
+        // Expect: [279 = <|im_start|>, ...hello-encoded tokens].
+        assert_eq!(toks[0], 279, "first token should be the special-token ID");
+        // The "hello" suffix should match what plain `encode("hello")` produces.
+        let hello_only = tok.encode("hello", false);
+        assert_eq!(&toks[1..], &hello_only[..]);
+    }
+
+    #[test]
+    fn special_token_at_end() {
+        let tok = make_test_tokenizer_with_specials();
+        let toks = tok.encode("hello<|im_end|>", false);
+        // Expect: [...hello-encoded..., 280 = <|im_end|>].
+        let hello_only = tok.encode("hello", false);
+        assert_eq!(&toks[..toks.len() - 1], &hello_only[..]);
+        assert_eq!(*toks.last().unwrap(), 280);
+    }
+
+    #[test]
+    fn special_token_in_middle() {
+        let tok = make_test_tokenizer_with_specials();
+        let toks = tok.encode("hello<|im_start|>world", false);
+        let hello_only = tok.encode("hello", false);
+        let world_only = tok.encode("world", false);
+        // [hello..., 279, world...]
+        assert_eq!(&toks[..hello_only.len()], &hello_only[..]);
+        assert_eq!(toks[hello_only.len()], 279);
+        assert_eq!(&toks[hello_only.len() + 1..], &world_only[..]);
+    }
+
+    #[test]
+    fn adjacent_special_tokens() {
+        let tok = make_test_tokenizer_with_specials();
+        let toks = tok.encode("<|im_start|><|im_end|>", false);
+        // Two specials back-to-back with nothing in between.
+        assert_eq!(toks, vec![279, 280]);
+    }
+
+    #[test]
+    fn three_special_tokens() {
+        let tok = make_test_tokenizer_with_specials();
+        let toks = tok.encode("<|im_start|>hello<|im_end|><|endoftext|>", false);
+        let hello_only = tok.encode("hello", false);
+        let mut expected = vec![279u32];
+        expected.extend_from_slice(&hello_only);
+        expected.push(280);
+        expected.push(281);
+        assert_eq!(toks, expected);
+    }
+
+    #[test]
+    fn no_special_tokens_unchanged() {
+        // Regression: plain BPE behavior must be identical to the
+        // base tokenizer fixture (which has no <|im_*|> tokens in vocab).
+        let plain = make_test_tokenizer();
+        let with_specials = make_test_tokenizer_with_specials();
+        let plain_out = plain.encode("hello world", false);
+        let specials_out = with_specials.encode("hello world", false);
+        assert_eq!(plain_out, specials_out,
+            "encode of text with no special tokens must match the no-specials fixture exactly");
+    }
+
+    #[test]
+    fn longest_special_wins_on_tie() {
+        // Make a fixture where two control tokens share a prefix; verify
+        // the longer one is preferred when both could match at the same
+        // starting position.
+        let mut vocab = Vec::new();
+        let mut scores = Vec::new();
+        let mut types = Vec::new();
+        vocab.push("<unk>".to_string());     scores.push(0.0); types.push(TokenType::Unknown);
+        vocab.push("<s>".to_string());       scores.push(0.0); types.push(TokenType::Control);
+        vocab.push("</s>".to_string());      scores.push(0.0); types.push(TokenType::Control);
+        for b in 0..=255u8 {
+            vocab.push(format!("<0x{:02X}>", b));
+            scores.push(0.0);
+            types.push(TokenType::Byte);
+        }
+        // 259, 260: short vs long with shared prefix.
+        vocab.push("<|x|>".to_string());        scores.push(0.0); types.push(TokenType::Control);
+        vocab.push("<|x|>extended".to_string());scores.push(0.0); types.push(TokenType::Control);
+        let tok = Tokenizer::from_parts(vocab, scores, types, 1, 2).unwrap();
+
+        // Text contains the LONGER token; the encoder must pick id 260
+        // (longer match) over id 259 (shorter prefix match).
+        let toks = tok.encode("<|x|>extended", false);
+        assert_eq!(toks, vec![260]);
+    }
+
+    #[test]
+    fn special_token_empty_string_ignored() {
+        // Empty-string control tokens (test-fixture pathology) must not
+        // crash the encoder — they'd otherwise match at every position
+        // and produce an infinite loop.
+        let mut vocab = Vec::new();
+        let mut scores = Vec::new();
+        let mut types = Vec::new();
+        vocab.push("<unk>".to_string()); scores.push(0.0); types.push(TokenType::Unknown);
+        vocab.push("<s>".to_string());   scores.push(0.0); types.push(TokenType::Control);
+        vocab.push("</s>".to_string());  scores.push(0.0); types.push(TokenType::Control);
+        for b in 0..=255u8 {
+            vocab.push(format!("<0x{:02X}>", b));
+            scores.push(0.0);
+            types.push(TokenType::Byte);
+        }
+        // 259: empty string with Control type (should be filtered out).
+        vocab.push("".to_string());      scores.push(0.0); types.push(TokenType::Control);
+        let tok = Tokenizer::from_parts(vocab, scores, types, 1, 2).unwrap();
+        // Should not hang or panic.
+        let _ = tok.encode("hello", false);
     }
 
     #[test]
