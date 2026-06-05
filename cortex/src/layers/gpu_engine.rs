@@ -2053,9 +2053,17 @@ impl GpuEngine {
             hidden_init.extend_from_slice(&embed_data[off..off + self.embed_dim]);
         }
 
+        // Same Phase 0 fix as trace forward: forward_block_gpu_inner
+        // reads hidden_buf as packed-f16 (C3). Passing raw f32 here
+        // (the pre-2026-06-03 mistake) feeds the block misaligned bytes
+        // and produces garbage K/V in the cache — which then poisons
+        // every downstream attention read with NaN. Symptom: chat
+        // against a cache_load'd shard outputs `!!!!` regardless of
+        // polar/QJL/etc.
+        let hidden_packed = GpuDevice::pack_f16(&hidden_init);
         let hidden_buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("forward_advance_only.hidden"),
-            contents: bytemuck::cast_slice(&hidden_init),
+            contents: bytemuck::cast_slice(&hidden_packed),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
 
@@ -2332,8 +2340,11 @@ impl GpuEngine {
         // after each block, reads back after submit, counts Inf/NaN per
         // layer. Gated on CORTEX_DEBUG_HIDDEN_FINITE.
         let debug_finite = std::env::var("CORTEX_DEBUG_HIDDEN_FINITE").is_ok();
-        // Option E: hidden_buf is f32; capture buffers must match that size.
-        let hidden_bytes = (n_tokens * self.embed_dim * std::mem::size_of::<f32>()) as u64;
+        // C3: hidden_buf is PACKED f16 (2 per u32), half the f32 size.
+        // (The stale "Option E: f32" comment misled the trace into
+        // reading raw bytes as f32 floats — every other 2-byte slice
+        // got reinterpreted as a high-half of f32, producing fake NaNs.)
+        let hidden_bytes = (n_tokens * self.embed_dim * 2) as u64;
         let debug_captures: Vec<wgpu::Buffer> = if debug_finite {
             (0..n_layers).map(|i| self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(&format!("debug_finite.capture.{}", i)),
@@ -2409,8 +2420,10 @@ impl GpuEngine {
                 "CORTEX_DEBUG_HIDDEN_FINITE: per-block hidden-state scan",
             );
             for i in 0..n_layers {
-                // Option E: hidden_buf is f32; read back directly (no unpack).
-                let unpacked = read_back_buffer(
+                // C3: hidden_buf is packed f16. Unpack via the existing
+                // helper so we count NaN/Inf on the actual f32 values
+                // the next block would read.
+                let unpacked = read_back_buffer_f16_unpack(
                     &self.gpu, &debug_stagings[i], hidden_bytes as usize,
                 );
                 let mut n_inf: usize = 0;
