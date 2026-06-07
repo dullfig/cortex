@@ -1711,10 +1711,19 @@ impl GpuEngine {
             hidden_init.extend_from_slice(&embed_data[off..off + self.embed_dim]);
         }
 
-        let bytes = (hidden_init.len() * std::mem::size_of::<f32>()) as u64;
+        // Phase 0 fix (same class as 7d63396 cache_advance_only +
+        // f5b55a2 polar_traced): forward_block_gpu_inner reads hidden_buf
+        // as packed f16 (C3). Passing raw f32 here feeds misaligned
+        // bytes through the block, garbage K/V get written into the
+        // captured score buffers as NaN, and the retrieve aggregator
+        // filters them all out — symptom: /v1/chat/completions
+        // mode="retrieve" returns {"hits":[]} for every query regardless
+        // of corpus or top_k. cache_traced was the last sibling left
+        // unpatched after the f5b55a2/7d63396 hunt.
+        let hidden_packed = GpuDevice::pack_f16(&hidden_init);
         let hidden_buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("forward_traced_with_cache.hidden"),
-            contents: bytemuck::cast_slice(&hidden_init),
+            contents: bytemuck::cast_slice(&hidden_packed),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
 
