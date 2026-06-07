@@ -1988,27 +1988,57 @@ async fn chat_completions(
         let attn_max_seq = cache_seq + n_query;
         let baseline_attn_max = cache_seq + baseline_tokens.len();
 
-        // Closure: compute per-corpus-position MAX score from a captured
+        // Closure: compute per-corpus-position score from a captured
         // per-layer attention tensor (layout [n_q, n_heads, attn_max]).
-        // Aggregates across (layers x heads x LAST query position only).
-        // Using last-position-only keeps query and baseline comparable
-        // (both aggregate over the same number of values: layers x heads).
-        let aggregate_max = |per_layer: &[Vec<f32>], n_q: usize, attn_max: usize| -> Vec<f32> {
-            let q_last = n_q - 1; // n_q >= 1 (asserted by forward_full_gpu_with_cache_traced)
+        // Aggregation strategy is env-var gated for retrieval-quality A/B:
+        //
+        //   CORTEX_RETRIEVE_AGG=last  (default) — MAX over (layers, heads)
+        //       at the LAST query position. Original behavior; keeps query
+        //       and baseline aggregating over the same count of values.
+        //   CORTEX_RETRIEVE_AGG=all   — MAX over (layers, heads, all query
+        //       positions). Tests whether earlier query tokens (the actual
+        //       content nouns/keywords) attend to more retrieval-relevant
+        //       corpus positions than the final assistant-marker token does.
+        //   CORTEX_RETRIEVE_AGG=mean  — MEAN over (layers, heads) at the
+        //       LAST query position. Tests whether MAX is being dominated
+        //       by outlier sink-attending heads.
+        //   CORTEX_RETRIEVE_AGG=all_mean — MEAN over (layers, heads, all
+        //       query positions). Both fixes combined.
+        let agg_mode: String = std::env::var("CORTEX_RETRIEVE_AGG")
+            .unwrap_or_else(|_| "last".to_string());
+        let agg_all_q = agg_mode == "all" || agg_mode == "all_mean";
+        let agg_mean = agg_mode == "mean" || agg_mode == "all_mean";
+        let aggregate_score = |per_layer: &[Vec<f32>], n_q: usize, attn_max: usize| -> Vec<f32> {
+            let q_range_start = if agg_all_q { 0 } else { n_q - 1 };
+            let q_range_end = n_q;
             let mut out = vec![f32::NEG_INFINITY; corpus_len];
             for k in 0..corpus_len {
-                let mut m = f32::NEG_INFINITY;
-                for layer_scores in per_layer {
-                    for h in 0..n_heads {
-                        let idx = q_last * n_heads * attn_max + h * attn_max + k;
-                        let v = layer_scores[idx];
-                        if v > m { m = v; }
+                let mut accum = f32::NEG_INFINITY;
+                let mut sum = 0.0f32;
+                let mut count = 0usize;
+                for q in q_range_start..q_range_end {
+                    for layer_scores in per_layer {
+                        for h in 0..n_heads {
+                            let idx = q * n_heads * attn_max + h * attn_max + k;
+                            let v = layer_scores[idx];
+                            if v.is_finite() {
+                                if v > accum { accum = v; }
+                                sum += v;
+                                count += 1;
+                            }
+                        }
                     }
                 }
-                if m.is_finite() { out[k] = m; }
+                let agg = if agg_mean {
+                    if count > 0 { sum / (count as f32) } else { f32::NEG_INFINITY }
+                } else {
+                    accum
+                };
+                if agg.is_finite() { out[k] = agg; }
             }
             out
         };
+        let aggregate_max = aggregate_score;
 
         let query_max = aggregate_max(&per_layer_scores, n_query, attn_max_seq);
         let baseline_max = aggregate_max(&baseline_per_layer, baseline_tokens.len(), baseline_attn_max);
