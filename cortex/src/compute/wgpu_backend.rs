@@ -357,6 +357,55 @@ impl Pipelines {
 // GpuDevice — shared device + queue + pipelines
 // ---------------------------------------------------------------------------
 
+/// Slot size (bytes) for the params buffer ring pool. Sized to fit any
+/// per-dispatch params struct cortex creates today (largest seen is well
+/// under 128B). Asserted at `create_params_buffer` call time.
+pub const PARAMS_POOL_SLOT_BYTES: u64 = 256;
+
+/// Number of slots in the params buffer ring pool. Must comfortably
+/// exceed the largest single synchronous forward pass's per-dispatch
+/// params allocation count, so the ring's natural wrap-around can't
+/// reuse a slot while the previous occupant is still bound in flight.
+/// Polar retrieve at Qwen-3B (36 layers × ~10 dispatches per layer)
+/// uses ~360 slots; 2048 leaves 5x headroom for future expansion.
+/// Memory cost: 2048 × 256 B = 512 KB. Trivial vs the ~6 GB cortex
+/// uses for weights+caches.
+pub const PARAMS_POOL_SLOT_COUNT: usize = 2048;
+
+/// Ring of pre-allocated uniform buffers used by `create_params_buffer`.
+/// See that method's doc comment for why this exists.
+pub struct ParamsBufferPool {
+    slots: Vec<wgpu::Buffer>,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+impl ParamsBufferPool {
+    pub fn new(device: &wgpu::Device) -> Self {
+        let slots = (0..PARAMS_POOL_SLOT_COUNT)
+            .map(|i| device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("params_pool[{i}]")),
+                size: PARAMS_POOL_SLOT_BYTES,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }))
+            .collect();
+        Self {
+            slots,
+            next: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Hand out the next slot in round-robin order. Returned wgpu::Buffer
+    /// is a refcounted handle to a pool-resident allocation — Drop just
+    /// decrements the refcount; the underlying buffer lives until the
+    /// pool itself drops (which is at GpuDevice tear-down).
+    pub fn next_slot(&self) -> wgpu::Buffer {
+        let idx = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % self.slots.len();
+        self.slots[idx].clone()
+    }
+}
+
 /// Shared GPU context: device, queue, and compiled pipelines.
 ///
 /// Created once at startup, shared across all layers via `Arc<GpuDevice>`.
@@ -364,6 +413,7 @@ pub struct GpuDevice {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub pipelines: Pipelines,
+    pub params_pool: ParamsBufferPool,
 }
 
 impl GpuDevice {
@@ -374,6 +424,16 @@ impl GpuDevice {
         // Instance::new takes desc by value.
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
         desc.backends = wgpu::Backends::all();
+        // DIAG: enable Vulkan validation + debug labels so the driver
+        // prints warnings/errors before the device-lost panic. Gated on
+        // CORTEX_WGPU_VALIDATE=1 so it's opt-in (validation has nonzero
+        // overhead and shouldn't ship). Reveal whatever the Vulkan
+        // loader sees before our device-lost mystery: buffer overruns,
+        // memory budget warnings, fence misuse, etc.
+        if std::env::var("CORTEX_WGPU_VALIDATE").as_deref() == Ok("1") {
+            desc.flags = wgpu::InstanceFlags::debugging();
+            eprintln!("[cortex] wgpu validation layers ENABLED via CORTEX_WGPU_VALIDATE=1");
+        }
         let instance = wgpu::Instance::new(desc);
 
         // wgpu 29: request_adapter returns Future<Result>, not Future<Option>.
@@ -436,7 +496,15 @@ impl GpuDevice {
         let pipelines = Pipelines::compile(&device);
         tracing::info!("compiled 34 GPU compute pipelines");
 
-        Some(Self { device, queue, pipelines })
+        let params_pool = ParamsBufferPool::new(&device);
+        tracing::info!(
+            slot_count = PARAMS_POOL_SLOT_COUNT,
+            slot_bytes = PARAMS_POOL_SLOT_BYTES,
+            total_kb = (PARAMS_POOL_SLOT_COUNT as u64 * PARAMS_POOL_SLOT_BYTES) / 1024,
+            "params buffer pool allocated",
+        );
+
+        Some(Self { device, queue, pipelines, params_pool })
     }
 
     /// Create a bind group from a pipeline and a list of buffers.
@@ -465,21 +533,46 @@ impl GpuDevice {
 
     /// Create a uniform buffer from a bytemuck-able params struct.
     ///
-    /// Uses `queue.write_buffer` to populate the data rather than
-    /// `create_buffer_init`. The latter uses an internal staging belt that
-    /// could not recycle reliably across hundreds of per-dispatch params
-    /// buffers — we hit a "staging buffer in bind group" validation error
-    /// around the 200th call. `queue.write_buffer` manages its own staging
-    /// at the queue level and is the wgpu-recommended pattern for frequent
-    /// small writes.
+    /// Routes through the pre-allocated `params_pool` (a ring of
+    /// PARAMS_POOL_SLOT_COUNT pre-allocated uniform buffers of
+    /// PARAMS_POOL_SLOT_BYTES each). This avoids cortex's per-dispatch
+    /// `device.create_buffer` churn — which under wgpu-29's stricter
+    /// resource accounting was reliably exhausting some internal
+    /// allocator limit during multi-shard polar workloads and
+    /// triggering `DeviceError::Lost` from the next `queue.submit`.
+    ///
+    /// Validation diagnosis 2026-06-08: enabling Vulkan validation
+    /// layers (CORTEX_WGPU_VALIDATE=1) caught the symptom — a
+    /// `Queue::write_buffer` on a `Buffer with '' label is invalid`,
+    /// triggered from `create_params_buffer`'s anonymous create_buffer
+    /// call eventually returning a `Fallible::Invalid` sentinel after
+    /// the device was marked lost by a prior submission. Stack
+    /// pointed at dispatch_rope_packed_in_pass /
+    /// dispatch_rmsnorm_packed_to_packed_in_pass — the hot per-layer
+    /// dispatches in `forward_full_gpu_polar_traced`.
+    ///
+    /// `wgpu::Buffer` is internally Arc'd so handing out owned clones
+    /// of pool slots is cheap. Caller's existing pattern (pass the
+    /// returned Buffer into `make_bind_group`'s
+    /// `as_entire_binding()`) stays unchanged because each slot IS a
+    /// whole standalone wgpu Buffer — we just never let them get
+    /// dropped.
+    ///
+    /// Ring size (2048) is comfortably larger than any single
+    /// synchronously-issued forward pass needs (polar retrieve =
+    /// ~36 layers × ~10 dispatches per layer = ~360 slots). Caller
+    /// returns are single-threaded per-device (cortex-cloud
+    /// serializes via the cache-pool mutex), so the ring's natural
+    /// wrap-around is safe after each function's terminal poll.
     pub fn create_params_buffer<T: bytemuck::Pod>(&self, params: &T) -> wgpu::Buffer {
         let size = std::mem::size_of::<T>() as u64;
-        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        assert!(
+            size <= PARAMS_POOL_SLOT_BYTES,
+            "params struct ({} bytes) exceeds PARAMS_POOL_SLOT_BYTES ({}); \
+             bump the constant or split the struct",
+            size, PARAMS_POOL_SLOT_BYTES,
+        );
+        let buf = self.params_pool.next_slot();
         self.queue.write_buffer(&buf, 0, bytemuck::bytes_of(params));
         buf
     }
