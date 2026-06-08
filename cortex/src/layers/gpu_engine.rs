@@ -1929,11 +1929,19 @@ impl GpuEngine {
             .unwrap_or(9);
         let single_submit = chunk_layers == 0 || chunk_layers >= n_layers;
 
+        // Per-submit diagnostic (gated on CORTEX_POLAR_TRACE_DIAG=1).
+        // When the device-lost panic fires from inside a chunk's
+        // queue.submit, the LAST tracing line tells us WHICH chunk +
+        // layer range was being submitted. First-chunk failure → a
+        // specific shader; last-chunk failure → cumulative-in-flight.
+        let diag = std::env::var("CORTEX_POLAR_TRACE_DIAG").as_deref() == Ok("1");
+
         let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("forward_polar_traced.encoder.0"),
         });
         let mut layers_in_encoder = 0usize;
         let mut chunk_idx = 0usize;
+        let mut chunk_layer_start = 0usize;
         for i in 0..n_layers {
             let capture = capture_lookup.get(&i).copied();
             self.forward_block_gpu_polar_inner(
@@ -1952,13 +1960,30 @@ impl GpuEngine {
                 // observed to make populate_from_f32_cache_gpu WORSE
                 // (cache_load crashed sooner) so we use the same
                 // submit-only pattern here for consistency.
+                if diag {
+                    tracing::info!(
+                        chunk = chunk_idx,
+                        layers = format!("{}..{}", chunk_layer_start, i + 1),
+                        n_tokens, start_pos, attn_max_seq,
+                        "polar_traced submitting chunk",
+                    );
+                }
                 self.gpu.queue.submit(Some(encoder.finish()));
                 chunk_idx += 1;
+                chunk_layer_start = i + 1;
                 encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some(&format!("forward_polar_traced.encoder.{chunk_idx}")),
                 });
                 layers_in_encoder = 0;
             }
+        }
+        if diag {
+            tracing::info!(
+                chunk = chunk_idx,
+                layers = format!("{}..{}", chunk_layer_start, n_layers),
+                n_tokens, start_pos, attn_max_seq,
+                "polar_traced submitting final chunk",
+            );
         }
         // Skip final_norm + output projection — retrieval doesn't need logits.
         // Capture-to-staging copies go on the final encoder so they ride
@@ -4449,6 +4474,42 @@ impl GpuEngine {
             submission_index: None,
             timeout: None,
         }).unwrap();
+    }
+
+    /// Log wgpu's internal allocator report at INFO. Use to track
+    /// VRAM growth / fragmentation around the 2200-token polar
+    /// retrieve device-lost ceiling. Includes total_allocated /
+    /// total_reserved totals, block + allocation counts, and the top
+    /// N allocations by size. `tag` is a free-text label that appears
+    /// in the log line so callers can distinguish before/after pairs.
+    pub fn log_allocator_report(&self, tag: &str) {
+        let Some(report) = self.gpu.device.generate_allocator_report() else {
+            tracing::info!(tag, "allocator report unavailable (backend doesn't provide)");
+            return;
+        };
+        let n_allocations = report.allocations.len();
+        let n_blocks = report.blocks.len();
+        let total_allocated_mb = report.total_allocated_bytes / (1024 * 1024);
+        let total_reserved_mb = report.total_reserved_bytes / (1024 * 1024);
+        tracing::info!(
+            tag,
+            total_allocated_mb,
+            total_reserved_mb,
+            n_allocations,
+            n_blocks,
+            "allocator report",
+        );
+        let mut top: Vec<_> = report.allocations.iter().collect();
+        top.sort_by_key(|a| std::cmp::Reverse(a.size));
+        for (i, a) in top.iter().take(10).enumerate() {
+            tracing::info!(
+                tag,
+                rank = i,
+                name = %a.name,
+                size_kb = a.size / 1024,
+                "top alloc",
+            );
+        }
     }
 
     pub fn embedding_data(&self) -> &[f32] {

@@ -1890,6 +1890,17 @@ async fn chat_completions(
                     backend = "polar",
                     "retrieval mode: single-shard polar trace forward",
                 );
+                // Allocator-state probe around the polar retrieve, opt-in via
+                // CORTEX_POLAR_TRACE_DIAG=1. Pairs with the per-submit
+                // tracing inside forward_full_gpu_polar_traced. Use to
+                // localize the 2200-token retrieve device-lost ceiling:
+                // if total_allocated_mb climbs sharply across retrieves,
+                // it's cumulative; if a specific top-N alloc balloons at
+                // big seq_len, that's the per-call buffer to attack.
+                let diag = std::env::var("CORTEX_POLAR_TRACE_DIAG").as_deref() == Ok("1");
+                if diag {
+                    state.engine.log_allocator_report("before_polar_retrieve");
+                }
                 let (q, b) = tokio::task::block_in_place(|| {
                     let q = state.engine.forward_full_gpu_polar_traced(
                         &prompt_tokens, polar_ref, &capture_layers,
@@ -1899,6 +1910,9 @@ async fn chat_completions(
                     );
                     (q, b)
                 });
+                if diag {
+                    state.engine.log_allocator_report("after_polar_retrieve");
+                }
                 (q, b, cache_seq)
             } else {
                 // Polar absent → f32 cache must be present. Polar-only
