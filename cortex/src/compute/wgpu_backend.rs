@@ -562,7 +562,7 @@ impl GpuDevice {
         ).expect("vram-heap B construction failed");
         let host_readback_heap = ::vram_heap::VramHeap::new(
             &device,
-            ::vram_heap::MemoryTier::HostVisibleReadback,
+            ::vram_heap::MemoryTier::HostReadback,
             heap_readback_mb * 1024 * 1024,
             "cortex.host_readback",
         ).expect("vram-heap readback construction failed");

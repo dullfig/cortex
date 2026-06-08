@@ -1904,11 +1904,13 @@ impl GpuEngine {
         // staging buffers. Safe because stagings are never bound as
         // compute resources — only copy_buffer_to_buffer destinations
         // and host map targets, neither of which triggers wgpu's
-        // per-dispatch buffer-usage tracker. host_readback_heap is
-        // reset_transients()'d at function exit so the next forward
-        // call starts with a fresh transient arena.
+        // per-dispatch buffer-usage tracker. After the overnight
+        // vram-heap rewrite, allocations free + coalesce via RAII
+        // Drop (no manual reset_transients); the explicit
+        // `drop(capture_stagings)` at function exit ensures Drop runs
+        // before the next forward call's allocator activity.
         let capture_stagings: Vec<::vram_heap::VramAllocation> = capture_layers.iter()
-            .map(|&l| self.gpu.host_readback_heap.alloc_transient(
+            .map(|&l| self.gpu.host_readback_heap.allocate(
                 scores_bytes,
                 ::vram_heap::COPY_BUFFER_ALIGNMENT,
                 &format!("forward_polar_traced.stg.layer{l}"),
@@ -2050,16 +2052,16 @@ impl GpuEngine {
             Vec::new()
         };
 
-        // Unmap the heap backing (covers the mapped span). Drop the
-        // VramAllocations explicitly so live-count drops to 0 before
-        // reset_transients (which sets it to 0 anyway, but ordering
-        // is cleaner). Then reset the transient region so the next
-        // forward call reuses the staging bytes.
+        // Unmap the heap backing (covers the mapped span). Then drop
+        // the VramAllocations explicitly: vram-heap's free-list
+        // reclaims the ranges and coalesces with neighbors via RAII
+        // Drop (no manual reset needed after the overnight rewrite).
+        // Explicit drop forces this to happen before the function
+        // returns so the freelist state is clean for the next call.
         if mapped_range.is_some() {
             self.gpu.host_readback_heap.buffer().unmap();
         }
         drop(capture_stagings);
-        self.gpu.host_readback_heap.reset_transients();
 
         per_layer_scores
     }
@@ -4552,6 +4554,35 @@ impl GpuEngine {
                 name = %a.name,
                 size_kb = a.size / 1024,
                 "top alloc",
+            );
+        }
+    }
+
+    /// Log per-heap vram-heap stats — complements `log_allocator_report`
+    /// (which reflects wgpu's internal allocator). Useful when chasing
+    /// vram-heap fragmentation, leak, or high-water issues. Same opt-in
+    /// gating expected at call sites (CORTEX_POLAR_TRACE_DIAG=1).
+    pub fn log_vram_heap_stats(&self, tag: &str) {
+        for heap in [
+            &self.gpu.transient_heap_a,
+            &self.gpu.transient_heap_b,
+            &self.gpu.host_readback_heap,
+        ] {
+            let s = heap.stats();
+            tracing::info!(
+                tag,
+                heap = %s.label,
+                tier = ?s.tier,
+                total_mb = s.total_size / (1024 * 1024),
+                used_mb = s.used_size / (1024 * 1024),
+                payload_mb = s.used_payload / (1024 * 1024),
+                high_water_mb = s.high_water_mark / (1024 * 1024),
+                live = s.current_live_allocations,
+                allocs = s.allocation_count,
+                frees = s.free_count,
+                largest_free_kb = s.largest_free_block / 1024,
+                fragmentation = s.fragmentation_ratio,
+                "vram_heap stats",
             );
         }
     }

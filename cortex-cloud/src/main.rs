@@ -1900,6 +1900,7 @@ async fn chat_completions(
                 let diag = std::env::var("CORTEX_POLAR_TRACE_DIAG").as_deref() == Ok("1");
                 if diag {
                     state.engine.log_allocator_report("before_polar_retrieve");
+                    state.engine.log_vram_heap_stats("before_polar_retrieve");
                 }
                 let (q, b) = tokio::task::block_in_place(|| {
                     let q = state.engine.forward_full_gpu_polar_traced(
@@ -1912,6 +1913,7 @@ async fn chat_completions(
                 });
                 if diag {
                     state.engine.log_allocator_report("after_polar_retrieve");
+                    state.engine.log_vram_heap_stats("after_polar_retrieve");
                 }
                 (q, b, cache_seq)
             } else {
