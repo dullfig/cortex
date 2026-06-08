@@ -1907,18 +1907,62 @@ impl GpuEngine {
                 .map(|(&l, buf)| (l, buf))
                 .collect();
 
-        // ---- All blocks in one encoder ----
+        // ---- All blocks, split into chunks to avoid Windows TDR ----
+        // Submitting all 36 layers' polar dispatches at large cache
+        // seq_len (e.g. 2271 tokens for a hist-139th-street shard) in
+        // one command buffer reliably trips Windows' 2-second TDR —
+        // Vulkan reports DeviceError::Lost from queue.submit, wgpu
+        // marks the device permanently lost, every subsequent request
+        // panics with "Parent device is lost".
+        //
+        // Confirmed empirically: retrieves on ~989-token polar shards
+        // succeed; the same code path on a 2271-token polar shard
+        // crashes the device. Chunking the dispatches across multiple
+        // smaller submits with poll(Wait) between gives each individual
+        // command buffer a tractable budget. Tunable via
+        // CORTEX_POLAR_CHUNK_LAYERS; default 9 yields 4 submits for
+        // Qwen 36-layer. Set 0 (or >= n_layers) to revert to the
+        // original single-submit behavior for A/B / regression testing.
+        let chunk_layers: usize = std::env::var("CORTEX_POLAR_CHUNK_LAYERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(9);
+        let single_submit = chunk_layers == 0 || chunk_layers >= n_layers;
+
         let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("forward_polar_traced.encoder"),
+            label: Some("forward_polar_traced.encoder.0"),
         });
+        let mut layers_in_encoder = 0usize;
+        let mut chunk_idx = 0usize;
         for i in 0..n_layers {
             let capture = capture_lookup.get(&i).copied();
             self.forward_block_gpu_polar_inner(
                 &mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch,
                 &rotated_buf, polar_cache, capture, None, None,
             );
+            layers_in_encoder += 1;
+            if !single_submit
+                && layers_in_encoder >= chunk_layers
+                && i + 1 < n_layers
+            {
+                // No poll(Wait) between chunks — wgpu's queue is FIFO so
+                // submits run in order, and TDR fires per command buffer
+                // not per queue. The final submit + readback poll below
+                // covers synchronization. Inter-chunk poll(Wait) was
+                // observed to make populate_from_f32_cache_gpu WORSE
+                // (cache_load crashed sooner) so we use the same
+                // submit-only pattern here for consistency.
+                self.gpu.queue.submit(Some(encoder.finish()));
+                chunk_idx += 1;
+                encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some(&format!("forward_polar_traced.encoder.{chunk_idx}")),
+                });
+                layers_in_encoder = 0;
+            }
         }
         // Skip final_norm + output projection — retrieval doesn't need logits.
+        // Capture-to-staging copies go on the final encoder so they ride
+        // the last submit; staging readback below polls again before mapping.
         for (cap_buf, stg_buf) in capture_bufs.iter().zip(capture_stagings.iter()) {
             encoder.copy_buffer_to_buffer(cap_buf, 0, stg_buf, 0, scores_bytes);
         }
@@ -4388,6 +4432,23 @@ impl GpuEngine {
 
     pub fn n_layers(&self) -> usize {
         self.cpu.n_layers()
+    }
+
+    /// Block until all submitted GPU work has completed AND the deferred-
+    /// destroy queue for dropped buffers has been processed. wgpu uses a
+    /// lazy destruction model — wgpu::Buffer's Drop only queues the
+    /// underlying allocation for cleanup; the actual free happens at the
+    /// next poll/submit. Without an explicit poll, churn-heavy patterns
+    /// (e.g. cache_load creating + dropping a 300MB f32 cache per shard)
+    /// can grow the destroy queue until wgpu-29's stricter validation
+    /// rejects new allocations with a delayed "Buffer X is invalid"
+    /// error that surfaces at the next poll/get_mapped_range. Calling
+    /// this between cache loads lets the allocator drain.
+    pub fn poll_wait(&self) {
+        self.gpu.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        }).unwrap();
     }
 
     pub fn embedding_data(&self) -> &[f32] {

@@ -359,9 +359,36 @@ impl GpuPolarKvCache {
             return;
         }
 
+        // Split into smaller submits (no inter-chunk sync) so each
+        // individual command buffer fits inside Windows TDR's 2-second
+        // budget. The earlier all-36-layers-in-one-submit pattern at
+        // larger cache sizes returns DeviceError::Lost from Vulkan,
+        // marks the device permanently lost (verified via wgpu-patched
+        // diagnostic), then every subsequent submit/poll panics.
+        //
+        // Multiple submits without intervening poll(Wait): wgpu's queue
+        // is FIFO so they execute in order, but TDR fires per command
+        // buffer, not per queue — so chunking buys us TDR headroom
+        // without paying the per-chunk synchronization cost (an earlier
+        // attempt with poll(Wait) between chunks made cache_load WORSE,
+        // crashing earlier than the single-submit baseline). One
+        // poll(Wait) at the end so populate is still synchronous from
+        // the caller's POV.
+        //
+        // Tunable via CORTEX_POLAR_CHUNK_LAYERS; default 9 = 4 submits
+        // for Qwen 36. Set 0 or >= n_layers for the original single-
+        // submit behavior.
+        let chunk_layers: usize = std::env::var("CORTEX_POLAR_CHUNK_LAYERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(9);
+        let single_submit = chunk_layers == 0 || chunk_layers >= self.n_layers;
+
         let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("polar_kv.populate_from_f32_cache_gpu"),
+            label: Some("polar_kv.populate_from_f32_cache_gpu.0"),
         });
+        let mut layers_in_encoder = 0usize;
+        let mut chunk_idx = 0usize;
         for layer in 0..self.n_layers {
             crate::layers::gpu_polar::compress_layer_into_polar(
                 &self.gpu,
@@ -385,6 +412,18 @@ impl GpuPolarKvCache {
                 n_tokens,
                 /*start_pos*/ 0,
             );
+            layers_in_encoder += 1;
+            if !single_submit
+                && layers_in_encoder >= chunk_layers
+                && layer + 1 < self.n_layers
+            {
+                self.gpu.queue.submit(Some(encoder.finish()));
+                chunk_idx += 1;
+                encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some(&format!("polar_kv.populate_from_f32_cache_gpu.{chunk_idx}")),
+                });
+                layers_in_encoder = 0;
+            }
         }
         self.gpu.queue.submit(Some(encoder.finish()));
         self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
