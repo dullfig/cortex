@@ -9,6 +9,9 @@
 //! (decode) and batch (prefill) paths. Weights are stored as f16 pairs
 //! packed into u32.
 
+#[cfg(feature = "gpu")]
+use std::sync::Arc;
+
 // ---------------------------------------------------------------------------
 // Param structs — repr(C) uniforms passed to shaders
 // ---------------------------------------------------------------------------
@@ -406,14 +409,43 @@ impl ParamsBufferPool {
     }
 }
 
-/// Shared GPU context: device, queue, and compiled pipelines.
+/// Shared GPU context: device, queue, compiled pipelines, and the
+/// vram-heap arenas for per-call transient allocations.
 ///
 /// Created once at startup, shared across all layers via `Arc<GpuDevice>`.
+///
+/// # vram-heap usage
+///
+/// `transient_heap_a` and `transient_heap_b` are TWO device-local
+/// heaps that callers use as "input-lane" and "output-lane" for
+/// dispatches that need both R and RW bindings: wgpu/Vulkan rejects
+/// binding `STORAGE_READ_ONLY` and `STORAGE_READ_WRITE` to the same
+/// backing buffer within a single dispatch (even at disjoint
+/// sub-ranges). By allocating reads from one heap and writes from
+/// another, both bindings are sub-ranges of *different* backings, so
+/// the buffer-level tracker is happy.
+///
+/// Both heaps reset their transient regions at the end of each
+/// forward pass (see `forward_full_gpu_polar_traced` and siblings).
 pub struct GpuDevice {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub pipelines: Pipelines,
     pub params_pool: ParamsBufferPool,
+    /// Input-lane device-local heap. Use for buffers that may be bound
+    /// as `STORAGE_READ_ONLY` in a dispatch (rmsnorm inputs, matmul
+    /// LHS, etc.). Also fine for write-only allocations that won't
+    /// share a dispatch with the output lane.
+    pub transient_heap_a: Arc<::vram_heap::VramHeap>,
+    /// Output-lane device-local heap. Use for buffers that will be
+    /// bound as `STORAGE_READ_WRITE` (matmul outputs, residual-add
+    /// targets, etc.).
+    pub transient_heap_b: Arc<::vram_heap::VramHeap>,
+    /// Host-visible readback heap. Use for staging buffers that
+    /// receive `copy_buffer_to_buffer` destinations and then get
+    /// host-mapped for read. Capture-staging buffers in retrieval
+    /// trace forwards land here.
+    pub host_readback_heap: Arc<::vram_heap::VramHeap>,
 }
 
 impl GpuDevice {
@@ -504,7 +536,41 @@ impl GpuDevice {
             "params buffer pool allocated",
         );
 
-        Some(Self { device, queue, pipelines, params_pool })
+        // vram-heap arenas. Two device-local heaps so callers can
+        // place R inputs and RW outputs on different backings within
+        // one dispatch (wgpu/Vulkan rejects same-buffer R+RW even at
+        // disjoint sub-ranges). Sizes default to 128 MB each — enough
+        // for hidden_buf + rotated_buf + future per-forward transients
+        // on Qwen 3B at typical query sizes; tunable via env vars.
+        let heap_a_mb: u64 = std::env::var("CORTEX_VRAM_HEAP_A_MB")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(128);
+        let heap_b_mb: u64 = std::env::var("CORTEX_VRAM_HEAP_B_MB")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(128);
+        let heap_readback_mb: u64 = std::env::var("CORTEX_VRAM_HEAP_READBACK_MB")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(256);
+        let transient_heap_a = ::vram_heap::VramHeap::new(
+            &device,
+            ::vram_heap::MemoryTier::DeviceLocal,
+            heap_a_mb * 1024 * 1024,
+            "cortex.transient.a",
+        ).expect("vram-heap A construction failed");
+        let transient_heap_b = ::vram_heap::VramHeap::new(
+            &device,
+            ::vram_heap::MemoryTier::DeviceLocal,
+            heap_b_mb * 1024 * 1024,
+            "cortex.transient.b",
+        ).expect("vram-heap B construction failed");
+        let host_readback_heap = ::vram_heap::VramHeap::new(
+            &device,
+            ::vram_heap::MemoryTier::HostVisibleReadback,
+            heap_readback_mb * 1024 * 1024,
+            "cortex.host_readback",
+        ).expect("vram-heap readback construction failed");
+
+        Some(Self {
+            device, queue, pipelines, params_pool,
+            transient_heap_a, transient_heap_b, host_readback_heap,
+        })
     }
 
     /// Create a bind group from a pipeline and a list of buffers.

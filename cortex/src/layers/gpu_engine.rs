@@ -1899,8 +1899,20 @@ impl GpuEngine {
                 mapped_at_creation: false,
             })
         }).collect();
-        let capture_stagings: Vec<wgpu::Buffer> = (0..capture_layers.len())
-            .map(|_| self.gpu.create_staging_buffer(scores_bytes))
+        // vram-heap migration: capture stagings are sub-allocations of
+        // the host-visible readback heap rather than fresh wgpu
+        // staging buffers. Safe because stagings are never bound as
+        // compute resources — only copy_buffer_to_buffer destinations
+        // and host map targets, neither of which triggers wgpu's
+        // per-dispatch buffer-usage tracker. host_readback_heap is
+        // reset_transients()'d at function exit so the next forward
+        // call starts with a fresh transient arena.
+        let capture_stagings: Vec<::vram_heap::VramAllocation> = capture_layers.iter()
+            .map(|&l| self.gpu.host_readback_heap.alloc_transient(
+                scores_bytes,
+                ::vram_heap::COPY_BUFFER_ALIGNMENT,
+                &format!("forward_polar_traced.stg.layer{l}"),
+            ).expect("host_readback_heap capacity"))
             .collect();
         let capture_lookup: std::collections::HashMap<usize, &wgpu::Buffer> =
             capture_layers.iter().zip(capture_bufs.iter())
@@ -1988,34 +2000,66 @@ impl GpuEngine {
         // Skip final_norm + output projection — retrieval doesn't need logits.
         // Capture-to-staging copies go on the final encoder so they ride
         // the last submit; staging readback below polls again before mapping.
-        for (cap_buf, stg_buf) in capture_bufs.iter().zip(capture_stagings.iter()) {
-            encoder.copy_buffer_to_buffer(cap_buf, 0, stg_buf, 0, scores_bytes);
+        for (cap_buf, stg) in capture_bufs.iter().zip(capture_stagings.iter()) {
+            // vram-heap: stg is a sub-range of the host_readback_heap's
+            // backing buffer. Copy to the right offset.
+            encoder.copy_buffer_to_buffer(
+                cap_buf, 0,
+                stg.buffer(), stg.offset(),
+                scores_bytes,
+            );
         }
         self.gpu.queue.submit(Some(encoder.finish()));
 
-        // Batched readback (single poll for all stagings).
+        // vram-heap migration: all capture_stagings share the same
+        // backing wgpu::Buffer (the host_readback_heap), so we can't
+        // map each sub-range separately (wgpu enforces one map state
+        // per buffer). Instead, map ONE range covering all the
+        // capture_staging sub-ranges, then slice into the mapped
+        // bytes by offset. Allocations are bump-allocated contiguously
+        // so the range is exactly [first.offset .. last.end].
         use std::sync::mpsc;
-        let mut receivers: Vec<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>> = Vec::with_capacity(capture_stagings.len());
-        let capture_slices: Vec<wgpu::BufferSlice> = capture_stagings.iter().map(|stg| {
-            let slice = stg.slice(..);
+        let span_start = capture_stagings.first().map(|a| a.offset()).unwrap_or(0);
+        let span_end = capture_stagings.last()
+            .map(|a| a.offset() + a.size())
+            .unwrap_or(0);
+        let mapped_range = if span_end > span_start {
+            let slice = self.gpu.host_readback_heap.buffer().slice(span_start..span_end);
             let (tx, rx) = mpsc::channel();
             slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
-            receivers.push(rx);
-            slice
-        }).collect();
-        self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
-        for rx in &receivers {
+            self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
             rx.recv().expect("readback channel closed").expect("buffer map failed");
-        }
+            Some(slice)
+        } else {
+            self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+            None
+        };
 
-        let per_layer_scores: Vec<Vec<f32>> = capture_slices.iter().zip(capture_stagings.iter()).map(|(slice, stg)| {
+        let per_layer_scores: Vec<Vec<f32>> = if let Some(slice) = mapped_range.as_ref() {
             let data = slice.get_mapped_range();
-            let v: Vec<f32> = data[..scores_bytes as usize].chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let out = capture_stagings.iter().map(|stg| {
+                let local_off = (stg.offset() - span_start) as usize;
+                let bytes = &data[local_off..local_off + scores_bytes as usize];
+                bytes.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect()
+            }).collect();
             drop(data);
-            stg.unmap();
-            v
-        }).collect();
+            out
+        } else {
+            Vec::new()
+        };
+
+        // Unmap the heap backing (covers the mapped span). Drop the
+        // VramAllocations explicitly so live-count drops to 0 before
+        // reset_transients (which sets it to 0 anyway, but ordering
+        // is cleaner). Then reset the transient region so the next
+        // forward call reuses the staging bytes.
+        if mapped_range.is_some() {
+            self.gpu.host_readback_heap.buffer().unmap();
+        }
+        drop(capture_stagings);
+        self.gpu.host_readback_heap.reset_transients();
 
         per_layer_scores
     }

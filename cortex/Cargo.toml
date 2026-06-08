@@ -9,7 +9,7 @@ categories = ["science", "mathematics"]
 
 [features]
 default = ["gpu"]
-gpu = ["wgpu", "pollster", "bytemuck", "half"]
+gpu = ["wgpu", "pollster", "bytemuck", "half", "vram-heap"]
 # memory = ["engram"]  # disabled until engram lands on this machine
 
 [dependencies]
@@ -24,6 +24,12 @@ wgpu = { version = "29", default-features = false, features = ["vulkan", "wgsl"]
 pollster = { version = "0.4", optional = true }
 bytemuck = { version = "1", features = ["derive"], optional = true }
 half = { version = "2", optional = true }
+# Substrate-owned VRAM allocator. Bump-arena heaps over wgpu buffers
+# that cortex pre-allocates at startup and sub-allocates per call,
+# avoiding the per-dispatch device.create_buffer churn that hit
+# wgpu-29's allocator pressure ceiling. See C:\src\vram-heap\DESIGN.md
+# for the architectural commitment.
+vram-heap = { path = "../../vram-heap", optional = true }
 # engram lives on the old machine; temporarily disabled until it's copied over or absorbed into cortex per the roadmap.
 # engram = { path = "../../engram", default-features = false, optional = true }
 
