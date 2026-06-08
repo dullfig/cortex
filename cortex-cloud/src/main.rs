@@ -2840,6 +2840,15 @@ async fn cache_load(
     let cache_opt = if req.polar_only {
         debug_assert!(polar.is_some(), "polar_only validated to require polar_cache_enabled");
         drop(cache);
+        // Flush wgpu's deferred-destroy queue so the 300MB f32 cache we
+        // just dropped is actually freed before the next cache_load
+        // tries to allocate a fresh one. Without this, multiple back-
+        // to-back polar_only loads accumulate destroyed-but-not-yet-
+        // freed buffers in wgpu-29's allocator until allocation fails
+        // with a delayed validation error ("Buffer X is invalid")
+        // that surfaces at the NEXT poll/get_mapped_range — usually a
+        // subsequent retrieve, with a misleading buffer label.
+        tokio::task::block_in_place(|| state.engine.poll_wait());
         None
     } else {
         Some(cache)
