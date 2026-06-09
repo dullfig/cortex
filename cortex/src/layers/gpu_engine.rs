@@ -3525,7 +3525,7 @@ impl GpuEngine {
         start_pos: usize,
         scratch: &BlockScratch,
         pre_softmax_capture: Option<&wgpu::Buffer>,
-        kv_cache_target: Option<(&wgpu::Buffer, &wgpu::Buffer)>,
+        kv_cache_target: Option<(&::vram_heap::VramAllocation, &::vram_heap::VramAllocation)>,
         post_block_hidden_capture: Option<&wgpu::Buffer>,
         pre_block_hidden_inject: Option<&wgpu::Buffer>,
     ) {
@@ -3616,9 +3616,13 @@ impl GpuEngine {
             );
 
             // 5.5 (cached path) Write K/V into the layer's resident cache.
+            // Phase F: kv_cache_target carries &VramAllocation. Build a
+            // fresh binding per dispatch (BindingResource is move-only,
+            // so we re-emit .binding() at each consumption site).
             if let Some((k_cache, v_cache)) = kv_cache_target {
                 self.dispatch_kv_write_in_pass(
-                    &mut pass, &scratch.k, &scratch.v, k_cache, v_cache,
+                    &mut pass, &scratch.k, &scratch.v,
+                    k_cache.binding(), v_cache.binding(),
                     kv_dim, start_pos, n_tokens,
                 );
             }
@@ -3630,8 +3634,8 @@ impl GpuEngine {
         // scratch.scores with conflicting access — needs explicit pass
         // splits inside `dispatch_attention_inner`.
         let (k_for_attn, v_for_attn, attn_max_seq) = match kv_cache_target {
-            Some((kc, vc)) => (kc, vc, start_pos + n_tokens),
-            None => (&scratch.k, &scratch.v, n_tokens),
+            Some((kc, vc)) => (kc.binding(), vc.binding(), start_pos + n_tokens),
+            None => (scratch.k.as_entire_binding(), scratch.v.as_entire_binding(), n_tokens),
         };
         // Perf-bisect: see CORTEX_SKIP_SCORE / SOFTMAX / VALUE inside
         // `dispatch_attention_inner` — per-stage skip flags that bypass
@@ -4170,7 +4174,8 @@ impl GpuEngine {
         n_tokens: usize,
     ) {
         self.dispatch_attention_inner(
-            encoder, q_buf, k_buf, v_buf, scores_buf, out_buf,
+            encoder, q_buf, k_buf.as_entire_binding(), v_buf.as_entire_binding(),
+            scores_buf, out_buf,
             n_heads, n_kv_heads, head_dim, start_pos, max_seq, n_tokens,
             None,
         );
@@ -4182,12 +4187,17 @@ impl GpuEngine {
     /// Used by the retrieval / traced forward path to extract per-layer
     /// raw attention scores.
     #[allow(clippy::too_many_arguments)]
+    /// Phase F (vram-heap): `k_buf` and `v_buf` are `BindingResource` so
+    /// GpuKvCache sub-allocations (cached path) bind at sub-ranges; the
+    /// prefill path passes `scratch.k.as_entire_binding()` /
+    /// `scratch.v.as_entire_binding()`.
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_attention_inner(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         q_buf: &wgpu::Buffer,
-        k_buf: &wgpu::Buffer,
-        v_buf: &wgpu::Buffer,
+        k_buf: wgpu::BindingResource<'_>,
+        v_buf: wgpu::BindingResource<'_>,
         scores_buf: &wgpu::Buffer,
         out_buf: &wgpu::Buffer,
         n_heads: usize,
@@ -4237,9 +4247,15 @@ impl GpuEngine {
             };
             let params_buf = self.gpu.create_params_buffer(&params);
             let pipeline = &self.gpu.pipelines.attn_fused_batch;
-            let bind = self.gpu.make_bind_group(
+            let bind = self.gpu.make_bind_group_with(
                 pipeline,
-                &[q_buf, k_buf, v_buf, out_buf, &params_buf],
+                vec![
+                    q_buf.as_entire_binding(),
+                    k_buf,
+                    v_buf,
+                    out_buf.as_entire_binding(),
+                    params_buf.as_entire_binding(),
+                ],
             );
             let mut pass = self.begin_timed_pass(encoder, "attn_fused");
             pass.set_pipeline(pipeline);
@@ -4275,9 +4291,14 @@ impl GpuEngine {
         };
         let score_params_buf = self.gpu.create_params_buffer(&score_params);
         let score_pipeline = &self.gpu.pipelines.attn_score_batch;
-        let score_bind = self.gpu.make_bind_group(
+        let score_bind = self.gpu.make_bind_group_with(
             score_pipeline,
-            &[q_buf, k_buf, scores_buf, &score_params_buf],
+            vec![
+                q_buf.as_entire_binding(),
+                k_buf,
+                scores_buf.as_entire_binding(),
+                score_params_buf.as_entire_binding(),
+            ],
         );
         // 256-thread workgroups over (head*max_seq, tok); gid.x covers
         // (head, t), gid.y covers tok.
@@ -4332,9 +4353,14 @@ impl GpuEngine {
         };
         let value_params_buf = self.gpu.create_params_buffer(&value_params);
         let value_pipeline = &self.gpu.pipelines.attn_value_batch;
-        let value_bind = self.gpu.make_bind_group(
+        let value_bind = self.gpu.make_bind_group_with(
             value_pipeline,
-            &[scores_buf, v_buf, out_buf, &value_params_buf],
+            vec![
+                scores_buf.as_entire_binding(),
+                v_buf,
+                out_buf.as_entire_binding(),
+                value_params_buf.as_entire_binding(),
+            ],
         );
         // One thread per (tok, head, d); workgroup_size=256.
         let total_value_threads = (n_tokens * n_heads * head_dim) as u32;
@@ -4458,13 +4484,18 @@ impl GpuEngine {
     /// positions from per-block scratch buffers into the layer's resident
     /// cache buffers, starting at offset `start_pos` (in tokens). Used by
     /// the cached forward path.
+    /// Phase F (vram-heap): `k_cache` and `v_cache` are `BindingResource`
+    /// so GpuKvCache sub-allocations bind at sub-ranges. `k_src` and
+    /// `v_src` stay as `&wgpu::Buffer` because f32-path BlockScratch
+    /// is not migrated until Phase I.
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch_kv_write_into(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         k_src: &wgpu::Buffer,
         v_src: &wgpu::Buffer,
-        k_cache: &wgpu::Buffer,
-        v_cache: &wgpu::Buffer,
+        k_cache: wgpu::BindingResource<'_>,
+        v_cache: wgpu::BindingResource<'_>,
         kv_dim: usize,
         start_pos: usize,
         n_tokens: usize,
@@ -4483,8 +4514,8 @@ impl GpuEngine {
         pass: &mut wgpu::ComputePass<'_>,
         k_src: &wgpu::Buffer,
         v_src: &wgpu::Buffer,
-        k_cache: &wgpu::Buffer,
-        v_cache: &wgpu::Buffer,
+        k_cache: wgpu::BindingResource<'_>,
+        v_cache: wgpu::BindingResource<'_>,
         kv_dim: usize,
         start_pos: usize,
         n_tokens: usize,
@@ -4498,9 +4529,15 @@ impl GpuEngine {
         let params_buf = self.gpu.create_params_buffer(&params);
 
         let pipeline = &self.gpu.pipelines.kv_write_batch;
-        let bind = self.gpu.make_bind_group(
+        let bind = self.gpu.make_bind_group_with(
             pipeline,
-            &[k_src, v_src, k_cache, v_cache, &params_buf],
+            vec![
+                k_src.as_entire_binding(),
+                v_src.as_entire_binding(),
+                k_cache,
+                v_cache,
+                params_buf.as_entire_binding(),
+            ],
         );
 
         // Phase A: K/V cache is packed f16 (2 per u32). The shader writes

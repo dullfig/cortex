@@ -451,8 +451,8 @@ impl GpuPolarKvCache {
                 &mut encoder,
                 self,
                 layer,
-                f32_cache.k_layer(layer).as_entire_binding(),
-                f32_cache.v_layer(layer).as_entire_binding(),
+                f32_cache.k_layer(layer).binding(),
+                f32_cache.v_layer(layer).binding(),
                 n_tokens,
                 /*start_pos*/ 0,
             );
@@ -464,7 +464,7 @@ impl GpuPolarKvCache {
                 &mut encoder,
                 self,
                 layer,
-                f32_cache.k_layer(layer).as_entire_binding(),
+                f32_cache.k_layer(layer).binding(),
                 n_tokens,
                 /*start_pos*/ 0,
             );
@@ -886,12 +886,8 @@ mod tests {
         for (layer, (k_data, v_data, _)) in layer_data.iter().enumerate() {
             let k_packed = GpuDevice::pack_f16(k_data);
             let v_packed = GpuDevice::pack_f16(v_data);
-            gpu.queue.write_buffer(
-                f32_cache.k_layer(layer), 0, bytemuck::cast_slice(&k_packed),
-            );
-            gpu.queue.write_buffer(
-                f32_cache.v_layer(layer), 0, bytemuck::cast_slice(&v_packed),
-            );
+            f32_cache.k_layer(layer).write(&gpu.queue, bytemuck::cast_slice(&k_packed));
+            f32_cache.v_layer(layer).write(&gpu.queue, bytemuck::cast_slice(&v_packed));
         }
         f32_cache.advance(n_tokens);
 

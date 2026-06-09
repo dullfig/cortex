@@ -26,15 +26,23 @@ use crate::compute::wgpu_backend::GpuDevice;
 /// Resident KV cache on the GPU. One pair of (K, V) buffers per transformer
 /// layer, sized to `max_seq * n_kv_heads * head_dim` f16 elements each
 /// (Phase A: packed 2 f16 per u32; storage buffer holds u32s).
+///
+/// Phase F (vram-heap): the per-layer K/V buffers are sub-allocations of
+/// a single internal `VramHeap` owned by the cache. No same-dispatch R+RW
+/// conflict exists between K and V (kv_write writes both, attn_score reads
+/// only K, attn_value reads only V — never paired R+RW on the same
+/// backing), so a single heap is sufficient. Cache drop → heap drop →
+/// backing `wgpu::Buffer` released to wgpu.
 pub struct GpuKvCache {
     gpu: Arc<GpuDevice>,
+    kv_heap: Arc<::vram_heap::VramHeap>,
     /// Per-layer K storage. `k_buffers[i]` holds `[max_seq, kv_dim/2]` u32
     /// flat — each u32 packs 2 f16 K-values (Phase A). Shader unpacks via
     /// `unpack2x16float` on read; `kv_write_batch` packs via
     /// `pack2x16float` on write. kv_dim must be even (asserted on alloc).
-    k_buffers: Vec<wgpu::Buffer>,
+    k_buffers: Vec<::vram_heap::VramAllocation>,
     /// Per-layer V storage. Same shape + packing as `k_buffers`.
-    v_buffers: Vec<wgpu::Buffer>,
+    v_buffers: Vec<::vram_heap::VramAllocation>,
     n_layers: usize,
     n_kv_heads: usize,
     head_dim: usize,
@@ -60,29 +68,35 @@ impl GpuKvCache {
         assert!(kv_dim % 2 == 0, "kv_dim ({kv_dim}) must be even for f16 packing");
         let bytes_per_buffer = (max_seq_len * kv_dim * 2) as u64;
 
+        let align = ::vram_heap::STORAGE_BUFFER_OFFSET_ALIGNMENT_NVIDIA;
+        let round_up = |bytes: u64| ((bytes + align - 1) / align) * align;
+        // Heap capacity = 2 buffers per layer (K + V), each padded to alignment.
+        // Add per-allocation slack so free-list bookkeeping headroom is sane.
+        let pad_per_alloc = align;
+        let heap_size = round_up(bytes_per_buffer) * 2 * n_layers as u64
+            + pad_per_alloc * (n_layers as u64 * 2);
+
+        let kv_heap = ::vram_heap::VramHeap::new(
+            &gpu.device,
+            ::vram_heap::MemoryTier::DeviceLocal,
+            heap_size,
+            "gpu_kv.heap",
+        ).expect("gpu_kv_cache heap construction failed");
+
         let mut k_buffers = Vec::with_capacity(n_layers);
         let mut v_buffers = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
-            k_buffers.push(gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(&format!("gpu_kv_cache.k.layer{i}")),
-                size: bytes_per_buffer,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            }));
-            v_buffers.push(gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(&format!("gpu_kv_cache.v.layer{i}")),
-                size: bytes_per_buffer,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            }));
+            k_buffers.push(kv_heap.allocate(
+                bytes_per_buffer, align, &format!("gpu_kv_cache.k.layer{i}"),
+            ).expect("gpu_kv_cache heap capacity for K"));
+            v_buffers.push(kv_heap.allocate(
+                bytes_per_buffer, align, &format!("gpu_kv_cache.v.layer{i}"),
+            ).expect("gpu_kv_cache heap capacity for V"));
         }
 
         Self {
             gpu,
+            kv_heap,
             k_buffers,
             v_buffers,
             n_layers,
@@ -94,12 +108,12 @@ impl GpuKvCache {
     }
 
     /// Borrow the K buffer for a specific layer.
-    pub fn k_layer(&self, idx: usize) -> &wgpu::Buffer {
+    pub fn k_layer(&self, idx: usize) -> &::vram_heap::VramAllocation {
         &self.k_buffers[idx]
     }
 
     /// Borrow the V buffer for a specific layer.
-    pub fn v_layer(&self, idx: usize) -> &wgpu::Buffer {
+    pub fn v_layer(&self, idx: usize) -> &::vram_heap::VramAllocation {
         &self.v_buffers[idx]
     }
 
