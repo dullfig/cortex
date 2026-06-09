@@ -34,41 +34,70 @@ use crate::ops::polar;
 ///
 /// One pair of (K_angles, K_radius, V_angles, V_radius) buffers per
 /// transformer layer, sized at construction.
+///
+/// Phase E (vram-heap): the per-layer buffers are sub-allocations of
+/// three internal `VramHeap` instances owned by the cache. The 3-lane
+/// split satisfies wgpu-29's same-backing R+RW prohibition that fires
+/// inside `compress_layer_into_polar` (reads rotation+lut, writes
+/// angles/radius) and `qjl_encode_k_layer` (reads angles/radius/
+/// projection/lut, writes signs):
+///
+/// - **`const_heap`**: rotation, lut, k_qjl_projection — all written
+///   once at construction, R-only forever after.
+/// - **`data_heap`**: k_angles, k_radius, v_angles, v_radius — written
+///   by `compress_layer_into_polar`, R-only during attention.
+/// - **`signs_heap`** (only if QJL enabled): k_qjl_signs — written by
+///   `qjl_encode_k_layer`, R-only during the QJL attn-score path.
+///
+/// Each heap is sized exactly for what the cache needs at construction.
+/// Cache drop → heaps drop → backing `wgpu::Buffer`s released to wgpu.
 pub struct GpuPolarKvCache {
     gpu: Arc<GpuDevice>,
 
-    /// Per-layer packed K angles. Each buffer holds
+    /// Read-only constants lane: rotation_buffers, lut_buffer,
+    /// k_qjl_projection_buffers. See struct docs for rationale.
+    const_heap: Arc<::vram_heap::VramHeap>,
+    /// Compressed K/V data lane: angles + radius for K and V. Written
+    /// by `compress`, R during attention.
+    data_heap: Arc<::vram_heap::VramHeap>,
+    /// QJL signs lane (allocated only when n_qjl_proj > 0): written by
+    /// `qjl_encode_k_layer`, R during attn_score_polar_qjl_batch.
+    signs_heap: Option<Arc<::vram_heap::VramHeap>>,
+
+    /// Per-layer packed K angles. Each allocation holds
     /// `ceil(max_seq * n_kv_heads * n_pairs / 4)` u32 words.
-    k_angles_buffers: Vec<wgpu::Buffer>,
+    k_angles_buffers: Vec<::vram_heap::VramAllocation>,
     /// Per-layer K radius buffers. Each holds `max_seq * n_kv_heads` f32.
-    k_radius_buffers: Vec<wgpu::Buffer>,
-    v_angles_buffers: Vec<wgpu::Buffer>,
-    v_radius_buffers: Vec<wgpu::Buffer>,
+    k_radius_buffers: Vec<::vram_heap::VramAllocation>,
+    v_angles_buffers: Vec<::vram_heap::VramAllocation>,
+    v_radius_buffers: Vec<::vram_heap::VramAllocation>,
 
     /// Per-layer rotation matrices: one f32 storage buffer per layer of
     /// size `head_dim * head_dim * 4` bytes. Storing per-layer (vs one
     /// packed buffer) keeps the resident dispatchers from needing
     /// sub-region bindings and avoids `min_storage_buffer_offset_alignment`
     /// constraints when head_dim is small (test fixtures).
-    rotation_buffers: Vec<wgpu::Buffer>,
+    rotation_buffers: Vec<::vram_heap::VramAllocation>,
 
     /// Shared angle LUT uniform: vec4<f32>[8] (cos, sin, _, _) per bucket.
-    lut_buffer: wgpu::Buffer,
+    /// On the const_heap (DeviceLocal backing buffer includes UNIFORM
+    /// usage flag, so uniform bindings work).
+    lut_buffer: ::vram_heap::VramAllocation,
 
     /// Per-layer QJL sign-bit storage for K residuals. Empty when QJL
-    /// is disabled (`n_qjl_proj == 0`). Each buffer holds
+    /// is disabled (`n_qjl_proj == 0`). Each allocation holds
     /// `max_seq_len * n_kv_heads * sign_words_per_entry` u32 words.
     /// `sign_words_per_entry = ceil(n_qjl_proj / 32)`. For the default
     /// `n_qjl_proj = 32`, one u32 per (pos, head) entry — the j-th
     /// bit of the word is the sign for projection j (matches CPU
     /// `QjlProjection::encode_signs` bit layout).
-    k_qjl_signs_buffers: Vec<wgpu::Buffer>,
+    k_qjl_signs_buffers: Vec<::vram_heap::VramAllocation>,
 
     /// Per-layer QJL projection matrices (deterministic from
     /// `qjl_seed_base + layer_idx`). Empty when QJL is disabled. Each
-    /// buffer is `n_qjl_proj * head_dim * 4` bytes (row-major f32).
+    /// allocation is `n_qjl_proj * head_dim * 4` bytes (row-major f32).
     /// Uploaded once at construction, read-only thereafter.
-    k_qjl_projection_buffers: Vec<wgpu::Buffer>,
+    k_qjl_projection_buffers: Vec<::vram_heap::VramAllocation>,
 
     n_layers: usize,
     n_kv_heads: usize,
@@ -149,92 +178,120 @@ impl GpuPolarKvCache {
         let angles_bytes = (angles_words * std::mem::size_of::<u32>()) as u64;
         let radius_bytes = (max_seq_len * n_kv_heads * std::mem::size_of::<f32>()) as u64;
 
-        let mk_angles = |label: &str| {
-            gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size: angles_bytes,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            })
-        };
-        let mk_radius = |label: &str| {
-            gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size: radius_bytes,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            })
-        };
+        let lut = polar_lut_vec4();
+        let lut_bytes = std::mem::size_of_val(&lut) as u64;
+        let rotation_bytes = (head_dim * head_dim * std::mem::size_of::<f32>()) as u64;
+
+        let qjl_enabled = n_qjl_proj > 0;
+        let sign_words_per_entry = (n_qjl_proj + 31) / 32;
+        let signs_bytes = if qjl_enabled {
+            (max_seq_len * n_kv_heads * sign_words_per_entry
+                * std::mem::size_of::<u32>()) as u64
+        } else { 0 };
+        let projection_bytes = if qjl_enabled {
+            (n_qjl_proj * head_dim * std::mem::size_of::<f32>()) as u64
+        } else { 0 };
+
+        // Heap capacity = sum of per-allocation bytes + alignment slack.
+        // STORAGE_BUFFER_OFFSET_ALIGNMENT_NVIDIA = 256; allocations are
+        // many KB to many MB, so padding overhead is negligible.
+        let align = ::vram_heap::STORAGE_BUFFER_OFFSET_ALIGNMENT_NVIDIA;
+        let pad_per_alloc = align;
+        let round_up = |bytes: u64| ((bytes + align - 1) / align) * align;
+
+        let const_size = round_up(rotation_bytes) * n_layers as u64
+            + round_up(lut_bytes)
+            + if qjl_enabled { round_up(projection_bytes) * n_layers as u64 } else { 0 }
+            + pad_per_alloc * (n_layers as u64 * 2 + 1); // slack
+        let data_size = (round_up(angles_bytes) + round_up(radius_bytes)) * 2 * n_layers as u64
+            + pad_per_alloc * (n_layers as u64 * 4);
+        let signs_size = if qjl_enabled {
+            round_up(signs_bytes) * n_layers as u64 + pad_per_alloc * n_layers as u64
+        } else { 0 };
+
+        let const_heap = ::vram_heap::VramHeap::new(
+            &gpu.device,
+            ::vram_heap::MemoryTier::DeviceLocal,
+            const_size,
+            "polar_kv.const",
+        ).expect("polar_kv const_heap construction failed");
+        let data_heap = ::vram_heap::VramHeap::new(
+            &gpu.device,
+            ::vram_heap::MemoryTier::DeviceLocal,
+            data_size,
+            "polar_kv.data",
+        ).expect("polar_kv data_heap construction failed");
+        let signs_heap = if qjl_enabled {
+            Some(::vram_heap::VramHeap::new(
+                &gpu.device,
+                ::vram_heap::MemoryTier::DeviceLocal,
+                signs_size,
+                "polar_kv.signs",
+            ).expect("polar_kv signs_heap construction failed"))
+        } else { None };
 
         let mut k_angles_buffers = Vec::with_capacity(n_layers);
         let mut k_radius_buffers = Vec::with_capacity(n_layers);
         let mut v_angles_buffers = Vec::with_capacity(n_layers);
         let mut v_radius_buffers = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
-            k_angles_buffers.push(mk_angles(&format!("polar_kv.k_angles.layer{i}")));
-            k_radius_buffers.push(mk_radius(&format!("polar_kv.k_radius.layer{i}")));
-            v_angles_buffers.push(mk_angles(&format!("polar_kv.v_angles.layer{i}")));
-            v_radius_buffers.push(mk_radius(&format!("polar_kv.v_radius.layer{i}")));
+            k_angles_buffers.push(data_heap.allocate(
+                angles_bytes, align, &format!("polar_kv.k_angles.layer{i}"),
+            ).expect("polar_kv data_heap capacity for k_angles"));
+            k_radius_buffers.push(data_heap.allocate(
+                radius_bytes, align, &format!("polar_kv.k_radius.layer{i}"),
+            ).expect("polar_kv data_heap capacity for k_radius"));
+            v_angles_buffers.push(data_heap.allocate(
+                angles_bytes, align, &format!("polar_kv.v_angles.layer{i}"),
+            ).expect("polar_kv data_heap capacity for v_angles"));
+            v_radius_buffers.push(data_heap.allocate(
+                radius_bytes, align, &format!("polar_kv.v_radius.layer{i}"),
+            ).expect("polar_kv data_heap capacity for v_radius"));
         }
 
-        // Per-layer rotation matrices: one buffer each, deterministic from
-        // (rotation_seed_base + layer_idx) — matches engram's per-layer
-        // R seeding convention.
+        // Per-layer rotation matrices: one allocation each on const_heap,
+        // populated from a deterministic seed (rotation_seed_base + layer_idx).
         let mut rotation_buffers = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
             let r = polar::generate_rotation_matrix(head_dim, rotation_seed_base + i as u64);
-            rotation_buffers.push(gpu.create_storage_buffer(
-                bytemuck::cast_slice(&r),
-                &format!("polar_kv.rotation.layer{i}"),
-            ));
+            let alloc = const_heap.allocate(
+                rotation_bytes, align, &format!("polar_kv.rotation.layer{i}"),
+            ).expect("polar_kv const_heap capacity for rotation");
+            alloc.write(&gpu.queue, bytemuck::cast_slice(&r));
+            rotation_buffers.push(alloc);
         }
 
-        // Shared angle LUT uniform.
-        let lut = polar_lut_vec4();
-        let lut_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("polar_kv.angle_lut"),
-            size: std::mem::size_of_val(&lut) as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        gpu.queue.write_buffer(&lut_buffer, 0, bytemuck::cast_slice(&lut));
+        // Shared angle LUT uniform (on const_heap; DeviceLocal backing
+        // buffer includes UNIFORM usage flag).
+        let lut_buffer = const_heap.allocate(
+            lut_bytes, align, "polar_kv.angle_lut",
+        ).expect("polar_kv const_heap capacity for lut");
+        lut_buffer.write(&gpu.queue, bytemuck::cast_slice(&lut));
 
         // QJL buffers — only allocated when QJL is enabled.
-        let (k_qjl_signs_buffers, k_qjl_projection_buffers) = if n_qjl_proj > 0 {
-            let sign_words_per_entry = (n_qjl_proj + 31) / 32; // = 1 for n_qjl_proj <= 32
-            let signs_bytes = (max_seq_len * n_kv_heads * sign_words_per_entry
-                * std::mem::size_of::<u32>()) as u64;
-
+        let (k_qjl_signs_buffers, k_qjl_projection_buffers) = if qjl_enabled {
             let mut signs = Vec::with_capacity(n_layers);
             let mut projs = Vec::with_capacity(n_layers);
+            let signs_heap_ref = signs_heap.as_ref()
+                .expect("signs_heap must exist when n_qjl_proj > 0");
             for layer in 0..n_layers {
-                // Signs: zero-initialized storage, written by the QJL
-                // encode shader. COPY_DST so we can clear via host
-                // writes if needed; COPY_SRC for test readback.
-                signs.push(gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(&format!("polar_kv.k_qjl_signs.layer{layer}")),
-                    size: signs_bytes,
-                    usage: wgpu::BufferUsages::STORAGE
-                        | wgpu::BufferUsages::COPY_DST
-                        | wgpu::BufferUsages::COPY_SRC,
-                    mapped_at_creation: false,
-                }));
+                // Signs: zero-init storage, written by the QJL encode shader.
+                signs.push(signs_heap_ref.allocate(
+                    signs_bytes, align,
+                    &format!("polar_kv.k_qjl_signs.layer{layer}"),
+                ).expect("polar_kv signs_heap capacity"));
 
-                // Projection matrix: deterministic from (qjl_seed_base + layer).
-                // Same RNG seed scheme as rotation matrices, but a separate
-                // seed base — QJL projections are rectangular Gaussian, not
-                // square orthonormal.
+                // Projection matrix: deterministic from (qjl_seed_base + layer),
+                // uploaded to const_heap (R-only, never rewritten).
                 let qjl = crate::ops::qjl::QjlProjection::with_n_projections(
                     head_dim, n_qjl_proj, qjl_seed_base + layer as u64,
                 );
-                projs.push(gpu.create_storage_buffer(
-                    bytemuck::cast_slice(qjl.projections()),
+                let proj_alloc = const_heap.allocate(
+                    projection_bytes, align,
                     &format!("polar_kv.k_qjl_projection.layer{layer}"),
-                ));
+                ).expect("polar_kv const_heap capacity for projection");
+                proj_alloc.write(&gpu.queue, bytemuck::cast_slice(qjl.projections()));
+                projs.push(proj_alloc);
             }
             (signs, projs)
         } else {
@@ -243,6 +300,9 @@ impl GpuPolarKvCache {
 
         Self {
             gpu,
+            const_heap,
+            data_heap,
+            signs_heap,
             k_angles_buffers,
             k_radius_buffers,
             v_angles_buffers,
@@ -283,16 +343,14 @@ impl GpuPolarKvCache {
             .map(|i| cpu.k_angles_slice()[i])
             .collect();
         let k_packed = pack_angles_to_u32(&k_angles_full);
-        self.gpu.queue.write_buffer(
-            &self.k_angles_buffers[layer],
-            0,
+        self.k_angles_buffers[layer].write(
+            &self.gpu.queue,
             bytemuck::cast_slice(&k_packed),
         );
 
         // K radius.
-        self.gpu.queue.write_buffer(
-            &self.k_radius_buffers[layer],
-            0,
+        self.k_radius_buffers[layer].write(
+            &self.gpu.queue,
             bytemuck::cast_slice(&cpu.k_radius_slice()[..radius_used]),
         );
 
@@ -311,14 +369,12 @@ impl GpuPolarKvCache {
             }
         }
         let v_packed = pack_angles_to_u32(&v_angles_full);
-        self.gpu.queue.write_buffer(
-            &self.v_angles_buffers[layer],
-            0,
+        self.v_angles_buffers[layer].write(
+            &self.gpu.queue,
             bytemuck::cast_slice(&v_packed),
         );
-        self.gpu.queue.write_buffer(
-            &self.v_radius_buffers[layer],
-            0,
+        self.v_radius_buffers[layer].write(
+            &self.gpu.queue,
             bytemuck::cast_slice(&v_radius_full),
         );
     }
@@ -451,12 +507,12 @@ impl GpuPolarKvCache {
     pub fn head_dim(&self) -> usize { self.head_dim }
     pub fn n_pairs(&self) -> usize { self.head_dim / 2 }
 
-    pub fn k_angles_layer(&self, idx: usize) -> &wgpu::Buffer { &self.k_angles_buffers[idx] }
-    pub fn k_radius_layer(&self, idx: usize) -> &wgpu::Buffer { &self.k_radius_buffers[idx] }
-    pub fn v_angles_layer(&self, idx: usize) -> &wgpu::Buffer { &self.v_angles_buffers[idx] }
-    pub fn v_radius_layer(&self, idx: usize) -> &wgpu::Buffer { &self.v_radius_buffers[idx] }
-    pub fn rotation_layer(&self, idx: usize) -> &wgpu::Buffer { &self.rotation_buffers[idx] }
-    pub fn lut_buffer(&self) -> &wgpu::Buffer { &self.lut_buffer }
+    pub fn k_angles_layer(&self, idx: usize) -> &::vram_heap::VramAllocation { &self.k_angles_buffers[idx] }
+    pub fn k_radius_layer(&self, idx: usize) -> &::vram_heap::VramAllocation { &self.k_radius_buffers[idx] }
+    pub fn v_angles_layer(&self, idx: usize) -> &::vram_heap::VramAllocation { &self.v_angles_buffers[idx] }
+    pub fn v_radius_layer(&self, idx: usize) -> &::vram_heap::VramAllocation { &self.v_radius_buffers[idx] }
+    pub fn rotation_layer(&self, idx: usize) -> &::vram_heap::VramAllocation { &self.rotation_buffers[idx] }
+    pub fn lut_buffer(&self) -> &::vram_heap::VramAllocation { &self.lut_buffer }
 
     /// Number of QJL projections. 0 means QJL is disabled.
     pub fn n_qjl_proj(&self) -> usize { self.n_qjl_proj }
@@ -472,13 +528,13 @@ impl GpuPolarKvCache {
     }
 
     /// K QJL signs buffer for layer `idx`. `None` when QJL disabled.
-    pub fn k_qjl_signs_layer(&self, idx: usize) -> Option<&wgpu::Buffer> {
+    pub fn k_qjl_signs_layer(&self, idx: usize) -> Option<&::vram_heap::VramAllocation> {
         self.k_qjl_signs_buffers.get(idx)
     }
 
     /// K QJL projection matrix buffer for layer `idx`. `None` when
     /// QJL disabled.
-    pub fn k_qjl_projection_layer(&self, idx: usize) -> Option<&wgpu::Buffer> {
+    pub fn k_qjl_projection_layer(&self, idx: usize) -> Option<&::vram_heap::VramAllocation> {
         self.k_qjl_projection_buffers.get(idx)
     }
 
@@ -543,12 +599,12 @@ mod tests {
 
     /// Read back a wgpu storage buffer's contents to a CPU `Vec<u8>`.
     /// Test-only — uses a staging buffer + map_async + device.poll(Wait).
-    fn readback_buffer(gpu: &GpuDevice, src: &wgpu::Buffer, bytes: u64) -> Vec<u8> {
+    fn readback_buffer(gpu: &GpuDevice, src: &::vram_heap::VramAllocation, bytes: u64) -> Vec<u8> {
         let staging = gpu.create_staging_buffer(bytes);
         let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("polar_kv.test.readback"),
         });
-        encoder.copy_buffer_to_buffer(src, 0, &staging, 0, bytes);
+        encoder.copy_buffer_to_buffer(src.buffer(), src.offset(), &staging, 0, bytes);
         gpu.queue.submit(Some(encoder.finish()));
         let slice = staging.slice(..);
         let (s, r) = std::sync::mpsc::channel();

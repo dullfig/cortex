@@ -3825,7 +3825,9 @@ impl GpuEngine {
 
         // 6a. rotate_q: packed scratch.q → f32 rotated_buf.
         crate::layers::gpu_polar::dispatch_rotate_q_packed(
-            &self.gpu, encoder, scratch.q.binding(), polar_cache.rotation_layer(block_idx), rotated_buf.binding(),
+            &self.gpu, encoder, scratch.q.binding(),
+            polar_cache.rotation_layer(block_idx).binding(),
+            rotated_buf.binding(),
             n_tokens, n_heads, head_dim,
         );
 
@@ -3836,23 +3838,25 @@ impl GpuEngine {
         if polar_cache.n_qjl_proj() > 0 {
             crate::layers::gpu_polar::dispatch_attn_score_polar_qjl_batch(
                 &self.gpu, encoder, rotated_buf.binding(),
-                polar_cache.k_angles_layer(block_idx),
-                polar_cache.k_radius_layer(block_idx),
+                polar_cache.k_angles_layer(block_idx).binding(),
+                polar_cache.k_radius_layer(block_idx).binding(),
                 scratch.scores.binding(),
                 polar_cache.k_qjl_signs_layer(block_idx)
-                    .expect("k_qjl_signs_layer must exist when n_qjl_proj > 0"),
+                    .expect("k_qjl_signs_layer must exist when n_qjl_proj > 0")
+                    .binding(),
                 polar_cache.k_qjl_projection_layer(block_idx)
-                    .expect("k_qjl_projection_layer must exist when n_qjl_proj > 0"),
-                polar_cache.lut_buffer(),
+                    .expect("k_qjl_projection_layer must exist when n_qjl_proj > 0")
+                    .binding(),
+                polar_cache.lut_buffer().binding(),
                 n_heads, n_kv_heads, head_dim, start_pos, n_tokens, attn_max_seq,
                 polar_cache.n_qjl_proj(),
             );
         } else {
             crate::layers::gpu_polar::dispatch_attn_score_polar_batch(
                 &self.gpu, encoder, rotated_buf.binding(),
-                polar_cache.k_angles_layer(block_idx),
-                polar_cache.k_radius_layer(block_idx),
-                scratch.scores.binding(), polar_cache.lut_buffer(),
+                polar_cache.k_angles_layer(block_idx).binding(),
+                polar_cache.k_radius_layer(block_idx).binding(),
+                scratch.scores.binding(), polar_cache.lut_buffer().binding(),
                 n_heads, n_kv_heads, head_dim, start_pos, n_tokens, attn_max_seq,
             );
         }
@@ -3894,9 +3898,9 @@ impl GpuEngine {
         //     (overwriting rq, no longer needed)
         crate::layers::gpu_polar::dispatch_attn_value_polar_batch(
             &self.gpu, encoder, scratch.scores.binding(),
-            polar_cache.v_angles_layer(block_idx),
-            polar_cache.v_radius_layer(block_idx),
-            rotated_buf.binding(), polar_cache.lut_buffer(),
+            polar_cache.v_angles_layer(block_idx).binding(),
+            polar_cache.v_radius_layer(block_idx).binding(),
+            rotated_buf.binding(), polar_cache.lut_buffer().binding(),
             n_heads, n_kv_heads, head_dim, start_pos, n_tokens, attn_max_seq,
         );
 
@@ -3904,7 +3908,7 @@ impl GpuEngine {
         //     Treat (n_tokens * n_heads) as effective head count — R is per-layer.
         crate::layers::gpu_polar::dispatch_derotate_packed(
             &self.gpu, encoder, rotated_buf.binding(),
-            polar_cache.rotation_layer(block_idx), scratch.attn_out.binding(),
+            polar_cache.rotation_layer(block_idx).binding(), scratch.attn_out.binding(),
             n_tokens * n_heads, head_dim,
         );
 

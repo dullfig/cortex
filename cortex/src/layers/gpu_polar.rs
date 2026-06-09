@@ -75,10 +75,10 @@ pub fn dispatch_attn_score_polar(
     gpu: &Arc<GpuDevice>,
     encoder: &mut wgpu::CommandEncoder,
     rq_buf: &wgpu::Buffer,
-    k_angles_buf: &wgpu::Buffer,
-    k_radius_buf: &wgpu::Buffer,
+    k_angles_buf: wgpu::BindingResource<'_>,
+    k_radius_buf: wgpu::BindingResource<'_>,
     scores_buf: &wgpu::Buffer,
-    lut_buf: &wgpu::Buffer,
+    lut_buf: wgpu::BindingResource<'_>,
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
@@ -106,9 +106,16 @@ pub fn dispatch_attn_score_polar(
     let params_buf = gpu.create_params_buffer(&params);
 
     let pipeline = &gpu.pipelines.attn_score_polar;
-    let bind = gpu.make_bind_group(
+    let bind = gpu.make_bind_group_with(
         pipeline,
-        &[rq_buf, k_angles_buf, k_radius_buf, scores_buf, &params_buf, lut_buf],
+        vec![
+            rq_buf.as_entire_binding(),
+            k_angles_buf,
+            k_radius_buf,
+            scores_buf.as_entire_binding(),
+            params_buf.as_entire_binding(),
+            lut_buf,
+        ],
     );
 
     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -172,7 +179,8 @@ pub fn attn_score_polar_oneshot(
     });
     dispatch_attn_score_polar(
         gpu, &mut encoder,
-        &rq_buf, &angles_buf, &radius_buf, &scores_buf, &lut_buf,
+        &rq_buf, angles_buf.as_entire_binding(), radius_buf.as_entire_binding(),
+        &scores_buf, lut_buf.as_entire_binding(),
         n_heads, n_kv_heads, head_dim, seq_len, /*max_seq*/ seq_len,
     );
 
@@ -228,10 +236,10 @@ pub fn dispatch_attn_value_polar(
     gpu: &Arc<GpuDevice>,
     encoder: &mut wgpu::CommandEncoder,
     softmax_buf: &wgpu::Buffer,
-    v_angles_buf: &wgpu::Buffer,
-    v_radius_buf: &wgpu::Buffer,
+    v_angles_buf: wgpu::BindingResource<'_>,
+    v_radius_buf: wgpu::BindingResource<'_>,
     weighted_rot_buf: &wgpu::Buffer,
-    lut_buf: &wgpu::Buffer,
+    lut_buf: wgpu::BindingResource<'_>,
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
@@ -258,9 +266,16 @@ pub fn dispatch_attn_value_polar(
     let params_buf = gpu.create_params_buffer(&params);
 
     let pipeline = &gpu.pipelines.attn_value_polar;
-    let bind = gpu.make_bind_group(
+    let bind = gpu.make_bind_group_with(
         pipeline,
-        &[softmax_buf, v_angles_buf, v_radius_buf, weighted_rot_buf, &params_buf, lut_buf],
+        vec![
+            softmax_buf.as_entire_binding(),
+            v_angles_buf,
+            v_radius_buf,
+            weighted_rot_buf.as_entire_binding(),
+            params_buf.as_entire_binding(),
+            lut_buf,
+        ],
     );
 
     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -280,7 +295,7 @@ pub fn dispatch_derotate(
     gpu: &Arc<GpuDevice>,
     encoder: &mut wgpu::CommandEncoder,
     weighted_rot_buf: &wgpu::Buffer,
-    rotation_buf: &wgpu::Buffer,
+    rotation_buf: wgpu::BindingResource<'_>,
     out_buf: &wgpu::Buffer,
     n_heads: usize,
     head_dim: usize,
@@ -294,9 +309,14 @@ pub fn dispatch_derotate(
     let params_buf = gpu.create_params_buffer(&params);
 
     let pipeline = &gpu.pipelines.derotate;
-    let bind = gpu.make_bind_group(
+    let bind = gpu.make_bind_group_with(
         pipeline,
-        &[weighted_rot_buf, rotation_buf, out_buf, &params_buf],
+        vec![
+            weighted_rot_buf.as_entire_binding(),
+            rotation_buf,
+            out_buf.as_entire_binding(),
+            params_buf.as_entire_binding(),
+        ],
     );
 
     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -321,7 +341,7 @@ pub fn dispatch_derotate_packed(
     gpu: &Arc<GpuDevice>,
     encoder: &mut wgpu::CommandEncoder,
     weighted_rot_buf: wgpu::BindingResource<'_>,
-    rotation_buf: &wgpu::Buffer,
+    rotation_buf: wgpu::BindingResource<'_>,
     out_buf: wgpu::BindingResource<'_>,
     n_heads: usize,
     head_dim: usize,
@@ -339,7 +359,7 @@ pub fn dispatch_derotate_packed(
         pipeline,
         vec![
             weighted_rot_buf,
-            rotation_buf.as_entire_binding(),
+            rotation_buf,
             out_buf,
             params_buf.as_entire_binding(),
         ],
@@ -407,12 +427,13 @@ pub fn attn_value_polar_oneshot(
     });
     dispatch_attn_value_polar(
         gpu, &mut encoder,
-        &softmax_buf, &v_angles_buf, &v_radius_buf, &weighted_rot_buf, &lut_buf,
+        &softmax_buf, v_angles_buf.as_entire_binding(), v_radius_buf.as_entire_binding(),
+        &weighted_rot_buf, lut_buf.as_entire_binding(),
         n_heads, n_kv_heads, head_dim, seq_len, /*max_seq*/ seq_len,
     );
     dispatch_derotate(
         gpu, &mut encoder,
-        &weighted_rot_buf, &rotation_buf, &final_buf,
+        &weighted_rot_buf, rotation_buf.as_entire_binding(), &final_buf,
         n_heads, head_dim,
     );
 
@@ -455,7 +476,7 @@ pub fn dispatch_rotate_q(
     gpu: &Arc<GpuDevice>,
     encoder: &mut wgpu::CommandEncoder,
     q_buf: &wgpu::Buffer,
-    rotation_buf: &wgpu::Buffer,
+    rotation_buf: wgpu::BindingResource<'_>,
     rq_buf: &wgpu::Buffer,
     n_tokens: usize,
     n_heads: usize,
@@ -470,9 +491,14 @@ pub fn dispatch_rotate_q(
     let params_buf = gpu.create_params_buffer(&params);
 
     let pipeline = &gpu.pipelines.rotate_q;
-    let bind = gpu.make_bind_group(
+    let bind = gpu.make_bind_group_with(
         pipeline,
-        &[q_buf, rotation_buf, rq_buf, &params_buf],
+        vec![
+            q_buf.as_entire_binding(),
+            rotation_buf,
+            rq_buf.as_entire_binding(),
+            params_buf.as_entire_binding(),
+        ],
     );
 
     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -497,7 +523,7 @@ pub fn dispatch_rotate_q_packed(
     gpu: &Arc<GpuDevice>,
     encoder: &mut wgpu::CommandEncoder,
     q_buf: wgpu::BindingResource<'_>,
-    rotation_buf: &wgpu::Buffer,
+    rotation_buf: wgpu::BindingResource<'_>,
     rq_buf: wgpu::BindingResource<'_>,
     n_tokens: usize,
     n_heads: usize,
@@ -516,7 +542,7 @@ pub fn dispatch_rotate_q_packed(
         pipeline,
         vec![
             q_buf,
-            rotation_buf.as_entire_binding(),
+            rotation_buf,
             rq_buf,
             params_buf.as_entire_binding(),
         ],
@@ -566,10 +592,10 @@ pub fn dispatch_attn_score_polar_batch(
     gpu: &Arc<GpuDevice>,
     encoder: &mut wgpu::CommandEncoder,
     rq_buf: wgpu::BindingResource<'_>,
-    k_angles_buf: &wgpu::Buffer,
-    k_radius_buf: &wgpu::Buffer,
+    k_angles_buf: wgpu::BindingResource<'_>,
+    k_radius_buf: wgpu::BindingResource<'_>,
     scores_buf: wgpu::BindingResource<'_>,
-    lut_buf: &wgpu::Buffer,
+    lut_buf: wgpu::BindingResource<'_>,
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
@@ -604,11 +630,11 @@ pub fn dispatch_attn_score_polar_batch(
         pipeline,
         vec![
             rq_buf,
-            k_angles_buf.as_entire_binding(),
-            k_radius_buf.as_entire_binding(),
+            k_angles_buf,
+            k_radius_buf,
             scores_buf,
             params_buf.as_entire_binding(),
-            lut_buf.as_entire_binding(),
+            lut_buf,
         ],
     );
 
@@ -658,12 +684,12 @@ pub fn dispatch_attn_score_polar_qjl_batch(
     gpu: &Arc<GpuDevice>,
     encoder: &mut wgpu::CommandEncoder,
     rq_buf: wgpu::BindingResource<'_>,
-    k_angles_buf: &wgpu::Buffer,
-    k_radius_buf: &wgpu::Buffer,
+    k_angles_buf: wgpu::BindingResource<'_>,
+    k_radius_buf: wgpu::BindingResource<'_>,
     scores_buf: wgpu::BindingResource<'_>,
-    k_qjl_signs_buf: &wgpu::Buffer,
-    projections_buf: &wgpu::Buffer,
-    lut_buf: &wgpu::Buffer,
+    k_qjl_signs_buf: wgpu::BindingResource<'_>,
+    projections_buf: wgpu::BindingResource<'_>,
+    lut_buf: wgpu::BindingResource<'_>,
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
@@ -701,13 +727,13 @@ pub fn dispatch_attn_score_polar_qjl_batch(
         pipeline,
         vec![
             rq_buf,
-            k_angles_buf.as_entire_binding(),
-            k_radius_buf.as_entire_binding(),
+            k_angles_buf,
+            k_radius_buf,
             scores_buf,
-            k_qjl_signs_buf.as_entire_binding(),
-            projections_buf.as_entire_binding(),
+            k_qjl_signs_buf,
+            projections_buf,
             params_buf.as_entire_binding(),
-            lut_buf.as_entire_binding(),
+            lut_buf,
         ],
     );
 
@@ -752,10 +778,10 @@ pub fn dispatch_attn_value_polar_batch(
     gpu: &Arc<GpuDevice>,
     encoder: &mut wgpu::CommandEncoder,
     softmax_buf: wgpu::BindingResource<'_>,
-    v_angles_buf: &wgpu::Buffer,
-    v_radius_buf: &wgpu::Buffer,
+    v_angles_buf: wgpu::BindingResource<'_>,
+    v_radius_buf: wgpu::BindingResource<'_>,
     output_buf: wgpu::BindingResource<'_>,
-    lut_buf: &wgpu::Buffer,
+    lut_buf: wgpu::BindingResource<'_>,
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
@@ -787,11 +813,11 @@ pub fn dispatch_attn_value_polar_batch(
         pipeline,
         vec![
             softmax_buf,
-            v_angles_buf.as_entire_binding(),
-            v_radius_buf.as_entire_binding(),
+            v_angles_buf,
+            v_radius_buf,
             output_buf,
             params_buf.as_entire_binding(),
-            lut_buf.as_entire_binding(),
+            lut_buf,
         ],
     );
 
@@ -841,9 +867,9 @@ pub fn dispatch_kv_compress_polar(
     gpu: &Arc<GpuDevice>,
     encoder: &mut wgpu::CommandEncoder,
     k_in_buf: wgpu::BindingResource<'_>,
-    rotation_buf: &wgpu::Buffer,
-    angles_buf: &wgpu::Buffer,
-    radius_buf: &wgpu::Buffer,
+    rotation_buf: wgpu::BindingResource<'_>,
+    angles_buf: wgpu::BindingResource<'_>,
+    radius_buf: wgpu::BindingResource<'_>,
     n_tokens: usize,
     start_pos: usize,
     n_kv_heads: usize,
@@ -874,9 +900,9 @@ pub fn dispatch_kv_compress_polar(
         pipeline,
         vec![
             k_in_buf,
-            rotation_buf.as_entire_binding(),
-            angles_buf.as_entire_binding(),
-            radius_buf.as_entire_binding(),
+            rotation_buf,
+            angles_buf,
+            radius_buf,
             params_buf.as_entire_binding(),
         ],
     );
@@ -914,15 +940,19 @@ pub fn compress_layer_into_polar(
 ) {
     dispatch_kv_compress_polar(
         gpu, encoder,
-        k_in_buf, cache.rotation_layer(layer),
-        cache.k_angles_layer(layer), cache.k_radius_layer(layer),
+        k_in_buf,
+        cache.rotation_layer(layer).binding(),
+        cache.k_angles_layer(layer).binding(),
+        cache.k_radius_layer(layer).binding(),
         n_tokens, start_pos,
         cache.n_kv_heads(), cache.head_dim(), cache.max_seq_len(),
     );
     dispatch_kv_compress_polar(
         gpu, encoder,
-        v_in_buf, cache.rotation_layer(layer),
-        cache.v_angles_layer(layer), cache.v_radius_layer(layer),
+        v_in_buf,
+        cache.rotation_layer(layer).binding(),
+        cache.v_angles_layer(layer).binding(),
+        cache.v_radius_layer(layer).binding(),
         n_tokens, start_pos,
         cache.n_kv_heads(), cache.head_dim(), cache.max_seq_len(),
     );
@@ -959,12 +989,12 @@ pub fn dispatch_kv_qjl_encode(
     gpu: &Arc<GpuDevice>,
     encoder: &mut wgpu::CommandEncoder,
     k_in_buf: wgpu::BindingResource<'_>,
-    rotation_buf: &wgpu::Buffer,
-    k_angles_buf: &wgpu::Buffer,
-    k_radius_buf: &wgpu::Buffer,
-    projection_buf: &wgpu::Buffer,
-    signs_buf: &wgpu::Buffer,
-    lut_buf: &wgpu::Buffer,
+    rotation_buf: wgpu::BindingResource<'_>,
+    k_angles_buf: wgpu::BindingResource<'_>,
+    k_radius_buf: wgpu::BindingResource<'_>,
+    projection_buf: wgpu::BindingResource<'_>,
+    signs_buf: wgpu::BindingResource<'_>,
+    lut_buf: wgpu::BindingResource<'_>,
     n_tokens: usize,
     start_pos: usize,
     n_kv_heads: usize,
@@ -998,12 +1028,12 @@ pub fn dispatch_kv_qjl_encode(
         pipeline,
         vec![
             k_in_buf,
-            rotation_buf.as_entire_binding(),
-            k_angles_buf.as_entire_binding(),
-            k_radius_buf.as_entire_binding(),
-            projection_buf.as_entire_binding(),
-            signs_buf.as_entire_binding(),
-            lut_buf.as_entire_binding(),
+            rotation_buf,
+            k_angles_buf,
+            k_radius_buf,
+            projection_buf,
+            signs_buf,
+            lut_buf,
             params_buf.as_entire_binding(),
         ],
     );
@@ -1039,9 +1069,13 @@ pub fn qjl_encode_k_layer(
         .expect("k_qjl_projection_layer must exist when n_qjl_proj > 0");
     dispatch_kv_qjl_encode(
         gpu, encoder,
-        k_in_buf, cache.rotation_layer(layer),
-        cache.k_angles_layer(layer), cache.k_radius_layer(layer),
-        proj_buf, signs_buf, cache.lut_buffer(),
+        k_in_buf,
+        cache.rotation_layer(layer).binding(),
+        cache.k_angles_layer(layer).binding(),
+        cache.k_radius_layer(layer).binding(),
+        proj_buf.binding(),
+        signs_buf.binding(),
+        cache.lut_buffer().binding(),
         n_tokens, start_pos,
         cache.n_kv_heads(), cache.head_dim(), cache.n_qjl_proj(),
         cache.max_seq_len(),
@@ -1074,10 +1108,10 @@ pub fn attn_score_polar_resident(
         gpu,
         encoder,
         rq_buf,
-        cache.k_angles_layer(layer),
-        cache.k_radius_layer(layer),
+        cache.k_angles_layer(layer).binding(),
+        cache.k_radius_layer(layer).binding(),
         scores_buf,
-        cache.lut_buffer(),
+        cache.lut_buffer().binding(),
         n_query_heads,
         cache.n_kv_heads(),
         cache.head_dim(),
@@ -1109,10 +1143,10 @@ pub fn attn_value_polar_resident(
         gpu,
         encoder,
         softmax_buf,
-        cache.v_angles_layer(layer),
-        cache.v_radius_layer(layer),
+        cache.v_angles_layer(layer).binding(),
+        cache.v_radius_layer(layer).binding(),
         weighted_rot_buf,
-        cache.lut_buffer(),
+        cache.lut_buffer().binding(),
         n_query_heads,
         cache.n_kv_heads(),
         cache.head_dim(),
@@ -1123,7 +1157,7 @@ pub fn attn_value_polar_resident(
         gpu,
         encoder,
         weighted_rot_buf,
-        cache.rotation_layer(layer),
+        cache.rotation_layer(layer).binding(),
         out_buf,
         n_query_heads,
         cache.head_dim(),
@@ -1598,12 +1632,12 @@ mod tests {
         let used_radius = n_tokens * n_kv_heads;
         let used_packed_words = (used_angles + 3) / 4;
 
-        let read = |buf: &wgpu::Buffer, bytes: u64| -> Vec<u8> {
+        let read = |alloc: &::vram_heap::VramAllocation, bytes: u64| -> Vec<u8> {
             let staging = gpu.create_staging_buffer(bytes);
             let mut e = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("test.compress.readback"),
             });
-            e.copy_buffer_to_buffer(buf, 0, &staging, 0, bytes);
+            e.copy_buffer_to_buffer(alloc.buffer(), alloc.offset(), &staging, 0, bytes);
             gpu.queue.submit(Some(e.finish()));
             let slice = staging.slice(..);
             let (s, r) = std::sync::mpsc::channel();
@@ -1715,7 +1749,7 @@ mod tests {
         let mut e = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("test.read_radius"),
         });
-        e.copy_buffer_to_buffer(polar_kv.k_radius_layer(0), 0, &staging, 0, bytes);
+        e.copy_buffer_to_buffer(polar_kv.k_radius_layer(0).buffer(), polar_kv.k_radius_layer(0).offset(), &staging, 0, bytes);
         gpu.queue.submit(Some(e.finish()));
         let slice = staging.slice(..);
         let (s, r) = std::sync::mpsc::channel();
@@ -2026,13 +2060,13 @@ mod tests {
         });
 
         dispatch_rotate_q(
-            &gpu, &mut encoder, &q_buf, polar_kv.rotation_layer(layer), &rq_buf,
+            &gpu, &mut encoder, &q_buf, polar_kv.rotation_layer(layer).binding(), &rq_buf,
             n_tokens, n_query_heads, head_dim,
         );
         dispatch_attn_score_polar_batch(
             &gpu, &mut encoder, rq_buf.as_entire_binding(),
-            polar_kv.k_angles_layer(layer), polar_kv.k_radius_layer(layer),
-            scores_buf.as_entire_binding(), polar_kv.lut_buffer(),
+            polar_kv.k_angles_layer(layer).binding(), polar_kv.k_radius_layer(layer).binding(),
+            scores_buf.as_entire_binding(), polar_kv.lut_buffer().binding(),
             n_query_heads, n_kv_heads, head_dim, start_pos, n_tokens, max_seq,
         );
         // Softmax: reuse the existing softmax_batch shader (same layout).
@@ -2065,8 +2099,8 @@ mod tests {
         }
         dispatch_attn_value_polar_batch(
             &gpu, &mut encoder, scores_buf.as_entire_binding(),
-            polar_kv.v_angles_layer(layer), polar_kv.v_radius_layer(layer),
-            weighted_rot_buf.as_entire_binding(), polar_kv.lut_buffer(),
+            polar_kv.v_angles_layer(layer).binding(), polar_kv.v_radius_layer(layer).binding(),
+            weighted_rot_buf.as_entire_binding(), polar_kv.lut_buffer().binding(),
             n_query_heads, n_kv_heads, head_dim, start_pos, n_tokens, max_seq,
         );
         // Derotate: treat (n_tokens * n_query_heads) as "n_heads" — the
@@ -2074,7 +2108,7 @@ mod tests {
         // the f32 layout is [tok, head, head_dim] flat = same.
         dispatch_derotate(
             &gpu, &mut encoder, &weighted_rot_buf,
-            polar_kv.rotation_layer(layer), &final_buf,
+            polar_kv.rotation_layer(layer).binding(), &final_buf,
             n_tokens * n_query_heads, head_dim,
         );
 
@@ -2218,13 +2252,13 @@ mod tests {
             label: Some("qwen.score"),
         });
         dispatch_rotate_q(
-            &gpu, &mut encoder, &q_buf, polar_kv.rotation_layer(layer), &rq_buf,
+            &gpu, &mut encoder, &q_buf, polar_kv.rotation_layer(layer).binding(), &rq_buf,
             n_tokens, n_query_heads, head_dim,
         );
         dispatch_attn_score_polar_batch(
             &gpu, &mut encoder, rq_buf.as_entire_binding(),
-            polar_kv.k_angles_layer(layer), polar_kv.k_radius_layer(layer),
-            scores_buf.as_entire_binding(), polar_kv.lut_buffer(),
+            polar_kv.k_angles_layer(layer).binding(), polar_kv.k_radius_layer(layer).binding(),
+            scores_buf.as_entire_binding(), polar_kv.lut_buffer().binding(),
             n_query_heads, n_kv_heads, head_dim, start_pos, n_tokens, max_seq,
         );
         // Softmax via the production softmax_batch shader.
@@ -2248,13 +2282,13 @@ mod tests {
         }
         dispatch_attn_value_polar_batch(
             &gpu, &mut encoder, scores_buf.as_entire_binding(),
-            polar_kv.v_angles_layer(layer), polar_kv.v_radius_layer(layer),
-            weighted_rot_buf.as_entire_binding(), polar_kv.lut_buffer(),
+            polar_kv.v_angles_layer(layer).binding(), polar_kv.v_radius_layer(layer).binding(),
+            weighted_rot_buf.as_entire_binding(), polar_kv.lut_buffer().binding(),
             n_query_heads, n_kv_heads, head_dim, start_pos, n_tokens, max_seq,
         );
         dispatch_derotate(
             &gpu, &mut encoder, &weighted_rot_buf,
-            polar_kv.rotation_layer(layer), &final_buf,
+            polar_kv.rotation_layer(layer).binding(), &final_buf,
             n_tokens * n_query_heads, head_dim,
         );
         gpu.queue.submit(Some(encoder.finish()));
@@ -2434,13 +2468,13 @@ mod tests {
             label: Some("two.attn"),
         });
         dispatch_rotate_q(
-            &gpu, &mut encoder, &q_buf, polar_kv.rotation_layer(layer), &rq_buf,
+            &gpu, &mut encoder, &q_buf, polar_kv.rotation_layer(layer).binding(), &rq_buf,
             n_tokens, n_query_heads, head_dim,
         );
         dispatch_attn_score_polar_batch(
             &gpu, &mut encoder, rq_buf.as_entire_binding(),
-            polar_kv.k_angles_layer(layer), polar_kv.k_radius_layer(layer),
-            scores_buf.as_entire_binding(), polar_kv.lut_buffer(),
+            polar_kv.k_angles_layer(layer).binding(), polar_kv.k_radius_layer(layer).binding(),
+            scores_buf.as_entire_binding(), polar_kv.lut_buffer().binding(),
             n_query_heads, n_kv_heads, head_dim, start_pos, n_tokens, max_seq,
         );
         #[repr(C)]
@@ -2463,13 +2497,13 @@ mod tests {
         }
         dispatch_attn_value_polar_batch(
             &gpu, &mut encoder, scores_buf.as_entire_binding(),
-            polar_kv.v_angles_layer(layer), polar_kv.v_radius_layer(layer),
-            weighted_rot_buf.as_entire_binding(), polar_kv.lut_buffer(),
+            polar_kv.v_angles_layer(layer).binding(), polar_kv.v_radius_layer(layer).binding(),
+            weighted_rot_buf.as_entire_binding(), polar_kv.lut_buffer().binding(),
             n_query_heads, n_kv_heads, head_dim, start_pos, n_tokens, max_seq,
         );
         dispatch_derotate(
             &gpu, &mut encoder, &weighted_rot_buf,
-            polar_kv.rotation_layer(layer), &final_buf,
+            polar_kv.rotation_layer(layer).binding(), &final_buf,
             n_tokens * n_query_heads, head_dim,
         );
         gpu.queue.submit(Some(encoder.finish()));
@@ -2581,13 +2615,13 @@ mod tests {
             label: Some("test.batch1"),
         });
         dispatch_rotate_q(
-            &gpu, &mut e, &q_buf, polar_kv.rotation_layer(layer), &rq_buf,
+            &gpu, &mut e, &q_buf, polar_kv.rotation_layer(layer).binding(), &rq_buf,
             n_tokens, n_query_heads, head_dim,
         );
         dispatch_attn_score_polar_batch(
             &gpu, &mut e, rq_buf.as_entire_binding(),
-            polar_kv.k_angles_layer(layer), polar_kv.k_radius_layer(layer),
-            scores_buf.as_entire_binding(), polar_kv.lut_buffer(),
+            polar_kv.k_angles_layer(layer).binding(), polar_kv.k_radius_layer(layer).binding(),
+            scores_buf.as_entire_binding(), polar_kv.lut_buffer().binding(),
             n_query_heads, n_kv_heads, head_dim, start_pos, n_tokens, max_seq,
         );
         gpu.queue.submit(Some(e.finish()));
@@ -2763,8 +2797,10 @@ mod tests {
         // 1) Compress K + encode QJL.
         dispatch_kv_compress_polar(
             &gpu, &mut encoder,
-            k_in_buf.as_entire_binding(), cache.rotation_layer(layer),
-            cache.k_angles_layer(layer), cache.k_radius_layer(layer),
+            k_in_buf.as_entire_binding(),
+            cache.rotation_layer(layer).binding(),
+            cache.k_angles_layer(layer).binding(),
+            cache.k_radius_layer(layer).binding(),
             k_n_tokens, /*start_pos*/ 0,
             n_kv_heads, head_dim, max_seq,
         );
@@ -2776,18 +2812,21 @@ mod tests {
         dispatch_attn_score_polar_batch(
             &gpu, &mut encoder,
             rq_buf.as_entire_binding(),
-            cache.k_angles_layer(layer), cache.k_radius_layer(layer),
-            scores_polar.as_entire_binding(), cache.lut_buffer(),
+            cache.k_angles_layer(layer).binding(),
+            cache.k_radius_layer(layer).binding(),
+            scores_polar.as_entire_binding(),
+            cache.lut_buffer().binding(),
             n_heads, n_kv_heads, head_dim, start_pos, q_n_tokens, max_seq,
         );
         dispatch_attn_score_polar_qjl_batch(
             &gpu, &mut encoder,
             rq_buf.as_entire_binding(),
-            cache.k_angles_layer(layer), cache.k_radius_layer(layer),
+            cache.k_angles_layer(layer).binding(),
+            cache.k_radius_layer(layer).binding(),
             scores_qjl.as_entire_binding(),
-            cache.k_qjl_signs_layer(layer).unwrap(),
-            cache.k_qjl_projection_layer(layer).unwrap(),
-            cache.lut_buffer(),
+            cache.k_qjl_signs_layer(layer).unwrap().binding(),
+            cache.k_qjl_projection_layer(layer).unwrap().binding(),
+            cache.lut_buffer().binding(),
             n_heads, n_kv_heads, head_dim, start_pos, q_n_tokens, max_seq,
             n_proj,
         );
@@ -2947,8 +2986,10 @@ mod tests {
         });
         dispatch_kv_compress_polar(
             &gpu, &mut encoder,
-            k_in_buf.as_entire_binding(), cache.rotation_layer(layer),
-            cache.k_angles_layer(layer), cache.k_radius_layer(layer),
+            k_in_buf.as_entire_binding(),
+            cache.rotation_layer(layer).binding(),
+            cache.k_angles_layer(layer).binding(),
+            cache.k_radius_layer(layer).binding(),
             n_tokens, /*start_pos*/ 0,
             n_kv_heads, head_dim, max_seq,
         );
@@ -2960,10 +3001,13 @@ mod tests {
         // Stage signs for readback.
         let signs_bytes = (max_seq * n_kv_heads * std::mem::size_of::<u32>()) as u64;
         let staging = gpu.create_staging_buffer(signs_bytes);
-        encoder.copy_buffer_to_buffer(
-            cache.k_qjl_signs_layer(layer).unwrap(),
-            0, &staging, 0, signs_bytes,
-        );
+        {
+            let signs_alloc = cache.k_qjl_signs_layer(layer).unwrap();
+            encoder.copy_buffer_to_buffer(
+                signs_alloc.buffer(), signs_alloc.offset(),
+                &staging, 0, signs_bytes,
+            );
+        }
         gpu.queue.submit(Some(encoder.finish()));
 
         let slice = staging.slice(..);
