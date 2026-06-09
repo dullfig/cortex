@@ -377,6 +377,35 @@ pub const PARAMS_POOL_SLOT_COUNT: usize = 2048;
 
 /// Ring of pre-allocated uniform buffers used by `create_params_buffer`.
 /// See that method's doc comment for why this exists.
+///
+/// # Why this is NOT a `vram_heap::VramPool`
+///
+/// vram-heap's `VramPool` has an *explicit* slot lifecycle: `acquire()`
+/// pops an index from a free-list, `PoolSlot::drop` pushes it back.
+/// `ParamsBufferPool` has an *implicit* slot lifecycle: `next_slot()`
+/// is an atomic round-robin over 2048 slots and the slot is "available
+/// again" the instant it returns.
+///
+/// cortex's dispatch helpers do `acquire → write → bind → record →
+/// return`. The returned `wgpu::Buffer` (an Arc handle to the slot)
+/// drops at function return, but the GPU's actual `queue.submit` +
+/// dispatch read happens later — often hundreds of microseconds later,
+/// batched at the end of the forward function. The current ring
+/// tolerates this because nothing overwrites a slot until 2048 more
+/// allocations later, by which point the GPU has long since finished
+/// reading the in-flight slots.
+///
+/// Migrating to `VramPool` would force every dispatch helper to grow a
+/// `&mut Vec<PoolSlot>` keepalive parameter threaded from the forward
+/// function down through every dispatch — ~44 call sites, all-or-
+/// nothing plumbing, no substrate benefit. The ring is already
+/// solving the wgpu-29 allocator-pressure ceiling that motivated the
+/// vram-heap work in the first place. Leave it.
+///
+/// `VramPool` is the right answer for callers that DO want explicit
+/// per-slot lifetime tracking — e.g. memex's KV-cache slot reuse or
+/// ternary-rs's quantized-tensor allocation patterns where slots
+/// outlive a single function-scope.
 pub struct ParamsBufferPool {
     slots: Vec<wgpu::Buffer>,
     next: std::sync::atomic::AtomicUsize,
@@ -581,14 +610,42 @@ impl GpuDevice {
         pipeline: &wgpu::ComputePipeline,
         buffers: &[&wgpu::Buffer],
     ) -> wgpu::BindGroup {
-        let layout = pipeline.get_bind_group_layout(0);
-        let entries: Vec<wgpu::BindGroupEntry> = buffers
+        // Delegate to the BindingResource variant. Bindings come out
+        // as `buf.as_entire_binding()` per the original semantics
+        // (no offset/size; the whole buffer).
+        let resources: Vec<wgpu::BindingResource<'_>> = buffers
             .iter()
+            .map(|b| b.as_entire_binding())
+            .collect();
+        self.make_bind_group_with(pipeline, resources)
+    }
+
+    /// Build a bind group from an explicit list of `BindingResource`s.
+    /// Bindings are numbered by their index in `resources` — same
+    /// convention as [`Self::make_bind_group`], just with a flexible
+    /// per-binding resource type.
+    ///
+    /// Use this when at least one binding is a sub-range of some
+    /// larger buffer (typically a vram-heap backing buffer). For a
+    /// `VramAllocation` `alloc`, pass `alloc.binding()`. For a whole
+    /// wgpu::Buffer `buf`, pass `buf.as_entire_binding()`. The list
+    /// can mix the two freely.
+    ///
+    /// `make_bind_group_with` is the keystone that unblocks
+    /// substrate migrations: future per-call buffers (hidden_buf,
+    /// rotated_buf, BlockScratch, KV caches, weights, the f32 cache)
+    /// will be sub-ranges of one of the three vram-heap arenas, and
+    /// their bind groups go through this helper.
+    pub fn make_bind_group_with(
+        &self,
+        pipeline: &wgpu::ComputePipeline,
+        resources: Vec<wgpu::BindingResource<'_>>,
+    ) -> wgpu::BindGroup {
+        let layout = pipeline.get_bind_group_layout(0);
+        let entries: Vec<wgpu::BindGroupEntry> = resources
+            .into_iter()
             .enumerate()
-            .map(|(i, buf)| wgpu::BindGroupEntry {
-                binding: i as u32,
-                resource: buf.as_entire_binding(),
-            })
+            .map(|(i, r)| wgpu::BindGroupEntry { binding: i as u32, resource: r })
             .collect();
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
