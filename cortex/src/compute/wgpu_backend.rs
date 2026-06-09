@@ -445,31 +445,38 @@ impl ParamsBufferPool {
 ///
 /// # vram-heap usage
 ///
-/// `transient_heap_a` and `transient_heap_b` are TWO device-local
-/// heaps that callers use as "input-lane" and "output-lane" for
-/// dispatches that need both R and RW bindings: wgpu/Vulkan rejects
-/// binding `STORAGE_READ_ONLY` and `STORAGE_READ_WRITE` to the same
-/// backing buffer within a single dispatch (even at disjoint
-/// sub-ranges). By allocating reads from one heap and writes from
-/// another, both bindings are sub-ranges of *different* backings, so
-/// the buffer-level tracker is happy.
+/// `transient_heap_a`, `transient_heap_b`, and `transient_heap_c` are
+/// THREE device-local heaps that callers use as lanes for dispatches
+/// that need disjoint R and RW bindings: wgpu/Vulkan rejects binding
+/// `STORAGE_READ_ONLY` and `STORAGE_READ_WRITE` to the same backing
+/// buffer within a single dispatch (even at disjoint sub-ranges). By
+/// allocating R inputs and RW outputs from different heaps, both
+/// bindings reference *different* backings, so the buffer-level
+/// tracker is happy.
 ///
-/// Both heaps reset their transient regions at the end of each
-/// forward pass (see `forward_full_gpu_polar_traced` and siblings).
+/// The 3-lane scheme (added in Phase D for the BlockScratch
+/// migration) carries `hidden_buf`, `rotated_buf`, and a subset of
+/// BlockScratch on heap A; another subset on heap B; the remainder
+/// on heap C. See `PolarBlockScratch` in `gpu_engine.rs` for the
+/// per-buffer lane assignment and the conflict-graph rationale.
+///
+/// All heaps free their transient regions via RAII Drop on
+/// `VramAllocation`; coalesce returns each lane to a single full
+/// span between forward passes.
 pub struct GpuDevice {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub pipelines: Pipelines,
     pub params_pool: ParamsBufferPool,
-    /// Input-lane device-local heap. Use for buffers that may be bound
-    /// as `STORAGE_READ_ONLY` in a dispatch (rmsnorm inputs, matmul
-    /// LHS, etc.). Also fine for write-only allocations that won't
-    /// share a dispatch with the output lane.
+    /// Lane-A device-local heap. Holds `hidden_buf`, `rotated_buf`,
+    /// `PolarBlockScratch::{gate, up}`.
     pub transient_heap_a: Arc<::vram_heap::VramHeap>,
-    /// Output-lane device-local heap. Use for buffers that will be
-    /// bound as `STORAGE_READ_WRITE` (matmul outputs, residual-add
-    /// targets, etc.).
+    /// Lane-B device-local heap. Holds
+    /// `PolarBlockScratch::{normed, activated, attn_out, scores}`.
     pub transient_heap_b: Arc<::vram_heap::VramHeap>,
+    /// Lane-C device-local heap. Holds
+    /// `PolarBlockScratch::{q, k, v, projected}`.
+    pub transient_heap_c: Arc<::vram_heap::VramHeap>,
     /// Host-visible readback heap. Use for staging buffers that
     /// receive `copy_buffer_to_buffer` destinations and then get
     /// host-mapped for read. Capture-staging buffers in retrieval
@@ -565,15 +572,20 @@ impl GpuDevice {
             "params buffer pool allocated",
         );
 
-        // vram-heap arenas. Two device-local heaps so callers can
-        // place R inputs and RW outputs on different backings within
-        // one dispatch (wgpu/Vulkan rejects same-buffer R+RW even at
-        // disjoint sub-ranges). Sizes default to 128 MB each — enough
-        // for hidden_buf + rotated_buf + future per-forward transients
-        // on Qwen 3B at typical query sizes; tunable via env vars.
+        // vram-heap arenas. Three device-local heaps form the 3-lane
+        // scheme that the polar forward path uses to keep R inputs
+        // and RW outputs on different backings within one dispatch
+        // (wgpu/Vulkan rejects same-buffer R+RW even at disjoint
+        // sub-ranges). Phase D required a 3rd lane because the
+        // hidden_buf/rotated_buf + BlockScratch conflict graph is
+        // not 2-colorable. Sizes default to 128 MB each — enough for
+        // Qwen 3B at typical query sizes (worst single allocation:
+        // ~63 MB scores at 989 tokens); tunable via env vars.
         let heap_a_mb: u64 = std::env::var("CORTEX_VRAM_HEAP_A_MB")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(128);
         let heap_b_mb: u64 = std::env::var("CORTEX_VRAM_HEAP_B_MB")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(128);
+        let heap_c_mb: u64 = std::env::var("CORTEX_VRAM_HEAP_C_MB")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(128);
         let heap_readback_mb: u64 = std::env::var("CORTEX_VRAM_HEAP_READBACK_MB")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(256);
@@ -589,6 +601,12 @@ impl GpuDevice {
             heap_b_mb * 1024 * 1024,
             "cortex.transient.b",
         ).expect("vram-heap B construction failed");
+        let transient_heap_c = ::vram_heap::VramHeap::new(
+            &device,
+            ::vram_heap::MemoryTier::DeviceLocal,
+            heap_c_mb * 1024 * 1024,
+            "cortex.transient.c",
+        ).expect("vram-heap C construction failed");
         let host_readback_heap = ::vram_heap::VramHeap::new(
             &device,
             ::vram_heap::MemoryTier::HostReadback,
@@ -598,7 +616,7 @@ impl GpuDevice {
 
         Some(Self {
             device, queue, pipelines, params_pool,
-            transient_heap_a, transient_heap_b, host_readback_heap,
+            transient_heap_a, transient_heap_b, transient_heap_c, host_readback_heap,
         })
     }
 

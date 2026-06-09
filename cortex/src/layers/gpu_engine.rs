@@ -234,6 +234,99 @@ pub struct BlockScratch {
     pub projected: wgpu::Buffer, // [n_tokens, embed_dim] both attn-out-proj and FFN-down output reuse this
 }
 
+/// Phase D vram-heap variant of `BlockScratch`. Same 10 fields, but
+/// each is a sub-allocation of a lane-colored device-local heap so
+/// dispatches inside `forward_block_gpu_polar_inner` never bind R and
+/// RW on the same backing buffer.
+///
+/// Lane assignment (lane = which heap the field lives on):
+///
+/// - **Lane A (`transient_heap_a`)**: shares with `hidden_buf`,
+///   `rotated_buf` (Phase C). Fields: `gate`, `up`.
+/// - **Lane B (`transient_heap_b`)**: `normed`, `activated`,
+///   `attn_out`, `scores`.
+/// - **Lane C (`transient_heap_c`, added in Phase D)**: `q`, `k`,
+///   `v`, `projected`.
+///
+/// The coloring solves the conflict graph where each edge is a
+/// (R buffer, RW buffer) pair appearing in one dispatch. With
+/// hidden + rotated pinned to lane A from Phase C, the graph is not
+/// 2-colorable (normed ↔ hidden forces normed off A; q ↔ rotated
+/// forces q off A; normed ↔ q forces them apart — three colors
+/// needed). See the Phase D plan section in
+/// `~/.claude/plans/giggly-chasing-melody.md` for the full derivation.
+///
+/// RAII Drop on each `VramAllocation` returns the range to its
+/// heap's free-list at function exit; coalesce restores each lane to
+/// a single full span between polar forward calls.
+pub struct PolarBlockScratch {
+    pub normed: ::vram_heap::VramAllocation,
+    pub q: ::vram_heap::VramAllocation,
+    pub k: ::vram_heap::VramAllocation,
+    pub v: ::vram_heap::VramAllocation,
+    pub attn_out: ::vram_heap::VramAllocation,
+    pub scores: ::vram_heap::VramAllocation,
+    pub gate: ::vram_heap::VramAllocation,
+    pub up: ::vram_heap::VramAllocation,
+    pub activated: ::vram_heap::VramAllocation,
+    pub projected: ::vram_heap::VramAllocation,
+}
+
+impl PolarBlockScratch {
+    /// Allocate the 10 polar-path scratch buffers across the 3-lane
+    /// heap scheme. See struct docs for lane assignment. Sizes mirror
+    /// `BlockScratch::allocate` exactly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn allocate(
+        gpu: &GpuDevice,
+        n_tokens: usize,
+        embed_dim: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        intermediate: usize,
+        max_seq: usize,
+    ) -> Self {
+        let align = ::vram_heap::STORAGE_BUFFER_OFFSET_ALIGNMENT_NVIDIA;
+        let f32_bytes = std::mem::size_of::<f32>() as u64;
+
+        let gate = gpu.transient_heap_a.allocate(
+            (n_tokens * intermediate * 2) as u64, align, "polar_scratch.gate",
+        ).expect("transient_heap_a capacity for polar_scratch.gate");
+        let up = gpu.transient_heap_a.allocate(
+            (n_tokens * intermediate * 2) as u64, align, "polar_scratch.up",
+        ).expect("transient_heap_a capacity for polar_scratch.up");
+
+        let normed = gpu.transient_heap_b.allocate(
+            (n_tokens * embed_dim * 2) as u64, align, "polar_scratch.normed",
+        ).expect("transient_heap_b capacity for polar_scratch.normed");
+        let activated = gpu.transient_heap_b.allocate(
+            (n_tokens * intermediate * 2) as u64, align, "polar_scratch.activated",
+        ).expect("transient_heap_b capacity for polar_scratch.activated");
+        let attn_out = gpu.transient_heap_b.allocate(
+            (n_tokens * n_heads * head_dim * 2) as u64, align, "polar_scratch.attn_out",
+        ).expect("transient_heap_b capacity for polar_scratch.attn_out");
+        let scores = gpu.transient_heap_b.allocate(
+            (n_tokens * n_heads * max_seq) as u64 * f32_bytes, align, "polar_scratch.scores",
+        ).expect("transient_heap_b capacity for polar_scratch.scores");
+
+        let q = gpu.transient_heap_c.allocate(
+            (n_tokens * n_heads * head_dim * 2) as u64, align, "polar_scratch.q",
+        ).expect("transient_heap_c capacity for polar_scratch.q");
+        let k = gpu.transient_heap_c.allocate(
+            (n_tokens * n_kv_heads * head_dim * 2) as u64, align, "polar_scratch.k",
+        ).expect("transient_heap_c capacity for polar_scratch.k");
+        let v = gpu.transient_heap_c.allocate(
+            (n_tokens * n_kv_heads * head_dim * 2) as u64, align, "polar_scratch.v",
+        ).expect("transient_heap_c capacity for polar_scratch.v");
+        let projected = gpu.transient_heap_c.allocate(
+            (n_tokens * embed_dim * 2) as u64, align, "polar_scratch.projected",
+        ).expect("transient_heap_c capacity for polar_scratch.projected");
+
+        Self { normed, q, k, v, attn_out, scores, gate, up, activated, projected }
+    }
+}
+
 impl BlockScratch {
     /// Allocate scratch buffers sized for a single forward of `n_tokens`.
     pub fn allocate(
@@ -615,7 +708,7 @@ impl GpuEngine {
         encoder: &mut wgpu::CommandEncoder,
         in_buf: wgpu::BindingResource<'_>,
         weight_buf: &wgpu::Buffer,
-        out_buf: &wgpu::Buffer,
+        out_buf: wgpu::BindingResource<'_>,
         n: usize,
         n_tokens: usize,
         eps: f32,
@@ -630,7 +723,7 @@ impl GpuEngine {
             vec![
                 in_buf,
                 weight_buf.as_entire_binding(),
-                out_buf.as_entire_binding(),
+                out_buf,
                 params_buf.as_entire_binding(),
             ],
         );
@@ -1199,37 +1292,121 @@ impl GpuEngine {
     }
 
     /// Phase C2 encoder-level wrapper for packed-IO linear-batch.
+    ///
+    /// Phase D (vram-heap): `in_packed_buf` and `out_packed_buf` are
+    /// `BindingResource` so PolarBlockScratch sub-allocations can be
+    /// bound at their sub-ranges. Bind group built inline via
+    /// `make_bind_group_with` rather than delegating to `_in_pass`
+    /// (the in-pass variant still serves the f32 path's PASS-bundled
+    /// dispatches that bind whole BlockScratch buffers).
     pub fn dispatch_linear_batch_packed_io_into(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         layer: &dyn LinearLayer,
-        in_packed_buf: &wgpu::Buffer,
-        out_packed_buf: &wgpu::Buffer,
+        in_packed_buf: wgpu::BindingResource<'_>,
+        out_packed_buf: wgpu::BindingResource<'_>,
         n_tokens: usize,
     ) {
+        let float = layer
+            .as_any()
+            .downcast_ref::<crate::layers::gpu_floatlinear::GpuFloatLinear>()
+            .unwrap_or_else(|| panic!(
+                "dispatch_linear_batch_packed_io_into: expected GpuFloatLinear \
+                 (concrete type: {:?})", layer));
+        let threshold = std::env::var("CORTEX_MATMUL_SHARED_THRESHOLD")
+            .ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(16);
+
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct MatmulParams { rows: u32, cols: u32, n_tokens: u32, _pad: u32 }
+        let params = MatmulParams {
+            rows: float.out_features() as u32,
+            cols: float.in_features() as u32,
+            n_tokens: n_tokens as u32,
+            _pad: 0,
+        };
+        let params_buf = self.gpu.create_params_buffer(&params);
+
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("gpu_engine.linear_batch_packed_io.pass"),
             timestamp_writes: None,
         });
-        self.dispatch_linear_batch_packed_io_in_pass(&mut pass, layer, in_packed_buf, out_packed_buf, n_tokens);
+
+        if n_tokens >= threshold {
+            let pipeline = &self.gpu.pipelines.matmul_shared_pin_pout;
+            let bind = self.gpu.make_bind_group_with(
+                pipeline,
+                vec![
+                    float.weight_buffer().as_entire_binding(),
+                    in_packed_buf,
+                    out_packed_buf,
+                    params_buf.as_entire_binding(),
+                ],
+            );
+            const TILE_M: usize = 32;
+            const TILE_N: usize = 16;
+            let rows = float.out_features();
+            let dx = ((rows + TILE_M - 1) / TILE_M) as u32;
+            let dy = ((n_tokens + TILE_N - 1) / TILE_N) as u32;
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(dx, dy, 1);
+        } else {
+            let pipeline = &self.gpu.pipelines.matmul_pin_pout;
+            let bind = self.gpu.make_bind_group_with(
+                pipeline,
+                vec![
+                    float.weight_buffer().as_entire_binding(),
+                    in_packed_buf,
+                    out_packed_buf,
+                    params_buf.as_entire_binding(),
+                ],
+            );
+            let row_pairs = (float.out_features() + 1) / 2;
+            let dx = (row_pairs.min(65535)) as u32;
+            let dy = ((row_pairs + 65534) / 65535) as u32;
+            let dz = n_tokens as u32;
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(dx, dy, dz);
+        }
     }
 
     /// Phase C2 encoder-level wrapper for packed gate_mul.
+    ///
+    /// Phase D (vram-heap): gate/up/out args are `BindingResource` so
+    /// PolarBlockScratch sub-allocations bind at sub-ranges. Bind
+    /// group built inline (the `_in_pass` variant still serves f32).
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch_gate_mul_packed_into(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        gate_buf: &wgpu::Buffer,
-        up_buf: &wgpu::Buffer,
-        out_buf: &wgpu::Buffer,
+        gate_buf: wgpu::BindingResource<'_>,
+        up_buf: wgpu::BindingResource<'_>,
+        out_buf: wgpu::BindingResource<'_>,
         n: usize,
         n_tokens: usize,
         activation: crate::layers::swiglu::GateActivation,
     ) {
+        let params = SiluMulBatchParams { n: n as u32, n_tokens: n_tokens as u32 };
+        let params_buf = self.gpu.create_params_buffer(&params);
+        let _ = activation;
+        let pipeline = &self.gpu.pipelines.silu_mul_batch_packed;
+        let bind = self.gpu.make_bind_group_with(
+            pipeline,
+            vec![gate_buf, up_buf, out_buf, params_buf.as_entire_binding()],
+        );
+        let total_packed = ((n * n_tokens) / 2) as u32;
+        let groups = (total_packed + 255) / 256;
+        let dx = groups.min(65535);
+        let dy = (groups + 65534) / 65535;
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("gpu_engine.gate_mul_packed.pass"),
             timestamp_writes: None,
         });
-        self.dispatch_gate_mul_packed_in_pass(&mut pass, gate_buf, up_buf, out_buf, n, n_tokens, activation);
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(dx, dy, 1);
     }
 
     /// Phase C1 encoder-level wrapper for packed-input linear-batch.
@@ -1901,7 +2078,7 @@ impl GpuEngine {
             .intermediate_size();
         let n_heads = attn0.n_heads();
         let head_dim = attn0.head_dim();
-        let scratch = BlockScratch::allocate(
+        let scratch = PolarBlockScratch::allocate(
             &self.gpu, n_tokens, self.embed_dim,
             n_heads, attn0.n_kv_heads(), head_dim,
             intermediate, attn_max_seq,
@@ -2339,7 +2516,7 @@ impl GpuEngine {
 
         let n_heads = attn0.n_heads();
         let head_dim = attn0.head_dim();
-        let scratch = BlockScratch::allocate(
+        let scratch = PolarBlockScratch::allocate(
             &self.gpu, n_tokens, self.embed_dim,
             n_heads, attn0.n_kv_heads(), head_dim,
             intermediate, attn_max_seq,
@@ -3020,7 +3197,7 @@ impl GpuEngine {
 
         let n_heads = attn0.n_heads();
         let head_dim = attn0.head_dim();
-        let scratch = BlockScratch::allocate(
+        let scratch = PolarBlockScratch::allocate(
             &self.gpu, n_tokens, self.embed_dim,
             n_heads, attn0.n_kv_heads(), head_dim,
             intermediate, attn_max_seq,
@@ -3110,7 +3287,7 @@ impl GpuEngine {
         // _in_pass variant (still takes &wgpu::Buffer for non-polar
         // callers).
         self.dispatch_rmsnorm_packed_to_packed_into(
-            &mut encoder, hidden_buf.binding(), &self.final_norm_weight_buf, &normed_buf,
+            &mut encoder, hidden_buf.binding(), &self.final_norm_weight_buf, normed_buf.as_entire_binding(),
             self.embed_dim, n_tokens, self.final_norm_eps,
         );
 
@@ -3551,7 +3728,7 @@ impl GpuEngine {
         hidden_buf: &::vram_heap::VramAllocation,
         n_tokens: usize,
         start_pos: usize,
-        scratch: &BlockScratch,
+        scratch: &PolarBlockScratch,
         rotated_buf: &::vram_heap::VramAllocation,
         polar_cache: &crate::layers::gpu_polar_kv_cache::GpuPolarKvCache,
         pre_softmax_capture: Option<&wgpu::Buffer>,
@@ -3603,31 +3780,31 @@ impl GpuEngine {
 
         // 1. attn_norm — C3: hidden packed → normed packed.
         self.dispatch_rmsnorm_packed_to_packed_into(
-            encoder, hidden_buf.binding(), &block_gpu.attn_norm_weight_buf, &scratch.normed,
+            encoder, hidden_buf.binding(), &block_gpu.attn_norm_weight_buf, scratch.normed.binding(),
             embed_dim, n_tokens, block_gpu.attn_norm_eps,
         );
 
         // 2-4. Q, K, V projections — C3: packed input AND packed output.
-        self.dispatch_linear_batch_packed_io_into(encoder, attn.q_proj(), &scratch.normed, &scratch.q, n_tokens);
+        self.dispatch_linear_batch_packed_io_into(encoder, attn.q_proj(), scratch.normed.binding(), scratch.q.binding(), n_tokens);
         if let Some(buf) = block_gpu.q_bias_buf.as_ref() {
-            self.dispatch_bias_add_packed_into(encoder, &scratch.q, buf, n_heads * head_dim, n_tokens);
+            self.dispatch_bias_add_packed_into(encoder, scratch.q.binding(), buf, n_heads * head_dim, n_tokens);
         }
-        self.dispatch_linear_batch_packed_io_into(encoder, attn.k_proj(), &scratch.normed, &scratch.k, n_tokens);
+        self.dispatch_linear_batch_packed_io_into(encoder, attn.k_proj(), scratch.normed.binding(), scratch.k.binding(), n_tokens);
         if let Some(buf) = block_gpu.k_bias_buf.as_ref() {
-            self.dispatch_bias_add_packed_into(encoder, &scratch.k, buf, kv_dim, n_tokens);
+            self.dispatch_bias_add_packed_into(encoder, scratch.k.binding(), buf, kv_dim, n_tokens);
         }
-        self.dispatch_linear_batch_packed_io_into(encoder, attn.v_proj(), &scratch.normed, &scratch.v, n_tokens);
+        self.dispatch_linear_batch_packed_io_into(encoder, attn.v_proj(), scratch.normed.binding(), scratch.v.binding(), n_tokens);
         if let Some(buf) = block_gpu.v_bias_buf.as_ref() {
-            self.dispatch_bias_add_packed_into(encoder, &scratch.v, buf, kv_dim, n_tokens);
+            self.dispatch_bias_add_packed_into(encoder, scratch.v.binding(), buf, kv_dim, n_tokens);
         }
 
         // 5. RoPE on Q and K — C3 packed (in-place).
         self.dispatch_rope_packed_into(
-            encoder, &scratch.q, &self.rope_cos_buf, &self.rope_sin_buf,
+            encoder, scratch.q.binding(), &self.rope_cos_buf, &self.rope_sin_buf,
             n_heads, head_dim, start_pos, n_tokens,
         );
         self.dispatch_rope_packed_into(
-            encoder, &scratch.k, &self.rope_cos_buf, &self.rope_sin_buf,
+            encoder, scratch.k.binding(), &self.rope_cos_buf, &self.rope_sin_buf,
             n_kv_heads, head_dim, start_pos, n_tokens,
         );
 
@@ -3635,7 +3812,7 @@ impl GpuEngine {
         // kv_compress_polar reads packed-f16 input (fixed 2026-05-27).
         crate::layers::gpu_polar::compress_layer_into_polar(
             &self.gpu, encoder, polar_cache, block_idx,
-            &scratch.k, &scratch.v, n_tokens, start_pos,
+            scratch.k.binding(), scratch.v.binding(), n_tokens, start_pos,
         );
 
         // 5.6 If QJL is enabled, encode K residual signs for the freshly-
@@ -3643,12 +3820,12 @@ impl GpuEngine {
         // radius written above). No-op when polar_cache.n_qjl_proj() == 0.
         crate::layers::gpu_polar::qjl_encode_k_layer(
             &self.gpu, encoder, polar_cache, block_idx,
-            &scratch.k, n_tokens, start_pos,
+            scratch.k.binding(), n_tokens, start_pos,
         );
 
         // 6a. rotate_q: packed scratch.q → f32 rotated_buf.
         crate::layers::gpu_polar::dispatch_rotate_q_packed(
-            &self.gpu, encoder, &scratch.q, polar_cache.rotation_layer(block_idx), rotated_buf.binding(),
+            &self.gpu, encoder, scratch.q.binding(), polar_cache.rotation_layer(block_idx), rotated_buf.binding(),
             n_tokens, n_heads, head_dim,
         );
 
@@ -3661,7 +3838,7 @@ impl GpuEngine {
                 &self.gpu, encoder, rotated_buf.binding(),
                 polar_cache.k_angles_layer(block_idx),
                 polar_cache.k_radius_layer(block_idx),
-                &scratch.scores,
+                scratch.scores.binding(),
                 polar_cache.k_qjl_signs_layer(block_idx)
                     .expect("k_qjl_signs_layer must exist when n_qjl_proj > 0"),
                 polar_cache.k_qjl_projection_layer(block_idx)
@@ -3675,7 +3852,7 @@ impl GpuEngine {
                 &self.gpu, encoder, rotated_buf.binding(),
                 polar_cache.k_angles_layer(block_idx),
                 polar_cache.k_radius_layer(block_idx),
-                &scratch.scores, polar_cache.lut_buffer(),
+                scratch.scores.binding(), polar_cache.lut_buffer(),
                 n_heads, n_kv_heads, head_dim, start_pos, n_tokens, attn_max_seq,
             );
         }
@@ -3683,7 +3860,10 @@ impl GpuEngine {
         // 6c. (optional) capture pre-softmax scores
         if let Some(capture_buf) = pre_softmax_capture {
             let bytes = (n_tokens * n_heads * attn_max_seq * std::mem::size_of::<f32>()) as u64;
-            encoder.copy_buffer_to_buffer(&scratch.scores, 0, capture_buf, 0, bytes);
+            encoder.copy_buffer_to_buffer(
+                scratch.scores.buffer(), scratch.scores.offset(),
+                capture_buf, 0, bytes,
+            );
         }
 
         // 6d. softmax in-place on scratch.scores. Reuses the f32 path's softmax_batch
@@ -3696,8 +3876,9 @@ impl GpuEngine {
         };
         let sm_params_buf = self.gpu.create_params_buffer(&sm_params);
         let sm_pipeline = &self.gpu.pipelines.softmax_batch;
-        let sm_bind = self.gpu.make_bind_group(
-            sm_pipeline, &[&scratch.scores, &sm_params_buf],
+        let sm_bind = self.gpu.make_bind_group_with(
+            sm_pipeline,
+            vec![scratch.scores.binding(), sm_params_buf.as_entire_binding()],
         );
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -3712,7 +3893,7 @@ impl GpuEngine {
         // 6e. attn_value_polar_batch: scratch.scores * V_polar → rotated_buf
         //     (overwriting rq, no longer needed)
         crate::layers::gpu_polar::dispatch_attn_value_polar_batch(
-            &self.gpu, encoder, &scratch.scores,
+            &self.gpu, encoder, scratch.scores.binding(),
             polar_cache.v_angles_layer(block_idx),
             polar_cache.v_radius_layer(block_idx),
             rotated_buf.binding(), polar_cache.lut_buffer(),
@@ -3723,32 +3904,32 @@ impl GpuEngine {
         //     Treat (n_tokens * n_heads) as effective head count — R is per-layer.
         crate::layers::gpu_polar::dispatch_derotate_packed(
             &self.gpu, encoder, rotated_buf.binding(),
-            polar_cache.rotation_layer(block_idx), &scratch.attn_out,
+            polar_cache.rotation_layer(block_idx), scratch.attn_out.binding(),
             n_tokens * n_heads, head_dim,
         );
 
         // 7. O projection — C3: packed attn_out → packed projected.
-        self.dispatch_linear_batch_packed_io_into(encoder, attn.o_proj(), &scratch.attn_out, &scratch.projected, n_tokens);
+        self.dispatch_linear_batch_packed_io_into(encoder, attn.o_proj(), scratch.attn_out.binding(), scratch.projected.binding(), n_tokens);
 
         // 8. Residual — C3: hidden packed += projected packed.
-        self.dispatch_add_packed_into(encoder, hidden_buf.binding(), &scratch.projected, embed_dim, n_tokens);
+        self.dispatch_add_packed_into(encoder, hidden_buf.binding(), scratch.projected.binding(), embed_dim, n_tokens);
 
         // ===== FFN SUBLAYER =====
 
         // ffn_norm — C3: hidden packed → normed packed.
         self.dispatch_rmsnorm_packed_to_packed_into(
-            encoder, hidden_buf.binding(), &block_gpu.ffn_norm_weight_buf, &scratch.normed,
+            encoder, hidden_buf.binding(), &block_gpu.ffn_norm_weight_buf, scratch.normed.binding(),
             embed_dim, n_tokens, block_gpu.ffn_norm_eps,
         );
         // C2 polar: gate/up/activated packed; use packed-IO router.
-        self.dispatch_linear_batch_packed_io_into(encoder, swiglu.gate_proj(), &scratch.normed, &scratch.gate, n_tokens);
-        self.dispatch_linear_batch_packed_io_into(encoder, swiglu.up_proj(),   &scratch.normed, &scratch.up,   n_tokens);
-        self.dispatch_gate_mul_packed_into(encoder, &scratch.gate, &scratch.up, &scratch.activated, intermediate, n_tokens, swiglu.activation());
+        self.dispatch_linear_batch_packed_io_into(encoder, swiglu.gate_proj(), scratch.normed.binding(), scratch.gate.binding(), n_tokens);
+        self.dispatch_linear_batch_packed_io_into(encoder, swiglu.up_proj(),   scratch.normed.binding(), scratch.up.binding(),   n_tokens);
+        self.dispatch_gate_mul_packed_into(encoder, scratch.gate.binding(), scratch.up.binding(), scratch.activated.binding(), intermediate, n_tokens, swiglu.activation());
 
         // C3 down_proj: packed input, packed output.
-        self.dispatch_linear_batch_packed_io_into(encoder, swiglu.down_proj(), &scratch.activated, &scratch.projected, n_tokens);
+        self.dispatch_linear_batch_packed_io_into(encoder, swiglu.down_proj(), scratch.activated.binding(), scratch.projected.binding(), n_tokens);
         // C3: hidden packed += projected packed.
-        self.dispatch_add_packed_into(encoder, hidden_buf.binding(), &scratch.projected, embed_dim, n_tokens);
+        self.dispatch_add_packed_into(encoder, hidden_buf.binding(), scratch.projected.binding(), embed_dim, n_tokens);
 
         // (optional) post-block hidden state capture — shim hook point.
         // C3: hidden_buf is packed f16; capture is half size.
@@ -3861,10 +4042,14 @@ impl GpuEngine {
     }
 
     /// Phase C3 encoder-level wrapper for packed RoPE.
+    /// Phase D (vram-heap): `x_buf` is `BindingResource` so the
+    /// in-place RW target (scratch.q or scratch.k) binds at its
+    /// sub-range. Bind group inlined; `_in_pass` still serves f32.
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch_rope_packed_into(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        x_buf: &wgpu::Buffer,
+        x_buf: wgpu::BindingResource<'_>,
         cos_buf: &wgpu::Buffer,
         sin_buf: &wgpu::Buffer,
         n_heads: usize,
@@ -3872,11 +4057,38 @@ impl GpuEngine {
         start_pos: usize,
         n_tokens: usize,
     ) {
+        assert!(head_dim % 2 == 0, "RoPE head_dim must be even");
+        assert!((head_dim / 2) % 2 == 0,
+            "Packed RoPE requires half_dim even (head_dim divisible by 4)");
+        let half_dim = head_dim / 2;
+        let params = RopeBatchParams {
+            n_heads: n_heads as u32,
+            head_dim: head_dim as u32,
+            start_pos: start_pos as u32,
+            half_dim: half_dim as u32,
+            n_tokens: n_tokens as u32,
+            _p1: 0, _p2: 0, _p3: 0,
+        };
+        let params_buf = self.gpu.create_params_buffer(&params);
+        let pipeline = &self.gpu.pipelines.rope_batch_packed;
+        let bind_group = self.gpu.make_bind_group_with(
+            pipeline,
+            vec![
+                x_buf,
+                cos_buf.as_entire_binding(),
+                sin_buf.as_entire_binding(),
+                params_buf.as_entire_binding(),
+            ],
+        );
+        let total_threads = (n_tokens * n_heads * (half_dim / 2)) as u32;
+        let dispatch_x = (total_threads + 63) / 64;
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("gpu_engine.rope_packed.pass"),
             timestamp_writes: None,
         });
-        self.dispatch_rope_packed_in_pass(&mut pass, x_buf, cos_buf, sin_buf, n_heads, head_dim, start_pos, n_tokens);
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(dispatch_x, 1, 1);
     }
 
     /// Phase C3: packed-f16 RoPE. x_buf is packed; thread count halves
@@ -4343,19 +4555,34 @@ impl GpuEngine {
     }
 
     /// Phase C3 encoder-level wrapper for packed bias_add.
+    /// Phase D (vram-heap): `a_buf` is `BindingResource` so the
+    /// in-place RW target (a PolarBlockScratch projection field) binds
+    /// at its sub-range. Bind group inlined; the `_in_pass` variant
+    /// still serves the f32 path.
     pub fn dispatch_bias_add_packed_into(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        a_buf: &wgpu::Buffer,
+        a_buf: wgpu::BindingResource<'_>,
         bias_buf: &wgpu::Buffer,
         n: usize,
         n_tokens: usize,
     ) {
+        let params = AddInplaceBatchParams { n: n as u32, n_tokens: n_tokens as u32 };
+        let params_buf = self.gpu.create_params_buffer(&params);
+        let pipeline = &self.gpu.pipelines.bias_add_batch_packed;
+        let bind = self.gpu.make_bind_group_with(
+            pipeline,
+            vec![a_buf, bias_buf.as_entire_binding(), params_buf.as_entire_binding()],
+        );
+        let total_slots = (n * n_tokens / 2) as u32;
+        let groups = (total_slots + 255) / 256;
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("gpu_engine.bias_add_packed.pass"),
             timestamp_writes: None,
         });
-        self.dispatch_bias_add_packed_in_pass(&mut pass, a_buf, bias_buf, n, n_tokens);
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(groups, 1, 1);
     }
 
     /// Phase C3: packed-`a` variant of bias_add. Bias buffer stays f32.
@@ -4428,7 +4655,7 @@ impl GpuEngine {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         a_buf: wgpu::BindingResource<'_>,
-        b_buf: &wgpu::Buffer,
+        b_buf: wgpu::BindingResource<'_>,
         n: usize,
         n_tokens: usize,
     ) {
@@ -4437,7 +4664,7 @@ impl GpuEngine {
         let pipeline = &self.gpu.pipelines.add_inplace_batch_packed;
         let bind = self.gpu.make_bind_group_with(
             pipeline,
-            vec![a_buf, b_buf.as_entire_binding(), params_buf.as_entire_binding()],
+            vec![a_buf, b_buf, params_buf.as_entire_binding()],
         );
         let total = (n * n_tokens / 2) as u32;
         let groups = (total + 255) / 256;

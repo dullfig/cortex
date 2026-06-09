@@ -395,8 +395,8 @@ impl GpuPolarKvCache {
                 &mut encoder,
                 self,
                 layer,
-                f32_cache.k_layer(layer),
-                f32_cache.v_layer(layer),
+                f32_cache.k_layer(layer).as_entire_binding(),
+                f32_cache.v_layer(layer).as_entire_binding(),
                 n_tokens,
                 /*start_pos*/ 0,
             );
@@ -408,7 +408,7 @@ impl GpuPolarKvCache {
                 &mut encoder,
                 self,
                 layer,
-                f32_cache.k_layer(layer),
+                f32_cache.k_layer(layer).as_entire_binding(),
                 n_tokens,
                 /*start_pos*/ 0,
             );
