@@ -26,10 +26,16 @@ struct MatvecParams {
 }
 
 /// A float linear layer with weights resident on the GPU.
+///
+/// Phase G (vram-heap): the resident weights are a static
+/// sub-allocation of `gpu.weights_heap`. RAII drop is a no-op for
+/// static allocations; the heap reclaims the underlying GPU memory
+/// only when the heap itself drops (process exit).
 pub struct GpuFloatLinear {
     gpu: Arc<GpuDevice>,
-    /// Resident f16-packed weights (out_features × in_features / 2 u32s).
-    weight_buf: wgpu::Buffer,
+    /// Resident f16-packed weights (out_features × in_features / 2 u32s),
+    /// sub-allocated on `gpu.weights_heap` via `allocate_static`.
+    weight_buf: ::vram_heap::VramAllocation,
     rows: usize,
     cols: usize,
 }
@@ -48,17 +54,12 @@ impl GpuFloatLinear {
         let packed = GpuDevice::pack_f16(tensor.data());
         let bytes = bytemuck::cast_slice(&packed);
 
-        // Use create_buffer + queue.write_buffer (persistent staging belt)
-        // instead of create_buffer_init (per-call staging buffer create/drop).
-        // The latter, called ~252 times during Qwen 3B load, churns enough
-        // staging buffers to confuse wgpu's validator (#16 stale-ID bug).
-        let weight_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("gpu_floatlinear.weights"),
-            size: bytes.len() as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        gpu.queue.write_buffer(&weight_buf, 0, bytes);
+        let weight_buf = gpu.weights_heap.allocate_static(
+            bytes.len() as u64,
+            ::vram_heap::STORAGE_BUFFER_OFFSET_ALIGNMENT_NVIDIA,
+            "gpu_floatlinear.weights",
+        ).expect("weights_heap capacity for GpuFloatLinear weights");
+        weight_buf.write(&gpu.queue, bytes);
 
         Self { gpu, weight_buf, rows, cols }
     }
@@ -93,9 +94,14 @@ impl LinearLayer for GpuFloatLinear {
         let params_buf = self.gpu.create_params_buffer(&params);
 
         let pipeline = &self.gpu.pipelines.matvec;
-        let bind_group = self.gpu.make_bind_group(
+        let bind_group = self.gpu.make_bind_group_with(
             pipeline,
-            &[&self.weight_buf, &act_buf, &output_buf, &params_buf],
+            vec![
+                self.weight_buf.binding(),
+                act_buf.as_entire_binding(),
+                output_buf.as_entire_binding(),
+                params_buf.as_entire_binding(),
+            ],
         );
 
         // The matvec shader computes row from `wid.x + wid.y * 65535`, so rows
@@ -143,8 +149,9 @@ impl LinearLayer for GpuFloatLinear {
 }
 
 impl GpuFloatLinear {
-    /// Borrow the resident f16-packed weight buffer.
-    pub fn weight_buffer(&self) -> &wgpu::Buffer { &self.weight_buf }
+    /// Borrow the resident f16-packed weight buffer (sub-allocation on
+    /// `gpu.weights_heap`).
+    pub fn weight_buffer(&self) -> &::vram_heap::VramAllocation { &self.weight_buf }
 
     /// Shared GPU device handle.
     pub fn gpu(&self) -> &Arc<GpuDevice> { &self.gpu }

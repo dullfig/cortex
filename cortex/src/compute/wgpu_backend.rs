@@ -477,6 +477,14 @@ pub struct GpuDevice {
     /// Lane-C device-local heap. Holds
     /// `PolarBlockScratch::{q, k, v, projected}`.
     pub transient_heap_c: Arc<::vram_heap::VramHeap>,
+    /// Static weights heap (Phase G). Holds every never-freed
+    /// allocation: GpuFloatLinear weights, GpuBlock norm + bias
+    /// weights, RoPE cos/sin tables, LM head weights, final norm
+    /// weight. All allocations made via `allocate_static` so heap
+    /// drop emits no leak warning at process exit. Default capacity
+    /// 7 GB (covers Qwen 3B's ~6 GB at packed f16 with slack);
+    /// tunable via CORTEX_VRAM_HEAP_WEIGHTS_MB.
+    pub weights_heap: Arc<::vram_heap::VramHeap>,
     /// Host-visible readback heap. Use for staging buffers that
     /// receive `copy_buffer_to_buffer` destinations and then get
     /// host-mapped for read. Capture-staging buffers in retrieval
@@ -587,6 +595,13 @@ impl GpuDevice {
             .ok().and_then(|s| s.parse().ok()).unwrap_or(128);
         let heap_c_mb: u64 = std::env::var("CORTEX_VRAM_HEAP_C_MB")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(128);
+        // Phase G: static weights heap sized for Qwen 3B-class models
+        // (~6 GB at packed f16) with ~1 GB slack. Set to 0 (or smaller)
+        // for TinyLlama / smaller models; the loader will OOM with a
+        // clear "polar_kv const_heap capacity"-style message naming
+        // the field that overflowed.
+        let heap_weights_mb: u64 = std::env::var("CORTEX_VRAM_HEAP_WEIGHTS_MB")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(7168);
         let heap_readback_mb: u64 = std::env::var("CORTEX_VRAM_HEAP_READBACK_MB")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(256);
         let transient_heap_a = ::vram_heap::VramHeap::new(
@@ -607,6 +622,12 @@ impl GpuDevice {
             heap_c_mb * 1024 * 1024,
             "cortex.transient.c",
         ).expect("vram-heap C construction failed");
+        let weights_heap = ::vram_heap::VramHeap::new(
+            &device,
+            ::vram_heap::MemoryTier::DeviceLocal,
+            heap_weights_mb * 1024 * 1024,
+            "cortex.weights",
+        ).expect("vram-heap weights construction failed");
         let host_readback_heap = ::vram_heap::VramHeap::new(
             &device,
             ::vram_heap::MemoryTier::HostReadback,
@@ -616,7 +637,7 @@ impl GpuDevice {
 
         Some(Self {
             device, queue, pipelines, params_pool,
-            transient_heap_a, transient_heap_b, transient_heap_c, host_readback_heap,
+            transient_heap_a, transient_heap_b, transient_heap_c, weights_heap, host_readback_heap,
         })
     }
 

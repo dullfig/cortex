@@ -147,15 +147,18 @@ struct ArgmaxVocabParams {
 /// Resident LM-head weights for the GPU greedy decode path.
 ///
 /// Materialized once at engine init from whichever `OutputProjection`
-/// variant the loader produced. For `Linear(GpuFloatLinear)` (the common
-/// case when GPU is available) the buffer is cloned from the existing
-/// layer's resident weights — `wgpu::Buffer` is internally `Arc`-wrapped
-/// so no GPU memory is duplicated. For `Float`/`TiedEmbedding` we pack
-/// the f32 weights to f16 and upload a fresh buffer. `None` if the
-/// projection isn't a shape the GPU shader can handle (odd in_features
-/// can't be packed, etc.) — the caller falls through to the CPU path.
+/// variant the loader produced. All three paths (Linear, Float,
+/// TiedEmbedding) allocate fresh on `gpu.weights_heap` via
+/// `allocate_static` and upload the packed-f16 weights. The Linear
+/// case used to clone the existing wgpu::Buffer via Arc-counting;
+/// post-Phase G it `copy_buffer_to_buffer`s from the source allocation
+/// to the new one (~590 MB extra weights_heap for Linear-output
+/// models; Qwen uses TiedEmbedding so isn't affected). `None` if the
+/// projection isn't a shape the GPU shader can handle (odd
+/// in_features can't be packed, etc.) — the caller falls through to
+/// the CPU path.
 pub(crate) struct LmHead {
-    pub(crate) weight_buf: wgpu::Buffer,
+    pub(crate) weight_buf: ::vram_heap::VramAllocation,
     pub(crate) vocab_size: usize,
     pub(crate) embed_dim: usize,
 }
@@ -166,23 +169,14 @@ pub(crate) struct LmHead {
 /// (they live inside `Box<dyn LinearLayer>` and are reached via
 /// `as_any().downcast_ref::<GpuFloatLinear>()`).
 struct GpuBlock {
-    attn_norm_weight_buf: wgpu::Buffer,
+    attn_norm_weight_buf: ::vram_heap::VramAllocation,
     attn_norm_eps: f32,
-    ffn_norm_weight_buf: wgpu::Buffer,
+    ffn_norm_weight_buf: ::vram_heap::VramAllocation,
     ffn_norm_eps: f32,
     /// Optional Q/K/V biases (Qwen2 family). None for most LLaMA-style models.
-    q_bias_buf: Option<wgpu::Buffer>,
-    k_bias_buf: Option<wgpu::Buffer>,
-    v_bias_buf: Option<wgpu::Buffer>,
-    /// BitNet b1.58 attention sub-norm: RMSNorm applied to the attention
-    /// output BEFORE `o_proj`. None for non-BitNet models. `attn.o_sub_norm()`
-    /// supplies the source weight + eps when present.
-    o_sub_norm_weight_buf: Option<wgpu::Buffer>,
-    o_sub_norm_eps: f32,
-    /// BitNet b1.58 FFN sub-norm: RMSNorm applied to `silu(gate) * up`
-    /// BEFORE `down_proj`. None for non-BitNet SwiGLU.
-    ffn_sub_norm_weight_buf: Option<wgpu::Buffer>,
-    ffn_sub_norm_eps: f32,
+    q_bias_buf: Option<::vram_heap::VramAllocation>,
+    k_bias_buf: Option<::vram_heap::VramAllocation>,
+    v_bias_buf: Option<::vram_heap::VramAllocation>,
 }
 
 /// Per-block scratch buffers reused across all dispatches inside a single
@@ -391,8 +385,9 @@ pub struct GpuEngine {
     /// Shared GPU context (device, queue, pipelines). Same `Arc` already
     /// held by the resident layers inside `cpu` — no double allocation.
     gpu: Arc<GpuDevice>,
-    /// Resident f32 weights for the final RMSNorm.
-    final_norm_weight_buf: wgpu::Buffer,
+    /// Resident f32 weights for the final RMSNorm (Phase G: static
+    /// allocation on `gpu.weights_heap`).
+    final_norm_weight_buf: ::vram_heap::VramAllocation,
     /// Captured at construction time so the dispatcher doesn't have to
     /// re-borrow the CPU model on every call.
     final_norm_eps: f32,
@@ -401,9 +396,10 @@ pub struct GpuEngine {
     /// Per-block resident resources.
     blocks_gpu: Vec<GpuBlock>,
     /// Resident RoPE cos lookup table, sized to `rope_max_seq * (head_dim/2)`.
-    rope_cos_buf: wgpu::Buffer,
+    /// Phase G: static allocation on `gpu.weights_heap`.
+    rope_cos_buf: ::vram_heap::VramAllocation,
     /// Resident RoPE sin lookup table, same shape as `rope_cos_buf`.
-    rope_sin_buf: wgpu::Buffer,
+    rope_sin_buf: ::vram_heap::VramAllocation,
     /// Maximum sequence length the rope tables cover. Forward calls with
     /// `start_pos + n_tokens > rope_max_seq` would index out of range, so
     /// they assert.
@@ -460,65 +456,56 @@ impl GpuEngine {
     /// Wrap a CPU `TransformerModel` with a shared GPU context, sizing the
     /// RoPE cos/sin lookup tables to `max_seq` positions.
     pub fn with_max_seq(cpu: TransformerModel, gpu: Arc<GpuDevice>, max_seq: usize) -> Self {
+        // Phase G: all static weight buffers (final norm + per-block norms +
+        // optional biases + RoPE + LM head) allocate from gpu.weights_heap
+        // via allocate_static. Heap drop at process exit emits no leak
+        // warning. Helper closures wrap the alloc + write pattern.
+        let align = ::vram_heap::STORAGE_BUFFER_OFFSET_ALIGNMENT_NVIDIA;
+        let upload_static = |bytes: &[u8], label: &str| -> ::vram_heap::VramAllocation {
+            let alloc = gpu.weights_heap.allocate_static(
+                bytes.len() as u64, align, label,
+            ).expect("weights_heap capacity");
+            alloc.write(&gpu.queue, bytes);
+            alloc
+        };
+
         // Final norm
         let final_norm = cpu.final_norm();
-        let final_norm_weight_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("gpu_engine.final_norm.weight"),
-            contents: bytemuck::cast_slice(final_norm.weight()),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+        let final_norm_weight_buf = upload_static(
+            bytemuck::cast_slice(final_norm.weight()),
+            "gpu_engine.final_norm.weight",
+        );
         let final_norm_eps = final_norm.eps();
         let embed_dim = cpu.embed_dim();
 
         // Per-block norms + optional Q/K/V biases (Qwen2)
-        let upload_bias = |bias: &[f32], i: usize, name: &str| -> wgpu::Buffer {
-            gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(&format!("gpu_engine.block{i}.{name}_bias")),
-                contents: bytemuck::cast_slice(bias),
-                usage: wgpu::BufferUsages::STORAGE,
-            })
-        };
         let blocks_gpu: Vec<GpuBlock> = cpu.blocks().iter().enumerate().map(|(i, blk)| {
             let an = blk.attn_norm();
             let fn_ = blk.ffn_norm();
             let attn = blk.attention();
-            let swiglu_opt = blk.ffn().as_any()
-                .downcast_ref::<crate::layers::swiglu::SwiGLU>();
-            let upload_norm = |w: &[f32], label: String| -> wgpu::Buffer {
-                gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some(&label),
-                    contents: bytemuck::cast_slice(w),
-                    usage: wgpu::BufferUsages::STORAGE,
-                })
-            };
-            let (o_sub_norm_buf, o_sub_norm_eps) = match attn.o_sub_norm() {
-                Some(n) => (Some(upload_norm(n.weight(), format!("gpu_engine.block{i}.o_sub_norm.weight"))), n.eps()),
-                None => (None, 0.0),
-            };
-            let (ffn_sub_norm_buf, ffn_sub_norm_eps) = match swiglu_opt.and_then(|s| s.sub_norm()) {
-                Some(n) => (Some(upload_norm(n.weight(), format!("gpu_engine.block{i}.ffn_sub_norm.weight"))), n.eps()),
-                None => (None, 0.0),
-            };
             GpuBlock {
-                attn_norm_weight_buf: gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some(&format!("gpu_engine.block{i}.attn_norm.weight")),
-                    contents: bytemuck::cast_slice(an.weight()),
-                    usage: wgpu::BufferUsages::STORAGE,
-                }),
+                attn_norm_weight_buf: upload_static(
+                    bytemuck::cast_slice(an.weight()),
+                    &format!("gpu_engine.block{i}.attn_norm.weight"),
+                ),
                 attn_norm_eps: an.eps(),
-                ffn_norm_weight_buf: gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some(&format!("gpu_engine.block{i}.ffn_norm.weight")),
-                    contents: bytemuck::cast_slice(fn_.weight()),
-                    usage: wgpu::BufferUsages::STORAGE,
-                }),
+                ffn_norm_weight_buf: upload_static(
+                    bytemuck::cast_slice(fn_.weight()),
+                    &format!("gpu_engine.block{i}.ffn_norm.weight"),
+                ),
                 ffn_norm_eps: fn_.eps(),
-                q_bias_buf: attn.q_bias().map(|b| upload_bias(b, i, "q")),
-                k_bias_buf: attn.k_bias().map(|b| upload_bias(b, i, "k")),
-                v_bias_buf: attn.v_bias().map(|b| upload_bias(b, i, "v")),
-                o_sub_norm_weight_buf: o_sub_norm_buf,
-                o_sub_norm_eps,
-                ffn_sub_norm_weight_buf: ffn_sub_norm_buf,
-                ffn_sub_norm_eps,
+                q_bias_buf: attn.q_bias().map(|b| upload_static(
+                    bytemuck::cast_slice(b),
+                    &format!("gpu_engine.block{i}.q_bias"),
+                )),
+                k_bias_buf: attn.k_bias().map(|b| upload_static(
+                    bytemuck::cast_slice(b),
+                    &format!("gpu_engine.block{i}.k_bias"),
+                )),
+                v_bias_buf: attn.v_bias().map(|b| upload_static(
+                    bytemuck::cast_slice(b),
+                    &format!("gpu_engine.block{i}.v_bias"),
+                )),
             }
         }).collect();
 
@@ -583,28 +570,44 @@ impl GpuEngine {
                     layer
                         .as_any()
                         .downcast_ref::<crate::layers::gpu_floatlinear::GpuFloatLinear>()
-                        .map(|gpu_layer| LmHead {
-                            weight_buf: gpu_layer.weight_buffer().clone(),
-                            vocab_size,
-                            embed_dim,
+                        .map(|gpu_layer| {
+                            // Phase G: allocate fresh on weights_heap and copy
+                            // from the GpuFloatLinear's existing allocation.
+                            // The Arc-cloned wgpu::Buffer trick used pre-Phase-G
+                            // doesn't work with VramAllocation (not Clone).
+                            let src = gpu_layer.weight_buffer();
+                            let alloc = gpu.weights_heap.allocate_static(
+                                src.size(),
+                                ::vram_heap::STORAGE_BUFFER_OFFSET_ALIGNMENT_NVIDIA,
+                                "gpu_engine.lm_head.linear",
+                            ).expect("weights_heap capacity for LM head (Linear)");
+                            // Copy src → alloc via a one-shot command buffer.
+                            let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("gpu_engine.lm_head.copy"),
+                            });
+                            enc.copy_buffer_to_buffer(
+                                src.buffer(), src.offset(),
+                                alloc.buffer(), alloc.offset(),
+                                src.size(),
+                            );
+                            gpu.queue.submit(Some(enc.finish()));
+                            LmHead { weight_buf: alloc, vocab_size, embed_dim }
                         })
                 }
                 crate::layers::model::OutputProjection::Float(tensor) => {
                     let packed = GpuDevice::pack_f16(tensor.data());
-                    let buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("gpu_engine.lm_head.float"),
-                        contents: bytemuck::cast_slice(&packed),
-                        usage: wgpu::BufferUsages::STORAGE,
-                    });
+                    let buf = upload_static(
+                        bytemuck::cast_slice(&packed),
+                        "gpu_engine.lm_head.float",
+                    );
                     Some(LmHead { weight_buf: buf, vocab_size, embed_dim })
                 }
                 crate::layers::model::OutputProjection::TiedEmbedding => {
                     let packed = GpuDevice::pack_f16(cpu.embedding_data());
-                    let buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("gpu_engine.lm_head.tied"),
-                        contents: bytemuck::cast_slice(&packed),
-                        usage: wgpu::BufferUsages::STORAGE,
-                    });
+                    let buf = upload_static(
+                        bytemuck::cast_slice(&packed),
+                        "gpu_engine.lm_head.tied",
+                    );
                     Some(LmHead { weight_buf: buf, vocab_size, embed_dim })
                 }
             }
@@ -677,11 +680,13 @@ impl GpuEngine {
     /// dispatches into a single pass (saves ~0.8ms of Vulkan
     /// pipeline-barrier overhead per dispatch), use
     /// `dispatch_rmsnorm_in_pass`.
+    /// Phase G (vram-heap): `weight_buf` is `BindingResource` so
+    /// static weights on `gpu.weights_heap` bind at sub-ranges.
     pub fn dispatch_rmsnorm_into(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         in_buf: &wgpu::Buffer,
-        weight_buf: &wgpu::Buffer,
+        weight_buf: wgpu::BindingResource<'_>,
         out_buf: &wgpu::Buffer,
         n: usize,
         n_tokens: usize,
@@ -707,7 +712,7 @@ impl GpuEngine {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         in_buf: wgpu::BindingResource<'_>,
-        weight_buf: &wgpu::Buffer,
+        weight_buf: wgpu::BindingResource<'_>,
         out_buf: wgpu::BindingResource<'_>,
         n: usize,
         n_tokens: usize,
@@ -722,7 +727,7 @@ impl GpuEngine {
             pipeline,
             vec![
                 in_buf,
-                weight_buf.as_entire_binding(),
+                weight_buf,
                 out_buf,
                 params_buf.as_entire_binding(),
             ],
@@ -741,7 +746,7 @@ impl GpuEngine {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         in_buf: &wgpu::Buffer,
-        weight_buf: &wgpu::Buffer,
+        weight_buf: wgpu::BindingResource<'_>,
         out_buf: &wgpu::Buffer,
         n: usize,
         n_tokens: usize,
@@ -762,7 +767,7 @@ impl GpuEngine {
         &self,
         pass: &mut wgpu::ComputePass<'_>,
         in_buf: &wgpu::Buffer,
-        weight_buf: &wgpu::Buffer,
+        weight_buf: wgpu::BindingResource<'_>,
         out_buf: &wgpu::Buffer,
         n: usize,
         n_tokens: usize,
@@ -773,8 +778,14 @@ impl GpuEngine {
         };
         let params_buf = self.gpu.create_params_buffer(&params);
         let pipeline = &self.gpu.pipelines.rmsnorm_batch;
-        let bind = self.gpu.make_bind_group(
-            pipeline, &[in_buf, weight_buf, out_buf, &params_buf],
+        let bind = self.gpu.make_bind_group_with(
+            pipeline,
+            vec![
+                in_buf.as_entire_binding(),
+                weight_buf,
+                out_buf.as_entire_binding(),
+                params_buf.as_entire_binding(),
+            ],
         );
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind, &[]);
@@ -789,7 +800,7 @@ impl GpuEngine {
         &self,
         pass: &mut wgpu::ComputePass<'_>,
         in_buf: &wgpu::Buffer,
-        weight_buf: &wgpu::Buffer,
+        weight_buf: wgpu::BindingResource<'_>,
         out_buf: &wgpu::Buffer,
         n: usize,
         n_tokens: usize,
@@ -800,8 +811,14 @@ impl GpuEngine {
         };
         let params_buf = self.gpu.create_params_buffer(&params);
         let pipeline = &self.gpu.pipelines.rmsnorm_batch_packed_to_f32;
-        let bind = self.gpu.make_bind_group(
-            pipeline, &[in_buf, weight_buf, out_buf, &params_buf],
+        let bind = self.gpu.make_bind_group_with(
+            pipeline,
+            vec![
+                in_buf.as_entire_binding(),
+                weight_buf,
+                out_buf.as_entire_binding(),
+                params_buf.as_entire_binding(),
+            ],
         );
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind, &[]);
@@ -815,7 +832,7 @@ impl GpuEngine {
         &self,
         pass: &mut wgpu::ComputePass<'_>,
         in_buf: &wgpu::Buffer,
-        weight_buf: &wgpu::Buffer,
+        weight_buf: wgpu::BindingResource<'_>,
         out_buf: &wgpu::Buffer,
         n: usize,
         n_tokens: usize,
@@ -826,8 +843,14 @@ impl GpuEngine {
         };
         let params_buf = self.gpu.create_params_buffer(&params);
         let pipeline = &self.gpu.pipelines.rmsnorm_batch_f32_to_packed;
-        let bind = self.gpu.make_bind_group(
-            pipeline, &[in_buf, weight_buf, out_buf, &params_buf],
+        let bind = self.gpu.make_bind_group_with(
+            pipeline,
+            vec![
+                in_buf.as_entire_binding(),
+                weight_buf,
+                out_buf.as_entire_binding(),
+                params_buf.as_entire_binding(),
+            ],
         );
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind, &[]);
@@ -841,7 +864,7 @@ impl GpuEngine {
         &self,
         pass: &mut wgpu::ComputePass<'_>,
         in_buf: &wgpu::Buffer,
-        weight_buf: &wgpu::Buffer,
+        weight_buf: wgpu::BindingResource<'_>,
         out_buf: &wgpu::Buffer,
         n: usize,
         n_tokens: usize,
@@ -852,8 +875,14 @@ impl GpuEngine {
         };
         let params_buf = self.gpu.create_params_buffer(&params);
         let pipeline = &self.gpu.pipelines.rmsnorm_batch_packed_to_packed;
-        let bind = self.gpu.make_bind_group(
-            pipeline, &[in_buf, weight_buf, out_buf, &params_buf],
+        let bind = self.gpu.make_bind_group_with(
+            pipeline,
+            vec![
+                in_buf.as_entire_binding(),
+                weight_buf,
+                out_buf.as_entire_binding(),
+                params_buf.as_entire_binding(),
+            ],
         );
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind, &[]);
@@ -943,9 +972,14 @@ impl GpuEngine {
         let params_buf = self.gpu.create_params_buffer(&params);
 
         let pipeline = &self.gpu.pipelines.matmul_shared_pin_fout;
-        let bind = self.gpu.make_bind_group(
+        let bind = self.gpu.make_bind_group_with(
             pipeline,
-            &[float.weight_buffer(), in_buf, out_buf, &params_buf],
+            vec![
+                float.weight_buffer().binding(),
+                in_buf.as_entire_binding(),
+                out_buf.as_entire_binding(),
+                params_buf.as_entire_binding(),
+            ],
         );
 
         let rows = float.out_features();
@@ -979,9 +1013,14 @@ impl GpuEngine {
         let params_buf = self.gpu.create_params_buffer(&params);
 
         let pipeline = &self.gpu.pipelines.matmul_shared;
-        let bind = self.gpu.make_bind_group(
+        let bind = self.gpu.make_bind_group_with(
             pipeline,
-            &[float.weight_buffer(), in_buf, out_buf, &params_buf],
+            vec![
+                float.weight_buffer().binding(),
+                in_buf.as_entire_binding(),
+                out_buf.as_entire_binding(),
+                params_buf.as_entire_binding(),
+            ],
         );
 
         // workgroup_id.x = row tile (one per TILE_M=32 output rows;
@@ -1046,15 +1085,15 @@ impl GpuEngine {
         let params_buf = self.gpu.create_params_buffer(&params);
 
         let pipeline = &self.gpu.pipelines.matmul_gate_up_shared;
-        let bind = self.gpu.make_bind_group(
+        let bind = self.gpu.make_bind_group_with(
             pipeline,
-            &[
-                gate_float.weight_buffer(),
-                up_float.weight_buffer(),
-                in_buf,
-                gate_out,
-                up_out,
-                &params_buf,
+            vec![
+                gate_float.weight_buffer().binding(),
+                up_float.weight_buffer().binding(),
+                in_buf.as_entire_binding(),
+                gate_out.as_entire_binding(),
+                up_out.as_entire_binding(),
+                params_buf.as_entire_binding(),
             ],
         );
 
@@ -1093,9 +1132,14 @@ impl GpuEngine {
         let params_buf = self.gpu.create_params_buffer(&params);
 
         let pipeline = &self.gpu.pipelines.matmul_pin;
-        let bind = self.gpu.make_bind_group(
+        let bind = self.gpu.make_bind_group_with(
             pipeline,
-            &[float.weight_buffer(), in_buf, out_buf, &params_buf],
+            vec![
+                float.weight_buffer().binding(),
+                in_buf.as_entire_binding(),
+                out_buf.as_entire_binding(),
+                params_buf.as_entire_binding(),
+            ],
         );
 
         let rows = float.out_features();
@@ -1131,9 +1175,14 @@ impl GpuEngine {
         let params_buf = self.gpu.create_params_buffer(&params);
 
         let pipeline = &self.gpu.pipelines.matmul_shared_pin_pout;
-        let bind = self.gpu.make_bind_group(
+        let bind = self.gpu.make_bind_group_with(
             pipeline,
-            &[float.weight_buffer(), in_buf, out_buf, &params_buf],
+            vec![
+                float.weight_buffer().binding(),
+                in_buf.as_entire_binding(),
+                out_buf.as_entire_binding(),
+                params_buf.as_entire_binding(),
+            ],
         );
 
         let rows = float.out_features();
@@ -1170,9 +1219,14 @@ impl GpuEngine {
         let params_buf = self.gpu.create_params_buffer(&params);
 
         let pipeline = &self.gpu.pipelines.matmul_pin_pout;
-        let bind = self.gpu.make_bind_group(
+        let bind = self.gpu.make_bind_group_with(
             pipeline,
-            &[float.weight_buffer(), in_buf, out_buf, &params_buf],
+            vec![
+                float.weight_buffer().binding(),
+                in_buf.as_entire_binding(),
+                out_buf.as_entire_binding(),
+                params_buf.as_entire_binding(),
+            ],
         );
 
         let row_pairs = (float.out_features() + 1) / 2;
@@ -1259,9 +1313,14 @@ impl GpuEngine {
         let params_buf = self.gpu.create_params_buffer(&params);
 
         let pipeline = &self.gpu.pipelines.matmul;
-        let bind = self.gpu.make_bind_group(
+        let bind = self.gpu.make_bind_group_with(
             pipeline,
-            &[float.weight_buffer(), in_buf, out_buf, &params_buf],
+            vec![
+                float.weight_buffer().binding(),
+                in_buf.as_entire_binding(),
+                out_buf.as_entire_binding(),
+                params_buf.as_entire_binding(),
+            ],
         );
 
         let rows = float.out_features();
@@ -1337,7 +1396,7 @@ impl GpuEngine {
             let bind = self.gpu.make_bind_group_with(
                 pipeline,
                 vec![
-                    float.weight_buffer().as_entire_binding(),
+                    float.weight_buffer().binding(),
                     in_packed_buf,
                     out_packed_buf,
                     params_buf.as_entire_binding(),
@@ -1356,7 +1415,7 @@ impl GpuEngine {
             let bind = self.gpu.make_bind_group_with(
                 pipeline,
                 vec![
-                    float.weight_buffer().as_entire_binding(),
+                    float.weight_buffer().binding(),
                     in_packed_buf,
                     out_packed_buf,
                     params_buf.as_entire_binding(),
@@ -1478,9 +1537,14 @@ impl GpuEngine {
         let params_buf = self.gpu.create_params_buffer(&params);
 
         let pipeline = &self.gpu.pipelines.rmsnorm_batch;
-        let bind_group = self.gpu.make_bind_group(
+        let bind_group = self.gpu.make_bind_group_with(
             pipeline,
-            &[&input_buf, &self.final_norm_weight_buf, &output_buf, &params_buf],
+            vec![
+                input_buf.as_entire_binding(),
+                self.final_norm_weight_buf.binding(),
+                output_buf.as_entire_binding(),
+                params_buf.as_entire_binding(),
+            ],
         );
 
         let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1647,7 +1711,7 @@ impl GpuEngine {
             self.forward_block_gpu_inner(&mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch, capture, None, None, None);
         }
         self.dispatch_rmsnorm_into(
-            &mut encoder, &hidden_buf, &self.final_norm_weight_buf, &normed_buf,
+            &mut encoder, &hidden_buf, self.final_norm_weight_buf.binding(), &normed_buf,
             self.embed_dim, n_tokens, self.final_norm_eps,
         );
         encoder.copy_buffer_to_buffer(&normed_buf, 0, &normed_staging, 0, bytes);
@@ -1802,7 +1866,7 @@ impl GpuEngine {
         }
         // Final RMSNorm — gives the final post-norm hidden state shims read.
         self.dispatch_rmsnorm_into(
-            &mut encoder, &hidden_buf, &self.final_norm_weight_buf, &normed_buf,
+            &mut encoder, &hidden_buf, self.final_norm_weight_buf.binding(), &normed_buf,
             self.embed_dim, n_tokens, self.final_norm_eps,
         );
         encoder.copy_buffer_to_buffer(&normed_buf, 0, &normed_staging, 0, hidden_bytes);
@@ -2708,7 +2772,7 @@ impl GpuEngine {
         {
             let mut pass = self.begin_timed_pass(&mut encoder, "final_norm");
             self.dispatch_rmsnorm_packed_to_packed_in_pass(
-                &mut pass, &hidden_buf, &self.final_norm_weight_buf, &normed_buf,
+                &mut pass, &hidden_buf, self.final_norm_weight_buf.binding(), &normed_buf,
                 self.embed_dim, n_tokens, self.final_norm_eps,
             );
         }
@@ -2906,9 +2970,14 @@ impl GpuEngine {
         };
         let params_buf = self.gpu.create_params_buffer(&params);
         let pipeline = &self.gpu.pipelines.matmul_pin;
-        let bind = self.gpu.make_bind_group(
+        let bind = self.gpu.make_bind_group_with(
             pipeline,
-            &[&lm_head.weight_buf, in_packed_buf, out_buf, &params_buf],
+            vec![
+                lm_head.weight_buf.binding(),
+                in_packed_buf.as_entire_binding(),
+                out_buf.as_entire_binding(),
+                params_buf.as_entire_binding(),
+            ],
         );
         // matmul_pin uses (wid.x + wid.y * 65535) row indexing — Qwen
         // 151k vocab requires dy = 3.
@@ -3069,7 +3138,7 @@ impl GpuEngine {
                 timestamp_writes: None,
             });
             self.dispatch_rmsnorm_packed_to_packed_in_pass(
-                &mut pass, &hidden_buf, &self.final_norm_weight_buf, &normed_buf,
+                &mut pass, &hidden_buf, self.final_norm_weight_buf.binding(), &normed_buf,
                 self.embed_dim, n_tokens, self.final_norm_eps,
             );
         }
@@ -3287,7 +3356,7 @@ impl GpuEngine {
         // _in_pass variant (still takes &wgpu::Buffer for non-polar
         // callers).
         self.dispatch_rmsnorm_packed_to_packed_into(
-            &mut encoder, hidden_buf.binding(), &self.final_norm_weight_buf, normed_buf.as_entire_binding(),
+            &mut encoder, hidden_buf.binding(), self.final_norm_weight_buf.binding(), normed_buf.as_entire_binding(),
             self.embed_dim, n_tokens, self.final_norm_eps,
         );
 
@@ -3438,7 +3507,7 @@ impl GpuEngine {
             });
             // C3: hidden packed, normed packed.
             self.dispatch_rmsnorm_packed_to_packed_in_pass(
-                &mut pass, &hidden_buf, &self.final_norm_weight_buf, &normed_buf,
+                &mut pass, &hidden_buf, self.final_norm_weight_buf.binding(), &normed_buf,
                 self.embed_dim, n_tokens, self.final_norm_eps,
             );
         }
@@ -3585,7 +3654,7 @@ impl GpuEngine {
 
             // 1. attn_norm: hidden packed → normed packed.
             self.dispatch_rmsnorm_packed_to_packed_in_pass(
-                &mut pass, hidden_buf, &block_gpu.attn_norm_weight_buf, &scratch.normed,
+                &mut pass, hidden_buf, block_gpu.attn_norm_weight_buf.binding(), &scratch.normed,
                 embed_dim, n_tokens, block_gpu.attn_norm_eps,
             );
 
@@ -3594,24 +3663,24 @@ impl GpuEngine {
             // and RoPE use their packed variants.
             self.dispatch_linear_batch_packed_io_in_pass(&mut pass, attn.q_proj(), &scratch.normed, &scratch.q, n_tokens);
             if let Some(buf) = block_gpu.q_bias_buf.as_ref() {
-                self.dispatch_bias_add_packed_in_pass(&mut pass, &scratch.q, buf, q_dim, n_tokens);
+                self.dispatch_bias_add_packed_in_pass(&mut pass, &scratch.q, buf.binding(), q_dim, n_tokens);
             }
             self.dispatch_linear_batch_packed_io_in_pass(&mut pass, attn.k_proj(), &scratch.normed, &scratch.k, n_tokens);
             if let Some(buf) = block_gpu.k_bias_buf.as_ref() {
-                self.dispatch_bias_add_packed_in_pass(&mut pass, &scratch.k, buf, kv_dim, n_tokens);
+                self.dispatch_bias_add_packed_in_pass(&mut pass, &scratch.k, buf.binding(), kv_dim, n_tokens);
             }
             self.dispatch_linear_batch_packed_io_in_pass(&mut pass, attn.v_proj(), &scratch.normed, &scratch.v, n_tokens);
             if let Some(buf) = block_gpu.v_bias_buf.as_ref() {
-                self.dispatch_bias_add_packed_in_pass(&mut pass, &scratch.v, buf, kv_dim, n_tokens);
+                self.dispatch_bias_add_packed_in_pass(&mut pass, &scratch.v, buf.binding(), kv_dim, n_tokens);
             }
 
             // 5. RoPE on Q and K (in-place packed).
             self.dispatch_rope_packed_in_pass(
-                &mut pass, &scratch.q, &self.rope_cos_buf, &self.rope_sin_buf,
+                &mut pass, &scratch.q, self.rope_cos_buf.binding(), self.rope_sin_buf.binding(),
                 n_heads, head_dim, start_pos, n_tokens,
             );
             self.dispatch_rope_packed_in_pass(
-                &mut pass, &scratch.k, &self.rope_cos_buf, &self.rope_sin_buf,
+                &mut pass, &scratch.k, self.rope_cos_buf.binding(), self.rope_sin_buf.binding(),
                 n_kv_heads, head_dim, start_pos, n_tokens,
             );
 
@@ -3669,7 +3738,7 @@ impl GpuEngine {
 
             // 9. ffn_norm: hidden packed → normed packed — C3.
             self.dispatch_rmsnorm_packed_to_packed_in_pass(
-                &mut pass, hidden_buf, &block_gpu.ffn_norm_weight_buf, &scratch.normed,
+                &mut pass, hidden_buf, block_gpu.ffn_norm_weight_buf.binding(), &scratch.normed,
                 embed_dim, n_tokens, block_gpu.ffn_norm_eps,
             );
 
@@ -3784,31 +3853,31 @@ impl GpuEngine {
 
         // 1. attn_norm — C3: hidden packed → normed packed.
         self.dispatch_rmsnorm_packed_to_packed_into(
-            encoder, hidden_buf.binding(), &block_gpu.attn_norm_weight_buf, scratch.normed.binding(),
+            encoder, hidden_buf.binding(), block_gpu.attn_norm_weight_buf.binding(), scratch.normed.binding(),
             embed_dim, n_tokens, block_gpu.attn_norm_eps,
         );
 
         // 2-4. Q, K, V projections — C3: packed input AND packed output.
         self.dispatch_linear_batch_packed_io_into(encoder, attn.q_proj(), scratch.normed.binding(), scratch.q.binding(), n_tokens);
         if let Some(buf) = block_gpu.q_bias_buf.as_ref() {
-            self.dispatch_bias_add_packed_into(encoder, scratch.q.binding(), buf, n_heads * head_dim, n_tokens);
+            self.dispatch_bias_add_packed_into(encoder, scratch.q.binding(), buf.binding(), n_heads * head_dim, n_tokens);
         }
         self.dispatch_linear_batch_packed_io_into(encoder, attn.k_proj(), scratch.normed.binding(), scratch.k.binding(), n_tokens);
         if let Some(buf) = block_gpu.k_bias_buf.as_ref() {
-            self.dispatch_bias_add_packed_into(encoder, scratch.k.binding(), buf, kv_dim, n_tokens);
+            self.dispatch_bias_add_packed_into(encoder, scratch.k.binding(), buf.binding(), kv_dim, n_tokens);
         }
         self.dispatch_linear_batch_packed_io_into(encoder, attn.v_proj(), scratch.normed.binding(), scratch.v.binding(), n_tokens);
         if let Some(buf) = block_gpu.v_bias_buf.as_ref() {
-            self.dispatch_bias_add_packed_into(encoder, scratch.v.binding(), buf, kv_dim, n_tokens);
+            self.dispatch_bias_add_packed_into(encoder, scratch.v.binding(), buf.binding(), kv_dim, n_tokens);
         }
 
         // 5. RoPE on Q and K — C3 packed (in-place).
         self.dispatch_rope_packed_into(
-            encoder, scratch.q.binding(), &self.rope_cos_buf, &self.rope_sin_buf,
+            encoder, scratch.q.binding(), self.rope_cos_buf.binding(), self.rope_sin_buf.binding(),
             n_heads, head_dim, start_pos, n_tokens,
         );
         self.dispatch_rope_packed_into(
-            encoder, scratch.k.binding(), &self.rope_cos_buf, &self.rope_sin_buf,
+            encoder, scratch.k.binding(), self.rope_cos_buf.binding(), self.rope_sin_buf.binding(),
             n_kv_heads, head_dim, start_pos, n_tokens,
         );
 
@@ -3926,7 +3995,7 @@ impl GpuEngine {
 
         // ffn_norm — C3: hidden packed → normed packed.
         self.dispatch_rmsnorm_packed_to_packed_into(
-            encoder, hidden_buf.binding(), &block_gpu.ffn_norm_weight_buf, scratch.normed.binding(),
+            encoder, hidden_buf.binding(), block_gpu.ffn_norm_weight_buf.binding(), scratch.normed.binding(),
             embed_dim, n_tokens, block_gpu.ffn_norm_eps,
         );
         // C2 polar: gate/up/activated packed; use packed-IO router.
@@ -3960,7 +4029,7 @@ impl GpuEngine {
         gpu: &GpuDevice,
         inv_freq: &[f32],
         max_seq: usize,
-    ) -> (wgpu::Buffer, wgpu::Buffer) {
+    ) -> (::vram_heap::VramAllocation, ::vram_heap::VramAllocation) {
         let half_dim = inv_freq.len();
         let mut cos = Vec::with_capacity(max_seq * half_dim);
         let mut sin = Vec::with_capacity(max_seq * half_dim);
@@ -3973,16 +4042,17 @@ impl GpuEngine {
             }
         }
 
-        let cos_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("gpu_engine.rope.cos"),
-            contents: bytemuck::cast_slice(&cos),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let sin_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("gpu_engine.rope.sin"),
-            contents: bytemuck::cast_slice(&sin),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+        let align = ::vram_heap::STORAGE_BUFFER_OFFSET_ALIGNMENT_NVIDIA;
+        let cos_bytes = bytemuck::cast_slice(&cos);
+        let sin_bytes = bytemuck::cast_slice(&sin);
+        let cos_buf = gpu.weights_heap.allocate_static(
+            cos_bytes.len() as u64, align, "gpu_engine.rope.cos",
+        ).expect("weights_heap capacity for RoPE cos");
+        cos_buf.write(&gpu.queue, cos_bytes);
+        let sin_buf = gpu.weights_heap.allocate_static(
+            sin_bytes.len() as u64, align, "gpu_engine.rope.sin",
+        ).expect("weights_heap capacity for RoPE sin");
+        sin_buf.write(&gpu.queue, sin_bytes);
         (cos_buf, sin_buf)
     }
 
@@ -3991,12 +4061,13 @@ impl GpuEngine {
     /// position `start_pos + t`. Halved (NeoX/HF) layout — Qwen and BitNet
     /// both use this; interleaved (older llama.cpp) is not supported by the
     /// shader yet.
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch_rope_into(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         x_buf: &wgpu::Buffer,
-        cos_buf: &wgpu::Buffer,
-        sin_buf: &wgpu::Buffer,
+        cos_buf: wgpu::BindingResource<'_>,
+        sin_buf: wgpu::BindingResource<'_>,
         n_heads: usize,
         head_dim: usize,
         start_pos: usize,
@@ -4015,8 +4086,8 @@ impl GpuEngine {
         &self,
         pass: &mut wgpu::ComputePass<'_>,
         x_buf: &wgpu::Buffer,
-        cos_buf: &wgpu::Buffer,
-        sin_buf: &wgpu::Buffer,
+        cos_buf: wgpu::BindingResource<'_>,
+        sin_buf: wgpu::BindingResource<'_>,
         n_heads: usize,
         head_dim: usize,
         start_pos: usize,
@@ -4036,9 +4107,14 @@ impl GpuEngine {
         let params_buf = self.gpu.create_params_buffer(&params);
 
         let pipeline = &self.gpu.pipelines.rope_batch;
-        let bind_group = self.gpu.make_bind_group(
+        let bind_group = self.gpu.make_bind_group_with(
             pipeline,
-            &[x_buf, cos_buf, sin_buf, &params_buf],
+            vec![
+                x_buf.as_entire_binding(),
+                cos_buf,
+                sin_buf,
+                params_buf.as_entire_binding(),
+            ],
         );
 
         let total_threads = (n_tokens * n_heads * half_dim) as u32;
@@ -4058,8 +4134,8 @@ impl GpuEngine {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         x_buf: wgpu::BindingResource<'_>,
-        cos_buf: &wgpu::Buffer,
-        sin_buf: &wgpu::Buffer,
+        cos_buf: wgpu::BindingResource<'_>,
+        sin_buf: wgpu::BindingResource<'_>,
         n_heads: usize,
         head_dim: usize,
         start_pos: usize,
@@ -4083,8 +4159,8 @@ impl GpuEngine {
             pipeline,
             vec![
                 x_buf,
-                cos_buf.as_entire_binding(),
-                sin_buf.as_entire_binding(),
+                cos_buf,
+                sin_buf,
                 params_buf.as_entire_binding(),
             ],
         );
@@ -4106,8 +4182,8 @@ impl GpuEngine {
         &self,
         pass: &mut wgpu::ComputePass<'_>,
         x_buf: &wgpu::Buffer,
-        cos_buf: &wgpu::Buffer,
-        sin_buf: &wgpu::Buffer,
+        cos_buf: wgpu::BindingResource<'_>,
+        sin_buf: wgpu::BindingResource<'_>,
         n_heads: usize,
         head_dim: usize,
         start_pos: usize,
@@ -4129,9 +4205,14 @@ impl GpuEngine {
         let params_buf = self.gpu.create_params_buffer(&params);
 
         let pipeline = &self.gpu.pipelines.rope_batch_packed;
-        let bind_group = self.gpu.make_bind_group(
+        let bind_group = self.gpu.make_bind_group_with(
             pipeline,
-            &[x_buf, cos_buf, sin_buf, &params_buf],
+            vec![
+                x_buf.as_entire_binding(),
+                cos_buf,
+                sin_buf,
+                params_buf.as_entire_binding(),
+            ],
         );
 
         // Half the original thread count (one per pair-pair).
@@ -4558,7 +4639,7 @@ impl GpuEngine {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         a_buf: &wgpu::Buffer,
-        bias_buf: &wgpu::Buffer,
+        bias_buf: wgpu::BindingResource<'_>,
         n: usize,
         n_tokens: usize,
     ) {
@@ -4574,7 +4655,7 @@ impl GpuEngine {
         &self,
         pass: &mut wgpu::ComputePass<'_>,
         a_buf: &wgpu::Buffer,
-        bias_buf: &wgpu::Buffer,
+        bias_buf: wgpu::BindingResource<'_>,
         n: usize,
         n_tokens: usize,
     ) {
@@ -4582,9 +4663,13 @@ impl GpuEngine {
         let params_buf = self.gpu.create_params_buffer(&params);
 
         let pipeline = &self.gpu.pipelines.bias_add_batch;
-        let bind = self.gpu.make_bind_group(
+        let bind = self.gpu.make_bind_group_with(
             pipeline,
-            &[a_buf, bias_buf, &params_buf],
+            vec![
+                a_buf.as_entire_binding(),
+                bias_buf,
+                params_buf.as_entire_binding(),
+            ],
         );
 
         let total = (n * n_tokens) as u32;
@@ -4604,7 +4689,7 @@ impl GpuEngine {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         a_buf: wgpu::BindingResource<'_>,
-        bias_buf: &wgpu::Buffer,
+        bias_buf: wgpu::BindingResource<'_>,
         n: usize,
         n_tokens: usize,
     ) {
@@ -4613,7 +4698,7 @@ impl GpuEngine {
         let pipeline = &self.gpu.pipelines.bias_add_batch_packed;
         let bind = self.gpu.make_bind_group_with(
             pipeline,
-            vec![a_buf, bias_buf.as_entire_binding(), params_buf.as_entire_binding()],
+            vec![a_buf, bias_buf, params_buf.as_entire_binding()],
         );
         let total_slots = (n * n_tokens / 2) as u32;
         let groups = (total_slots + 255) / 256;
@@ -4632,14 +4717,21 @@ impl GpuEngine {
         &self,
         pass: &mut wgpu::ComputePass<'_>,
         a_buf: &wgpu::Buffer,
-        bias_buf: &wgpu::Buffer,
+        bias_buf: wgpu::BindingResource<'_>,
         n: usize,
         n_tokens: usize,
     ) {
         let params = AddInplaceBatchParams { n: n as u32, n_tokens: n_tokens as u32 };
         let params_buf = self.gpu.create_params_buffer(&params);
         let pipeline = &self.gpu.pipelines.bias_add_batch_packed;
-        let bind = self.gpu.make_bind_group(pipeline, &[a_buf, bias_buf, &params_buf]);
+        let bind = self.gpu.make_bind_group_with(
+            pipeline,
+            vec![
+                a_buf.as_entire_binding(),
+                bias_buf,
+                params_buf.as_entire_binding(),
+            ],
+        );
         let total_slots = (n * n_tokens / 2) as u32;
         let groups = (total_slots + 255) / 256;
         pass.set_pipeline(pipeline);
