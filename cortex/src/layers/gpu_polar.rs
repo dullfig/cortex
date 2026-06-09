@@ -312,10 +312,15 @@ pub fn dispatch_derotate(
 /// Phase C3 polar variant of `dispatch_derotate`. Reads f32 weighted-V
 /// (from attn_value_polar_batch), writes packed-f16 attn_out.
 /// Half the thread count (one per d-pair).
+///
+/// Phase C (vram-heap): `weighted_rot_buf` is a `BindingResource` so
+/// rotated_buf — a sub-allocation of `transient_heap_a` — can be bound
+/// at its sub-range rather than the entire heap. Oneshot/test callers
+/// pass `buf.as_entire_binding()`.
 pub fn dispatch_derotate_packed(
     gpu: &Arc<GpuDevice>,
     encoder: &mut wgpu::CommandEncoder,
-    weighted_rot_buf: &wgpu::Buffer,
+    weighted_rot_buf: wgpu::BindingResource<'_>,
     rotation_buf: &wgpu::Buffer,
     out_buf: &wgpu::Buffer,
     n_heads: usize,
@@ -330,9 +335,14 @@ pub fn dispatch_derotate_packed(
     let params_buf = gpu.create_params_buffer(&params);
 
     let pipeline = &gpu.pipelines.derotate_packed;
-    let bind = gpu.make_bind_group(
+    let bind = gpu.make_bind_group_with(
         pipeline,
-        &[weighted_rot_buf, rotation_buf, out_buf, &params_buf],
+        vec![
+            weighted_rot_buf,
+            rotation_buf.as_entire_binding(),
+            out_buf.as_entire_binding(),
+            params_buf.as_entire_binding(),
+        ],
     );
 
     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -478,13 +488,17 @@ pub fn dispatch_rotate_q(
 
 /// Phase C3 polar variant of `dispatch_rotate_q`. Reads packed-f16 Q
 /// (post-C3 scratch.q), writes f32 rq. Same dispatch shape.
+///
+/// Phase C (vram-heap): `rq_buf` is a `BindingResource` so rotated_buf
+/// — a sub-allocation of `transient_heap_a` — can be bound at its
+/// sub-range. Oneshot/test callers pass `buf.as_entire_binding()`.
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_rotate_q_packed(
     gpu: &Arc<GpuDevice>,
     encoder: &mut wgpu::CommandEncoder,
     q_buf: &wgpu::Buffer,
     rotation_buf: &wgpu::Buffer,
-    rq_buf: &wgpu::Buffer,
+    rq_buf: wgpu::BindingResource<'_>,
     n_tokens: usize,
     n_heads: usize,
     head_dim: usize,
@@ -498,7 +512,15 @@ pub fn dispatch_rotate_q_packed(
     let params_buf = gpu.create_params_buffer(&params);
 
     let pipeline = &gpu.pipelines.rotate_q_packed;
-    let bind = gpu.make_bind_group(pipeline, &[q_buf, rotation_buf, rq_buf, &params_buf]);
+    let bind = gpu.make_bind_group_with(
+        pipeline,
+        vec![
+            q_buf.as_entire_binding(),
+            rotation_buf.as_entire_binding(),
+            rq_buf,
+            params_buf.as_entire_binding(),
+        ],
+    );
 
     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
         label: Some("rotate_q_packed.dispatch"),
@@ -535,11 +557,15 @@ struct AttnScorePolarBatchParams {
 ///
 /// `max_seq` is the row stride of `scores_buf` and bounds the t loop;
 /// callers commonly set it to `start_pos + n_tokens`.
+///
+/// Phase C (vram-heap): `rq_buf` is a `BindingResource` so rotated_buf
+/// — a sub-allocation of `transient_heap_a` — can be bound at its
+/// sub-range. Oneshot/test callers pass `buf.as_entire_binding()`.
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_attn_score_polar_batch(
     gpu: &Arc<GpuDevice>,
     encoder: &mut wgpu::CommandEncoder,
-    rq_buf: &wgpu::Buffer,
+    rq_buf: wgpu::BindingResource<'_>,
     k_angles_buf: &wgpu::Buffer,
     k_radius_buf: &wgpu::Buffer,
     scores_buf: &wgpu::Buffer,
@@ -574,9 +600,16 @@ pub fn dispatch_attn_score_polar_batch(
     let params_buf = gpu.create_params_buffer(&params);
 
     let pipeline = &gpu.pipelines.attn_score_polar_batch;
-    let bind = gpu.make_bind_group(
+    let bind = gpu.make_bind_group_with(
         pipeline,
-        &[rq_buf, k_angles_buf, k_radius_buf, scores_buf, &params_buf, lut_buf],
+        vec![
+            rq_buf,
+            k_angles_buf.as_entire_binding(),
+            k_radius_buf.as_entire_binding(),
+            scores_buf.as_entire_binding(),
+            params_buf.as_entire_binding(),
+            lut_buf.as_entire_binding(),
+        ],
     );
 
     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -616,11 +649,15 @@ struct AttnScorePolarQjlBatchParams {
 /// added per cell. Caller must supply the K QJL signs and projection
 /// buffers (typically `cache.k_qjl_signs_layer(i)` /
 /// `cache.k_qjl_projection_layer(i)`).
+///
+/// Phase C (vram-heap): `rq_buf` is a `BindingResource` so rotated_buf
+/// — a sub-allocation of `transient_heap_a` — can be bound at its
+/// sub-range. Oneshot/test callers pass `buf.as_entire_binding()`.
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_attn_score_polar_qjl_batch(
     gpu: &Arc<GpuDevice>,
     encoder: &mut wgpu::CommandEncoder,
-    rq_buf: &wgpu::Buffer,
+    rq_buf: wgpu::BindingResource<'_>,
     k_angles_buf: &wgpu::Buffer,
     k_radius_buf: &wgpu::Buffer,
     scores_buf: &wgpu::Buffer,
@@ -660,11 +697,17 @@ pub fn dispatch_attn_score_polar_qjl_batch(
     let params_buf = gpu.create_params_buffer(&params);
 
     let pipeline = &gpu.pipelines.attn_score_polar_qjl_batch;
-    let bind = gpu.make_bind_group(
+    let bind = gpu.make_bind_group_with(
         pipeline,
-        &[
-            rq_buf, k_angles_buf, k_radius_buf, scores_buf,
-            k_qjl_signs_buf, projections_buf, &params_buf, lut_buf,
+        vec![
+            rq_buf,
+            k_angles_buf.as_entire_binding(),
+            k_radius_buf.as_entire_binding(),
+            scores_buf.as_entire_binding(),
+            k_qjl_signs_buf.as_entire_binding(),
+            projections_buf.as_entire_binding(),
+            params_buf.as_entire_binding(),
+            lut_buf.as_entire_binding(),
         ],
     );
 
@@ -700,6 +743,10 @@ struct AttnValuePolarBatchParams {
 /// buffer with `n_heads = n_tokens * n_heads_real` to recover original
 /// space — the existing derotate shader handles the multi-token case
 /// because R is the same across all (tok, head).
+///
+/// Phase C (vram-heap): `output_buf` is a `BindingResource` so
+/// rotated_buf — a sub-allocation of `transient_heap_a` — can be bound
+/// at its sub-range. Oneshot/test callers pass `buf.as_entire_binding()`.
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_attn_value_polar_batch(
     gpu: &Arc<GpuDevice>,
@@ -707,7 +754,7 @@ pub fn dispatch_attn_value_polar_batch(
     softmax_buf: &wgpu::Buffer,
     v_angles_buf: &wgpu::Buffer,
     v_radius_buf: &wgpu::Buffer,
-    output_buf: &wgpu::Buffer,
+    output_buf: wgpu::BindingResource<'_>,
     lut_buf: &wgpu::Buffer,
     n_heads: usize,
     n_kv_heads: usize,
@@ -736,9 +783,16 @@ pub fn dispatch_attn_value_polar_batch(
     let params_buf = gpu.create_params_buffer(&params);
 
     let pipeline = &gpu.pipelines.attn_value_polar_batch;
-    let bind = gpu.make_bind_group(
+    let bind = gpu.make_bind_group_with(
         pipeline,
-        &[softmax_buf, v_angles_buf, v_radius_buf, output_buf, &params_buf, lut_buf],
+        vec![
+            softmax_buf.as_entire_binding(),
+            v_angles_buf.as_entire_binding(),
+            v_radius_buf.as_entire_binding(),
+            output_buf,
+            params_buf.as_entire_binding(),
+            lut_buf.as_entire_binding(),
+        ],
     );
 
     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1957,7 +2011,7 @@ mod tests {
             n_tokens, n_query_heads, head_dim,
         );
         dispatch_attn_score_polar_batch(
-            &gpu, &mut encoder, &rq_buf,
+            &gpu, &mut encoder, rq_buf.as_entire_binding(),
             polar_kv.k_angles_layer(layer), polar_kv.k_radius_layer(layer),
             &scores_buf, polar_kv.lut_buffer(),
             n_query_heads, n_kv_heads, head_dim, start_pos, n_tokens, max_seq,
@@ -1993,7 +2047,7 @@ mod tests {
         dispatch_attn_value_polar_batch(
             &gpu, &mut encoder, &scores_buf,
             polar_kv.v_angles_layer(layer), polar_kv.v_radius_layer(layer),
-            &weighted_rot_buf, polar_kv.lut_buffer(),
+            weighted_rot_buf.as_entire_binding(), polar_kv.lut_buffer(),
             n_query_heads, n_kv_heads, head_dim, start_pos, n_tokens, max_seq,
         );
         // Derotate: treat (n_tokens * n_query_heads) as "n_heads" — the
@@ -2149,7 +2203,7 @@ mod tests {
             n_tokens, n_query_heads, head_dim,
         );
         dispatch_attn_score_polar_batch(
-            &gpu, &mut encoder, &rq_buf,
+            &gpu, &mut encoder, rq_buf.as_entire_binding(),
             polar_kv.k_angles_layer(layer), polar_kv.k_radius_layer(layer),
             &scores_buf, polar_kv.lut_buffer(),
             n_query_heads, n_kv_heads, head_dim, start_pos, n_tokens, max_seq,
@@ -2176,7 +2230,7 @@ mod tests {
         dispatch_attn_value_polar_batch(
             &gpu, &mut encoder, &scores_buf,
             polar_kv.v_angles_layer(layer), polar_kv.v_radius_layer(layer),
-            &weighted_rot_buf, polar_kv.lut_buffer(),
+            weighted_rot_buf.as_entire_binding(), polar_kv.lut_buffer(),
             n_query_heads, n_kv_heads, head_dim, start_pos, n_tokens, max_seq,
         );
         dispatch_derotate(
@@ -2365,7 +2419,7 @@ mod tests {
             n_tokens, n_query_heads, head_dim,
         );
         dispatch_attn_score_polar_batch(
-            &gpu, &mut encoder, &rq_buf,
+            &gpu, &mut encoder, rq_buf.as_entire_binding(),
             polar_kv.k_angles_layer(layer), polar_kv.k_radius_layer(layer),
             &scores_buf, polar_kv.lut_buffer(),
             n_query_heads, n_kv_heads, head_dim, start_pos, n_tokens, max_seq,
@@ -2391,7 +2445,7 @@ mod tests {
         dispatch_attn_value_polar_batch(
             &gpu, &mut encoder, &scores_buf,
             polar_kv.v_angles_layer(layer), polar_kv.v_radius_layer(layer),
-            &weighted_rot_buf, polar_kv.lut_buffer(),
+            weighted_rot_buf.as_entire_binding(), polar_kv.lut_buffer(),
             n_query_heads, n_kv_heads, head_dim, start_pos, n_tokens, max_seq,
         );
         dispatch_derotate(
@@ -2512,7 +2566,7 @@ mod tests {
             n_tokens, n_query_heads, head_dim,
         );
         dispatch_attn_score_polar_batch(
-            &gpu, &mut e, &rq_buf,
+            &gpu, &mut e, rq_buf.as_entire_binding(),
             polar_kv.k_angles_layer(layer), polar_kv.k_radius_layer(layer),
             &scores_buf, polar_kv.lut_buffer(),
             n_query_heads, n_kv_heads, head_dim, start_pos, n_tokens, max_seq,
@@ -2702,14 +2756,14 @@ mod tests {
         // 2) Two attention dispatches against the same K cache.
         dispatch_attn_score_polar_batch(
             &gpu, &mut encoder,
-            &rq_buf,
+            rq_buf.as_entire_binding(),
             cache.k_angles_layer(layer), cache.k_radius_layer(layer),
             &scores_polar, cache.lut_buffer(),
             n_heads, n_kv_heads, head_dim, start_pos, q_n_tokens, max_seq,
         );
         dispatch_attn_score_polar_qjl_batch(
             &gpu, &mut encoder,
-            &rq_buf,
+            rq_buf.as_entire_binding(),
             cache.k_angles_layer(layer), cache.k_radius_layer(layer),
             &scores_qjl,
             cache.k_qjl_signs_layer(layer).unwrap(),
