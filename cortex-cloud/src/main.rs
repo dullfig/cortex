@@ -4025,6 +4025,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )),
     });
 
+    // Phase K: periodic metrics sampler. Snapshots the read-only
+    // gauges (cache pool depth/tokens, vram-heap usage across all 5
+    // heaps, ParamsBufferPool cumulative acquire count) into the
+    // Metrics struct so `/metrics` exposes them. Push-style metrics
+    // (concurrent_requests, request histograms, token counters) go
+    // through RequestTimer / handler code paths and don't need the
+    // sampler.
+    //
+    // Interval tunable via CORTEX_METRICS_SAMPLE_INTERVAL_MS
+    // (default 1000 ms). The locked region under cache_pool is
+    // tiny: just `len()` and a sum of `tokens.len()` per entry,
+    // then release. vram-heap stats() each hold the heap's
+    // internal lock for microseconds; safe at 1 Hz.
+    let sampler_state = state.clone();
+    let sampler_interval_ms: u64 = std::env::var("CORTEX_METRICS_SAMPLE_INTERVAL_MS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(1000);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(
+            std::time::Duration::from_millis(sampler_interval_ms),
+        );
+        // Skip the immediate first tick so we don't read empty
+        // state before the engine is warm.
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+
+            // Cache pool: lock briefly, copy out size + token-sum,
+            // release.
+            let (pool_size, pool_tokens) = {
+                let pool = sampler_state.cache_pool.lock().await;
+                let size = pool.len() as u64;
+                let tokens: u64 = pool.values()
+                    .map(|e| e.tokens.len() as u64).sum();
+                (size, tokens)
+            };
+            sampler_state.metrics.record_cache_pool(pool_size, pool_tokens);
+
+            // vram-heap usage across all 5 heaps.
+            let gpu = sampler_state.engine.gpu();
+            for (id, used_bytes) in gpu.vram_heap_usage() {
+                let label = match id {
+                    cortex::compute::wgpu_backend::VramHeapId::TransientA =>
+                        metrics::VramHeapLabel::TransientA,
+                    cortex::compute::wgpu_backend::VramHeapId::TransientB =>
+                        metrics::VramHeapLabel::TransientB,
+                    cortex::compute::wgpu_backend::VramHeapId::TransientC =>
+                        metrics::VramHeapLabel::TransientC,
+                    cortex::compute::wgpu_backend::VramHeapId::Weights =>
+                        metrics::VramHeapLabel::Weights,
+                    cortex::compute::wgpu_backend::VramHeapId::HostReadback =>
+                        metrics::VramHeapLabel::HostReadback,
+                };
+                sampler_state.metrics.record_vram_heap(label, used_bytes);
+            }
+
+            // ParamsBufferPool cumulative acquire count.
+            let p = gpu.params_pool.stats();
+            sampler_state.metrics.record_params_pool(p.total_acquired as u64);
+        }
+    });
+
     // Build router: always include completions, models, health, metrics.
     // Cache and retrieve endpoints are conditional on startup flags.
     let mut app = Router::new()

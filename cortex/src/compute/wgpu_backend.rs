@@ -550,6 +550,31 @@ pub struct GpuDevice {
     pub host_readback_heap: Arc<::vram_heap::VramHeap>,
 }
 
+/// Identifier for one of the five vram-heaps cortex constructs on a
+/// `GpuDevice`. The label matches the boot-log string and the
+/// metrics gauge label (Phase K dashboard).
+#[derive(Copy, Clone, Debug)]
+pub enum VramHeapId {
+    TransientA,
+    TransientB,
+    TransientC,
+    Weights,
+    HostReadback,
+}
+
+impl VramHeapId {
+    /// Stable string label for log lines and Prometheus metric labels.
+    pub fn label(self) -> &'static str {
+        match self {
+            VramHeapId::TransientA => "transient_a",
+            VramHeapId::TransientB => "transient_b",
+            VramHeapId::TransientC => "transient_c",
+            VramHeapId::Weights => "weights",
+            VramHeapId::HostReadback => "host_readback",
+        }
+    }
+}
+
 impl GpuDevice {
     /// Try to create a GPU device with all pipelines compiled.
     /// Returns `None` if no suitable adapter is found.
@@ -837,6 +862,20 @@ impl GpuDevice {
     ///
     /// Each u32 holds two f16 values: `(f16[2i] | f16[2i+1] << 16)`.
     /// The input length must be even.
+    /// Snapshot of all five vram-heaps as (id, used_bytes) pairs.
+    /// Used by the Phase K metrics sampler to update per-heap usage
+    /// gauges. Each `stats()` call holds the heap's internal lock for
+    /// microseconds; safe to call from a periodic task.
+    pub fn vram_heap_usage(&self) -> [(VramHeapId, u64); 5] {
+        [
+            (VramHeapId::TransientA, self.transient_heap_a.stats().used_payload),
+            (VramHeapId::TransientB, self.transient_heap_b.stats().used_payload),
+            (VramHeapId::TransientC, self.transient_heap_c.stats().used_payload),
+            (VramHeapId::Weights, self.weights_heap.stats().used_payload),
+            (VramHeapId::HostReadback, self.host_readback_heap.stats().used_payload),
+        ]
+    }
+
     pub fn pack_f16(data: &[f32]) -> Vec<u32> {
         assert!(data.len() % 2 == 0, "f16 packing requires even length");
         data.chunks_exact(2)

@@ -4959,6 +4959,13 @@ impl GpuEngine {
         &self.cpu
     }
 
+    /// Borrow the shared GPU device (vram-heap arenas, ParamsBufferPool,
+    /// pipelines). Used by the Phase K metrics sampler to read heap
+    /// usage and pool stats.
+    pub fn gpu(&self) -> &Arc<GpuDevice> {
+        &self.gpu
+    }
+
     // -- Pure passthroughs (Phase 1a) ---------------------------------------
 
     pub fn vocab_size(&self) -> usize {

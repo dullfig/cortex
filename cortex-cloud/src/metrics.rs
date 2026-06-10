@@ -1,15 +1,35 @@
 //! Prometheus-text-format metrics for cortex-server.
 //!
-//! MVP scope: instruments the request handlers we actively care about
-//! (chat_completions, cache_load, cache_append). Each metric here MUST be
-//! both recorded by a handler AND emitted by `render_prometheus()`. New
-//! metrics that aren't paired on both ends are phantom and should not
-//! land.
+//! Two flavors of metric land here:
+//!
+//! 1. **Request-level** (Phase 1 — already shipped): per-endpoint
+//!    counters, latency histograms, TTFT. Recorded inline by handlers
+//!    via `RequestTimer`. Each metric here MUST be both recorded by a
+//!    handler AND emitted by `render_prometheus()` — phantom metrics
+//!    are forbidden.
+//!
+//! 2. **Substrate/concurrency tripwires** (Phase K): the gauges that
+//!    tell us when the operating envelope is approaching the next
+//!    scaling stage. `cortex_concurrent_requests` for in-flight load,
+//!    `cortex_cache_pool_*` for cortex-cloud pool depth,
+//!    `cortex_vram_heap_bytes` for substrate pressure across all 5
+//!    heaps, `cortex_params_pool_acquired_total` for the
+//!    ParamsBufferPool wrap rate, `cortex_gpu_busy_micros_total` for
+//!    GPU utilization (Prometheus `rate()` over the counter gives
+//!    busy-fraction-per-second, i.e. utilization %). The sampler task
+//!    in `start_metrics_sampler` snapshots the read-only sources;
+//!    `RequestTimer` and the engine push the push-style ones.
+//!
+//! Tripwire/alert logic lives OUTSIDE cortex (Prometheus alert rules
+//! or Grafana). cortex emits; the dashboard decides when to fire.
+//! This keeps cortex oblivious to operational thresholds that should
+//! be tunable per-deployment.
 //!
 //! Wire format: <https://prometheus.io/docs/instrumenting/exposition_formats/>
 //! served via `GET /metrics` with content-type `text/plain; version=0.0.4`.
 
 use std::fmt::Write;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -91,6 +111,53 @@ impl Histogram {
     }
 }
 
+/// Identifier for one of the 5 vram-heaps cortex uses. The label
+/// matches the heap name in boot logs and the metric label exposed
+/// to Prometheus.
+#[derive(Copy, Clone, Debug)]
+pub enum VramHeapLabel {
+    TransientA,
+    TransientB,
+    TransientC,
+    Weights,
+    HostReadback,
+}
+
+impl VramHeapLabel {
+    pub fn label(self) -> &'static str {
+        match self {
+            VramHeapLabel::TransientA => "transient_a",
+            VramHeapLabel::TransientB => "transient_b",
+            VramHeapLabel::TransientC => "transient_c",
+            VramHeapLabel::Weights => "weights",
+            VramHeapLabel::HostReadback => "host_readback",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            VramHeapLabel::TransientA => 0,
+            VramHeapLabel::TransientB => 1,
+            VramHeapLabel::TransientC => 2,
+            VramHeapLabel::Weights => 3,
+            VramHeapLabel::HostReadback => 4,
+        }
+    }
+
+    /// Iterate over all heap labels in stable order. Used by the
+    /// sampler to thread heap stats into the per-label gauges and by
+    /// `render_prometheus` to emit them.
+    pub fn all() -> [VramHeapLabel; 5] {
+        [
+            VramHeapLabel::TransientA,
+            VramHeapLabel::TransientB,
+            VramHeapLabel::TransientC,
+            VramHeapLabel::Weights,
+            VramHeapLabel::HostReadback,
+        ]
+    }
+}
+
 /// All cortex-server metrics. Constructed once at startup, shared via
 /// `Arc<Metrics>` on `AppState`.
 pub struct Metrics {
@@ -116,6 +183,28 @@ pub struct Metrics {
     // Time-to-first-token (chat completions only).
     ttft: Histogram,
 
+    // Phase K: substrate/concurrency tripwire gauges.
+    //
+    // `concurrent_requests` is push-style (RequestTimer inc/dec on
+    // new/Drop); the rest are pull-style (sampler task reads them
+    // periodically from cortex-cloud state + GpuDevice).
+    //
+    // GPU utilization % is NOT emitted as its own counter. The
+    // existing `cortex_request_duration_seconds` histogram's `_sum`
+    // field already captures cumulative time spent inside the
+    // GPU-bound endpoints (chat_completions, cache_load, cache_append).
+    // Use `rate(cortex_request_duration_seconds_sum[1m])` in
+    // Prometheus to get "wall-time fraction spent in GPU work" =
+    // utilization fraction. The 40%-utilization tripwire is
+    // `rate(...) > 0.4`. No new counter needed; adding one would
+    // duplicate the signal with worse semantics (can't distinguish
+    // per-endpoint busy time).
+    concurrent_requests: AtomicU64,
+    cache_pool_size: AtomicU64,
+    cache_pool_tokens_total: AtomicU64,
+    vram_heap_bytes: [AtomicU64; 5],
+    params_pool_acquired_total: AtomicU64,
+
     // Static labels for the model_info gauge.
     model_name: String,
     build_version: String,
@@ -137,9 +226,46 @@ impl Metrics {
             cache_load_duration: Histogram::new(),
             cache_append_duration: Histogram::new(),
             ttft: Histogram::new(),
+            concurrent_requests: AtomicU64::new(0),
+            cache_pool_size: AtomicU64::new(0),
+            cache_pool_tokens_total: AtomicU64::new(0),
+            vram_heap_bytes: [
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0),
+            ],
+            params_pool_acquired_total: AtomicU64::new(0),
             model_name,
             build_version,
         }
+    }
+
+    /// Increment the in-flight requests gauge. Wired by `RequestTimer::new`.
+    pub fn record_concurrent_inc(&self) {
+        self.concurrent_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Decrement the in-flight requests gauge. Wired by `RequestTimer::Drop`.
+    pub fn record_concurrent_dec(&self) {
+        self.concurrent_requests.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Update the cache pool gauges. Called by the sampler task.
+    pub fn record_cache_pool(&self, size: u64, tokens_total: u64) {
+        self.cache_pool_size.store(size, Ordering::Relaxed);
+        self.cache_pool_tokens_total.store(tokens_total, Ordering::Relaxed);
+    }
+
+    /// Update one heap's used-bytes gauge. Called by the sampler task
+    /// once per heap, per tick.
+    pub fn record_vram_heap(&self, label: VramHeapLabel, used_bytes: u64) {
+        self.vram_heap_bytes[label.index()].store(used_bytes, Ordering::Relaxed);
+    }
+
+    /// Update the ParamsBufferPool cumulative acquire counter. Called
+    /// by the sampler task. Prometheus computes the wrap rate from
+    /// `rate()` over this counter.
+    pub fn record_params_pool(&self, total_acquired: u64) {
+        self.params_pool_acquired_total.store(total_acquired, Ordering::Relaxed);
     }
 
     /// Record one completed request: increments the endpoint × status
@@ -223,6 +349,36 @@ impl Metrics {
         let _ = writeln!(out, "# TYPE cortex_ttft_seconds histogram");
         self.ttft.render("cortex_ttft_seconds", "", &mut out);
 
+        // ---- Phase K: substrate/concurrency tripwire gauges ----
+
+        let _ = writeln!(out, "# HELP cortex_concurrent_requests In-flight HTTP requests, push-updated by RequestTimer.");
+        let _ = writeln!(out, "# TYPE cortex_concurrent_requests gauge");
+        let _ = writeln!(out, "cortex_concurrent_requests {}",
+            self.concurrent_requests.load(Ordering::Relaxed));
+
+        let _ = writeln!(out, "# HELP cortex_cache_pool_size Number of named KV caches currently held in the pool.");
+        let _ = writeln!(out, "# TYPE cortex_cache_pool_size gauge");
+        let _ = writeln!(out, "cortex_cache_pool_size {}",
+            self.cache_pool_size.load(Ordering::Relaxed));
+
+        let _ = writeln!(out, "# HELP cortex_cache_pool_tokens Total tokens across all KV caches in the pool.");
+        let _ = writeln!(out, "# TYPE cortex_cache_pool_tokens gauge");
+        let _ = writeln!(out, "cortex_cache_pool_tokens {}",
+            self.cache_pool_tokens_total.load(Ordering::Relaxed));
+
+        let _ = writeln!(out, "# HELP cortex_vram_heap_bytes Used bytes per vram-heap.");
+        let _ = writeln!(out, "# TYPE cortex_vram_heap_bytes gauge");
+        for heap in VramHeapLabel::all() {
+            let _ = writeln!(out, "cortex_vram_heap_bytes{{heap=\"{}\"}} {}",
+                heap.label(),
+                self.vram_heap_bytes[heap.index()].load(Ordering::Relaxed));
+        }
+
+        let _ = writeln!(out, "# HELP cortex_params_pool_acquired_total Cumulative ParamsBufferPool slot acquires. rate() over [1m] gives acquire rate; sustained growth means the ring is being stressed.");
+        let _ = writeln!(out, "# TYPE cortex_params_pool_acquired_total counter");
+        let _ = writeln!(out, "cortex_params_pool_acquired_total {}",
+            self.params_pool_acquired_total.load(Ordering::Relaxed));
+
         out
     }
 }
@@ -245,6 +401,7 @@ pub struct RequestTimer {
 
 impl RequestTimer {
     pub fn new(metrics: std::sync::Arc<Metrics>, endpoint: Endpoint) -> Self {
+        metrics.record_concurrent_inc();
         Self { metrics, endpoint, start: Instant::now(), success: false }
     }
 
@@ -257,6 +414,7 @@ impl Drop for RequestTimer {
     fn drop(&mut self) {
         let duration_s = self.start.elapsed().as_secs_f64();
         self.metrics.record_request(self.endpoint, self.success, duration_s);
+        self.metrics.record_concurrent_dec();
     }
 }
 
@@ -299,6 +457,11 @@ mod tests {
         m.record_request(Endpoint::CacheAppend, false, 1.2);
         m.record_tokens(42, 17);
         m.record_ttft(0.01);
+        // Phase K tripwire setters.
+        m.record_cache_pool(3, 4500);
+        m.record_vram_heap(VramHeapLabel::TransientA, 12_000_000);
+        m.record_vram_heap(VramHeapLabel::Weights, 6_000_000_000);
+        m.record_params_pool(123_456);
         let out = m.render_prometheus();
         // Spot-check: every metric name appears.
         for needle in [
@@ -313,9 +476,33 @@ mod tests {
             "cortex_request_duration_seconds_count{endpoint=\"chat_completions\"} 1",
             "cortex_ttft_seconds_bucket{le=\"0.025\"} 1",
             "cortex_ttft_seconds_count 1",
+            // Phase K
+            "cortex_concurrent_requests 0",
+            "cortex_cache_pool_size 3",
+            "cortex_cache_pool_tokens 4500",
+            "cortex_vram_heap_bytes{heap=\"transient_a\"} 12000000",
+            "cortex_vram_heap_bytes{heap=\"weights\"} 6000000000",
+            "cortex_vram_heap_bytes{heap=\"host_readback\"} 0",
+            "cortex_params_pool_acquired_total 123456",
         ] {
             assert!(out.contains(needle), "missing line: {needle}\nfull output:\n{out}");
         }
+    }
+
+    #[test]
+    fn concurrent_inc_dec_balanced() {
+        let m = std::sync::Arc::new(Metrics::new("t".to_string(), "0".to_string()));
+        // Five RequestTimers in flight simultaneously.
+        let timers: Vec<RequestTimer> = (0..5)
+            .map(|_| RequestTimer::new(m.clone(), Endpoint::ChatCompletions))
+            .collect();
+        let out = m.render_prometheus();
+        assert!(out.contains("cortex_concurrent_requests 5"),
+            "expected gauge at 5 with timers alive\nfull output:\n{out}");
+        drop(timers);
+        let out = m.render_prometheus();
+        assert!(out.contains("cortex_concurrent_requests 0"),
+            "expected gauge back to 0 after drops\nfull output:\n{out}");
     }
 
     #[test]
