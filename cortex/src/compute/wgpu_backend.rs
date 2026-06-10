@@ -366,14 +366,35 @@ impl Pipelines {
 pub const PARAMS_POOL_SLOT_BYTES: u64 = 256;
 
 /// Number of slots in the params buffer ring pool. Must comfortably
-/// exceed the largest single synchronous forward pass's per-dispatch
-/// params allocation count, so the ring's natural wrap-around can't
+/// exceed the LARGEST aggregate in-flight slot count across ALL
+/// concurrent forwards so the ring's natural wrap-around can't
 /// reuse a slot while the previous occupant is still bound in flight.
-/// Polar retrieve at Qwen-3B (36 layers × ~10 dispatches per layer)
-/// uses ~360 slots; 2048 leaves 5x headroom for future expansion.
-/// Memory cost: 2048 × 256 B = 512 KB. Trivial vs the ~6 GB cortex
-/// uses for weights+caches.
-pub const PARAMS_POOL_SLOT_COUNT: usize = 2048;
+///
+/// Single-forward demand at Qwen-3B polar retrieve: ~360 slots
+/// (36 layers × ~10 dispatches per layer). cortex-cloud's tokio
+/// handlers can run multiple forwards concurrently (`Arc<GpuEngine>`
+/// with `&self` forward methods), so the operating envelope is
+/// (concurrent forwards) × (in-flight slots per forward between
+/// chunked submits, ~135 with the default 9-layer chunking).
+///
+/// Phase J (2026-06-09) bumped this from 2048 to 16384 to close a
+/// latent wrap-around race: at 2048 slots, ~15 concurrent forwards
+/// could wrap the counter back to a slot still bound in another
+/// forward's not-yet-submitted command buffer, causing silent params
+/// corruption (queue.write_buffer happens before the previous
+/// dispatch's submit reads the slot). At 16384 the threshold moves
+/// to ~120 concurrent forwards — well outside any plausible
+/// operating envelope, even adversarial stress tests on the H100
+/// deployment. Memory cost: 16384 × 256 B = 4 MB; trivial against
+/// ~6 GB of weights + transient heaps.
+///
+/// The bug stays *statistically* possible at the new bound, not
+/// eliminated. The eliminate-by-construction fix would be a
+/// `VramPool` migration with `PoolSlot::drop`-after-submit
+/// keepalive plumbing through 44 dispatch sites — see the
+/// `ParamsBufferPool` doc comment for why that's the wrong
+/// tradeoff for cortex's actual concurrency profile.
+pub const PARAMS_POOL_SLOT_COUNT: usize = 16384;
 
 /// Ring of pre-allocated uniform buffers used by `create_params_buffer`.
 /// See that method's doc comment for why this exists.
@@ -383,24 +404,31 @@ pub const PARAMS_POOL_SLOT_COUNT: usize = 2048;
 /// vram-heap's `VramPool` has an *explicit* slot lifecycle: `acquire()`
 /// pops an index from a free-list, `PoolSlot::drop` pushes it back.
 /// `ParamsBufferPool` has an *implicit* slot lifecycle: `next_slot()`
-/// is an atomic round-robin over 2048 slots and the slot is "available
+/// is an atomic round-robin over the ring and the slot is "available
 /// again" the instant it returns.
 ///
 /// cortex's dispatch helpers do `acquire → write → bind → record →
 /// return`. The returned `wgpu::Buffer` (an Arc handle to the slot)
 /// drops at function return, but the GPU's actual `queue.submit` +
 /// dispatch read happens later — often hundreds of microseconds later,
-/// batched at the end of the forward function. The current ring
-/// tolerates this because nothing overwrites a slot until 2048 more
-/// allocations later, by which point the GPU has long since finished
-/// reading the in-flight slots.
+/// batched at the end of the forward function. The ring tolerates this
+/// because nothing overwrites a slot until `PARAMS_POOL_SLOT_COUNT`
+/// more allocations later, by which point the GPU has long since
+/// finished reading the in-flight slots — PROVIDED total in-flight
+/// slot count across all concurrent forwards stays below the ring
+/// size. Phase J sized the ring (16384 slots) for ~120 concurrent
+/// forwards' worth of headroom; see `PARAMS_POOL_SLOT_COUNT` for the
+/// math.
 ///
 /// Migrating to `VramPool` would force every dispatch helper to grow a
 /// `&mut Vec<PoolSlot>` keepalive parameter threaded from the forward
 /// function down through every dispatch — ~44 call sites, all-or-
-/// nothing plumbing, no substrate benefit. The ring is already
-/// solving the wgpu-29 allocator-pressure ceiling that motivated the
-/// vram-heap work in the first place. Leave it.
+/// nothing plumbing. The bigger-ring approach (Phase J) plus the
+/// `stats()` method below gives us both bug closure under any
+/// realistic concurrency AND the observability a vram-heap-backed
+/// pool would have provided, at the cost of being statistically
+/// (not constructively) safe at the bound. cortex doesn't see
+/// adversarial concurrency profiles; the tradeoff is right.
 ///
 /// `VramPool` is the right answer for callers that DO want explicit
 /// per-slot lifetime tracking — e.g. memex's KV-cache slot reuse or
@@ -409,6 +437,22 @@ pub const PARAMS_POOL_SLOT_COUNT: usize = 2048;
 pub struct ParamsBufferPool {
     slots: Vec<wgpu::Buffer>,
     next: std::sync::atomic::AtomicUsize,
+}
+
+/// Pool usage snapshot. Same shape as `vram_heap::HeapStats` so future
+/// diagnostic helpers can dump it uniformly alongside the vram-heap
+/// stats. `next_slot()` returns `total_acquired % slot_count`, so
+/// `wrap_count` answers "how stressed is the ring under current load".
+#[derive(Debug, Clone, Copy)]
+pub struct ParamsPoolStats {
+    /// Lifetime acquire count — every `next_slot()` call bumps this.
+    pub total_acquired: usize,
+    /// `total_acquired / slot_count`. A wrap_count growing absurdly
+    /// fast (per unit wall time) under sustained load is the signal
+    /// to alarm: the ring is being stressed beyond its safety margin.
+    pub wrap_count: usize,
+    pub slot_count: usize,
+    pub slot_bytes: u64,
 }
 
 impl ParamsBufferPool {
@@ -435,6 +479,20 @@ impl ParamsBufferPool {
         let idx = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             % self.slots.len();
         self.slots[idx].clone()
+    }
+
+    /// Pool usage snapshot. Reads the atomic counter only (no
+    /// per-slot tracking — see the struct doc for why the implicit
+    /// lifecycle precludes a `live_count` field).
+    pub fn stats(&self) -> ParamsPoolStats {
+        let total = self.next.load(std::sync::atomic::Ordering::Relaxed);
+        let slot_count = self.slots.len();
+        ParamsPoolStats {
+            total_acquired: total,
+            wrap_count: total / slot_count,
+            slot_count,
+            slot_bytes: PARAMS_POOL_SLOT_BYTES,
+        }
     }
 }
 
