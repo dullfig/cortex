@@ -215,17 +215,36 @@ impl HiddenCaptures {
     }
 }
 
+/// Per-block scratch buffers reused across all dispatches inside a single
+/// `forward_block_gpu` call.
+///
+/// Phase I (vram-heap): the f32 path's BlockScratch fields are sub-
+/// allocations of three lane-colored device-local heaps so dispatches
+/// inside `forward_block_gpu_inner` never bind R and RW on the same
+/// backing buffer.
+///
+/// Lane assignment differs from `PolarBlockScratch` in one place:
+/// `attn_out` lives on Lane A here, not Lane B. The f32 path's
+/// `attn_value_batch` dispatch reads scores and writes attn_out
+/// directly (the polar path goes through a rotated_buf intermediate),
+/// so if both were on Lane B that would be a same-backing R+RW
+/// conflict. Moving attn_out to Lane A keeps the conflict graph
+/// resolvable.
+///
+/// - **Lane A (`transient_heap_a`)**: `attn_out`, `gate`, `up`.
+/// - **Lane B (`transient_heap_b`)**: `normed`, `activated`, `scores`.
+/// - **Lane C (`transient_heap_c`)**: `q`, `k`, `v`, `projected`.
 pub struct BlockScratch {
-    pub normed: wgpu::Buffer,    // [n_tokens, embed_dim] post-rmsnorm scratch
-    pub q: wgpu::Buffer,         // [n_tokens, n_heads * head_dim]
-    pub k: wgpu::Buffer,         // [n_tokens, n_kv_heads * head_dim]
-    pub v: wgpu::Buffer,         // [n_tokens, n_kv_heads * head_dim]
-    pub attn_out: wgpu::Buffer,  // [n_tokens, n_heads * head_dim]
-    pub scores: wgpu::Buffer,    // [n_tokens, n_heads, max_seq] attention scores
-    pub gate: wgpu::Buffer,      // [n_tokens, intermediate]
-    pub up: wgpu::Buffer,        // [n_tokens, intermediate]
-    pub activated: wgpu::Buffer, // [n_tokens, intermediate] SiLU(gate)*up
-    pub projected: wgpu::Buffer, // [n_tokens, embed_dim] both attn-out-proj and FFN-down output reuse this
+    pub normed: ::vram_heap::VramAllocation,    // [n_tokens, embed_dim] post-rmsnorm scratch
+    pub q: ::vram_heap::VramAllocation,         // [n_tokens, n_heads * head_dim]
+    pub k: ::vram_heap::VramAllocation,         // [n_tokens, n_kv_heads * head_dim]
+    pub v: ::vram_heap::VramAllocation,         // [n_tokens, n_kv_heads * head_dim]
+    pub attn_out: ::vram_heap::VramAllocation,  // [n_tokens, n_heads * head_dim]
+    pub scores: ::vram_heap::VramAllocation,    // [n_tokens, n_heads, max_seq] attention scores
+    pub gate: ::vram_heap::VramAllocation,      // [n_tokens, intermediate]
+    pub up: ::vram_heap::VramAllocation,        // [n_tokens, intermediate]
+    pub activated: ::vram_heap::VramAllocation, // [n_tokens, intermediate] SiLU(gate)*up
+    pub projected: ::vram_heap::VramAllocation, // [n_tokens, embed_dim] both attn-out-proj and FFN-down output reuse this
 }
 
 /// Phase D vram-heap variant of `BlockScratch`. Same 10 fields, but
@@ -333,45 +352,46 @@ impl BlockScratch {
         intermediate: usize,
         max_seq: usize,
     ) -> Self {
-        let mk = |size: u64, label: &str| -> wgpu::Buffer {
-            gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            })
-        };
+        let align = ::vram_heap::STORAGE_BUFFER_OFFSET_ALIGNMENT_NVIDIA;
         let f32_bytes = std::mem::size_of::<f32>() as u64;
-        Self {
-            // Phase C1: scratch.normed packed f16 (half bytes).
-            normed:    mk((n_tokens * embed_dim * 2) as u64, "scratch.normed"),
-            // Phase C3: scratch.q/k/v/attn_out/projected packed f16.
-            // Q/K/V projections write packed via matmul_shared_pin_pout
-            // (prefill) or matmul_pin_pout (decode); RoPE / bias_add /
-            // kv_write read packed via their _packed shader variants;
-            // attention reads packed Q + writes packed attn_out via the
-            // updated attn_score / attn_value shaders. scores stays f32
-            // (softmax precision).
-            q:         mk((n_tokens * n_heads * head_dim * 2) as u64, "scratch.q"),
-            k:         mk((n_tokens * n_kv_heads * head_dim * 2) as u64, "scratch.k"),
-            v:         mk((n_tokens * n_kv_heads * head_dim * 2) as u64, "scratch.v"),
-            attn_out:  mk((n_tokens * n_heads * head_dim * 2) as u64, "scratch.attn_out"),
-            scores:    mk((n_tokens * n_heads * max_seq) as u64 * f32_bytes, "scratch.scores"),
-            // Phase C2: gate / up / activated packed f16 (2 per u32, half
-            // bytes). gate/up are written packed by matmul_gate_up_shared
-            // (or matmul_shared_pin_pout fallback). silu_mul_batch_packed /
-            // relu2_mul_batch_packed read packed gate+up, write packed
-            // activated. down_proj reads packed input via C1's
-            // dispatch_linear_batch_packed_input dispatcher; its output
-            // (scratch.projected) stays f32 in C2 (becomes packed in C3).
-            gate:      mk((n_tokens * intermediate * 2) as u64, "scratch.gate"),
-            up:        mk((n_tokens * intermediate * 2) as u64, "scratch.up"),
-            activated: mk((n_tokens * intermediate * 2) as u64, "scratch.activated"),
-            // Phase C3: scratch.projected packed f16. (Was reverted to
-            // f32 under Option E to fix BitNet's matmul saturation, but
-            // BitNet is gone post-2026-05-29 un-merge.)
-            projected: mk((n_tokens * embed_dim * 2) as u64, "scratch.projected"),
-        }
+
+        // Lane A: attn_out, gate, up
+        let attn_out = gpu.transient_heap_a.allocate(
+            (n_tokens * n_heads * head_dim * 2) as u64, align, "scratch.attn_out",
+        ).expect("transient_heap_a capacity for scratch.attn_out");
+        let gate = gpu.transient_heap_a.allocate(
+            (n_tokens * intermediate * 2) as u64, align, "scratch.gate",
+        ).expect("transient_heap_a capacity for scratch.gate");
+        let up = gpu.transient_heap_a.allocate(
+            (n_tokens * intermediate * 2) as u64, align, "scratch.up",
+        ).expect("transient_heap_a capacity for scratch.up");
+
+        // Lane B: normed, activated, scores
+        let normed = gpu.transient_heap_b.allocate(
+            (n_tokens * embed_dim * 2) as u64, align, "scratch.normed",
+        ).expect("transient_heap_b capacity for scratch.normed");
+        let activated = gpu.transient_heap_b.allocate(
+            (n_tokens * intermediate * 2) as u64, align, "scratch.activated",
+        ).expect("transient_heap_b capacity for scratch.activated");
+        let scores = gpu.transient_heap_b.allocate(
+            (n_tokens * n_heads * max_seq) as u64 * f32_bytes, align, "scratch.scores",
+        ).expect("transient_heap_b capacity for scratch.scores");
+
+        // Lane C: q, k, v, projected
+        let q = gpu.transient_heap_c.allocate(
+            (n_tokens * n_heads * head_dim * 2) as u64, align, "scratch.q",
+        ).expect("transient_heap_c capacity for scratch.q");
+        let k = gpu.transient_heap_c.allocate(
+            (n_tokens * n_kv_heads * head_dim * 2) as u64, align, "scratch.k",
+        ).expect("transient_heap_c capacity for scratch.k");
+        let v = gpu.transient_heap_c.allocate(
+            (n_tokens * n_kv_heads * head_dim * 2) as u64, align, "scratch.v",
+        ).expect("transient_heap_c capacity for scratch.v");
+        let projected = gpu.transient_heap_c.allocate(
+            (n_tokens * embed_dim * 2) as u64, align, "scratch.projected",
+        ).expect("transient_heap_c capacity for scratch.projected");
+
+        Self { normed, q, k, v, attn_out, scores, gate, up, activated, projected }
     }
 }
 
@@ -685,9 +705,9 @@ impl GpuEngine {
     pub fn dispatch_rmsnorm_into(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        in_buf: &wgpu::Buffer,
+        in_buf: wgpu::BindingResource<'_>,
         weight_buf: wgpu::BindingResource<'_>,
-        out_buf: &wgpu::Buffer,
+        out_buf: wgpu::BindingResource<'_>,
         n: usize,
         n_tokens: usize,
         eps: f32,
@@ -745,9 +765,9 @@ impl GpuEngine {
     pub fn dispatch_rmsnorm_f32_to_packed_into(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        in_buf: &wgpu::Buffer,
+        in_buf: wgpu::BindingResource<'_>,
         weight_buf: wgpu::BindingResource<'_>,
-        out_buf: &wgpu::Buffer,
+        out_buf: wgpu::BindingResource<'_>,
         n: usize,
         n_tokens: usize,
         eps: f32,
@@ -766,9 +786,9 @@ impl GpuEngine {
     pub fn dispatch_rmsnorm_in_pass(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
-        in_buf: &wgpu::Buffer,
+        in_buf: wgpu::BindingResource<'_>,
         weight_buf: wgpu::BindingResource<'_>,
-        out_buf: &wgpu::Buffer,
+        out_buf: wgpu::BindingResource<'_>,
         n: usize,
         n_tokens: usize,
         eps: f32,
@@ -781,9 +801,9 @@ impl GpuEngine {
         let bind = self.gpu.make_bind_group_with(
             pipeline,
             vec![
-                in_buf.as_entire_binding(),
+                in_buf,
                 weight_buf,
-                out_buf.as_entire_binding(),
+                out_buf,
                 params_buf.as_entire_binding(),
             ],
         );
@@ -799,9 +819,9 @@ impl GpuEngine {
     pub fn dispatch_rmsnorm_packed_to_f32_in_pass(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
-        in_buf: &wgpu::Buffer,
+        in_buf: wgpu::BindingResource<'_>,
         weight_buf: wgpu::BindingResource<'_>,
-        out_buf: &wgpu::Buffer,
+        out_buf: wgpu::BindingResource<'_>,
         n: usize,
         n_tokens: usize,
         eps: f32,
@@ -814,9 +834,9 @@ impl GpuEngine {
         let bind = self.gpu.make_bind_group_with(
             pipeline,
             vec![
-                in_buf.as_entire_binding(),
+                in_buf,
                 weight_buf,
-                out_buf.as_entire_binding(),
+                out_buf,
                 params_buf.as_entire_binding(),
             ],
         );
@@ -831,9 +851,9 @@ impl GpuEngine {
     pub fn dispatch_rmsnorm_f32_to_packed_in_pass(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
-        in_buf: &wgpu::Buffer,
+        in_buf: wgpu::BindingResource<'_>,
         weight_buf: wgpu::BindingResource<'_>,
-        out_buf: &wgpu::Buffer,
+        out_buf: wgpu::BindingResource<'_>,
         n: usize,
         n_tokens: usize,
         eps: f32,
@@ -846,9 +866,9 @@ impl GpuEngine {
         let bind = self.gpu.make_bind_group_with(
             pipeline,
             vec![
-                in_buf.as_entire_binding(),
+                in_buf,
                 weight_buf,
-                out_buf.as_entire_binding(),
+                out_buf,
                 params_buf.as_entire_binding(),
             ],
         );
@@ -863,9 +883,9 @@ impl GpuEngine {
     pub fn dispatch_rmsnorm_packed_to_packed_in_pass(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
-        in_buf: &wgpu::Buffer,
+        in_buf: wgpu::BindingResource<'_>,
         weight_buf: wgpu::BindingResource<'_>,
-        out_buf: &wgpu::Buffer,
+        out_buf: wgpu::BindingResource<'_>,
         n: usize,
         n_tokens: usize,
         eps: f32,
@@ -878,9 +898,9 @@ impl GpuEngine {
         let bind = self.gpu.make_bind_group_with(
             pipeline,
             vec![
-                in_buf.as_entire_binding(),
+                in_buf,
                 weight_buf,
-                out_buf.as_entire_binding(),
+                out_buf,
                 params_buf.as_entire_binding(),
             ],
         );
@@ -897,8 +917,8 @@ impl GpuEngine {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         layer: &dyn LinearLayer,
-        in_buf: &wgpu::Buffer,
-        out_buf: &wgpu::Buffer,
+        in_buf: wgpu::BindingResource<'_>,
+        out_buf: wgpu::BindingResource<'_>,
         n_tokens: usize,
     ) {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -916,8 +936,8 @@ impl GpuEngine {
         &self,
         pass: &mut wgpu::ComputePass<'_>,
         layer: &dyn LinearLayer,
-        in_buf: &wgpu::Buffer,
-        out_buf: &wgpu::Buffer,
+        in_buf: wgpu::BindingResource<'_>,
+        out_buf: wgpu::BindingResource<'_>,
         n_tokens: usize,
     ) {
         let float = layer
@@ -956,8 +976,8 @@ impl GpuEngine {
         &self,
         pass: &mut wgpu::ComputePass<'_>,
         float: &crate::layers::gpu_floatlinear::GpuFloatLinear,
-        in_buf: &wgpu::Buffer,
-        out_buf: &wgpu::Buffer,
+        in_buf: wgpu::BindingResource<'_>,
+        out_buf: wgpu::BindingResource<'_>,
         n_tokens: usize,
     ) {
         #[repr(C)]
@@ -976,8 +996,8 @@ impl GpuEngine {
             pipeline,
             vec![
                 float.weight_buffer().binding(),
-                in_buf.as_entire_binding(),
-                out_buf.as_entire_binding(),
+                in_buf,
+                out_buf,
                 params_buf.as_entire_binding(),
             ],
         );
@@ -997,8 +1017,8 @@ impl GpuEngine {
         &self,
         pass: &mut wgpu::ComputePass<'_>,
         float: &crate::layers::gpu_floatlinear::GpuFloatLinear,
-        in_buf: &wgpu::Buffer,
-        out_buf: &wgpu::Buffer,
+        in_buf: wgpu::BindingResource<'_>,
+        out_buf: wgpu::BindingResource<'_>,
         n_tokens: usize,
     ) {
         #[repr(C)]
@@ -1017,8 +1037,8 @@ impl GpuEngine {
             pipeline,
             vec![
                 float.weight_buffer().binding(),
-                in_buf.as_entire_binding(),
-                out_buf.as_entire_binding(),
+                in_buf,
+                out_buf,
                 params_buf.as_entire_binding(),
             ],
         );
@@ -1050,9 +1070,9 @@ impl GpuEngine {
         pass: &mut wgpu::ComputePass<'_>,
         gate_layer: &dyn LinearLayer,
         up_layer: &dyn LinearLayer,
-        in_buf: &wgpu::Buffer,
-        gate_out: &wgpu::Buffer,
-        up_out: &wgpu::Buffer,
+        in_buf: wgpu::BindingResource<'_>,
+        gate_out: wgpu::BindingResource<'_>,
+        up_out: wgpu::BindingResource<'_>,
         n_tokens: usize,
     ) -> bool {
         let gate_float = match gate_layer.as_any()
@@ -1090,9 +1110,9 @@ impl GpuEngine {
             vec![
                 gate_float.weight_buffer().binding(),
                 up_float.weight_buffer().binding(),
-                in_buf.as_entire_binding(),
-                gate_out.as_entire_binding(),
-                up_out.as_entire_binding(),
+                in_buf,
+                gate_out,
+                up_out,
                 params_buf.as_entire_binding(),
             ],
         );
@@ -1116,8 +1136,8 @@ impl GpuEngine {
         &self,
         pass: &mut wgpu::ComputePass<'_>,
         float: &crate::layers::gpu_floatlinear::GpuFloatLinear,
-        in_buf: &wgpu::Buffer,
-        out_buf: &wgpu::Buffer,
+        in_buf: wgpu::BindingResource<'_>,
+        out_buf: wgpu::BindingResource<'_>,
         n_tokens: usize,
     ) {
         #[repr(C)]
@@ -1136,8 +1156,8 @@ impl GpuEngine {
             pipeline,
             vec![
                 float.weight_buffer().binding(),
-                in_buf.as_entire_binding(),
-                out_buf.as_entire_binding(),
+                in_buf,
+                out_buf,
                 params_buf.as_entire_binding(),
             ],
         );
@@ -1159,8 +1179,8 @@ impl GpuEngine {
         &self,
         pass: &mut wgpu::ComputePass<'_>,
         float: &crate::layers::gpu_floatlinear::GpuFloatLinear,
-        in_buf: &wgpu::Buffer,
-        out_buf: &wgpu::Buffer,
+        in_buf: wgpu::BindingResource<'_>,
+        out_buf: wgpu::BindingResource<'_>,
         n_tokens: usize,
     ) {
         #[repr(C)]
@@ -1179,8 +1199,8 @@ impl GpuEngine {
             pipeline,
             vec![
                 float.weight_buffer().binding(),
-                in_buf.as_entire_binding(),
-                out_buf.as_entire_binding(),
+                in_buf,
+                out_buf,
                 params_buf.as_entire_binding(),
             ],
         );
@@ -1203,8 +1223,8 @@ impl GpuEngine {
         &self,
         pass: &mut wgpu::ComputePass<'_>,
         float: &crate::layers::gpu_floatlinear::GpuFloatLinear,
-        in_buf: &wgpu::Buffer,
-        out_buf: &wgpu::Buffer,
+        in_buf: wgpu::BindingResource<'_>,
+        out_buf: wgpu::BindingResource<'_>,
         n_tokens: usize,
     ) {
         #[repr(C)]
@@ -1223,8 +1243,8 @@ impl GpuEngine {
             pipeline,
             vec![
                 float.weight_buffer().binding(),
-                in_buf.as_entire_binding(),
-                out_buf.as_entire_binding(),
+                in_buf,
+                out_buf,
                 params_buf.as_entire_binding(),
             ],
         );
@@ -1246,8 +1266,8 @@ impl GpuEngine {
         &self,
         pass: &mut wgpu::ComputePass<'_>,
         layer: &dyn LinearLayer,
-        in_packed_buf: &wgpu::Buffer,
-        out_packed_buf: &wgpu::Buffer,
+        in_packed_buf: wgpu::BindingResource<'_>,
+        out_packed_buf: wgpu::BindingResource<'_>,
         n_tokens: usize,
     ) {
         let float = layer
@@ -1272,8 +1292,8 @@ impl GpuEngine {
         &self,
         pass: &mut wgpu::ComputePass<'_>,
         layer: &dyn LinearLayer,
-        in_buf: &wgpu::Buffer,
-        out_buf: &wgpu::Buffer,
+        in_buf: wgpu::BindingResource<'_>,
+        out_buf: wgpu::BindingResource<'_>,
         n_tokens: usize,
     ) {
         let float = layer
@@ -1297,8 +1317,8 @@ impl GpuEngine {
         &self,
         pass: &mut wgpu::ComputePass<'_>,
         float: &crate::layers::gpu_floatlinear::GpuFloatLinear,
-        in_buf: &wgpu::Buffer,
-        out_buf: &wgpu::Buffer,
+        in_buf: wgpu::BindingResource<'_>,
+        out_buf: wgpu::BindingResource<'_>,
         n_tokens: usize,
     ) {
         #[repr(C)]
@@ -1317,8 +1337,8 @@ impl GpuEngine {
             pipeline,
             vec![
                 float.weight_buffer().binding(),
-                in_buf.as_entire_binding(),
-                out_buf.as_entire_binding(),
+                in_buf,
+                out_buf,
                 params_buf.as_entire_binding(),
             ],
         );
@@ -1339,8 +1359,8 @@ impl GpuEngine {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         layer: &dyn LinearLayer,
-        in_buf: &wgpu::Buffer,
-        out_buf: &wgpu::Buffer,
+        in_buf: wgpu::BindingResource<'_>,
+        out_buf: wgpu::BindingResource<'_>,
         n_tokens: usize,
     ) {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1473,8 +1493,8 @@ impl GpuEngine {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         layer: &dyn LinearLayer,
-        in_packed_buf: &wgpu::Buffer,
-        out_buf: &wgpu::Buffer,
+        in_packed_buf: wgpu::BindingResource<'_>,
+        out_buf: wgpu::BindingResource<'_>,
         n_tokens: usize,
     ) {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1489,8 +1509,8 @@ impl GpuEngine {
         &self,
         pass: &mut wgpu::ComputePass<'_>,
         layer: &dyn LinearLayer,
-        in_buf: &wgpu::Buffer,
-        out_buf: &wgpu::Buffer,
+        in_buf: wgpu::BindingResource<'_>,
+        out_buf: wgpu::BindingResource<'_>,
         n_tokens: usize,
     ) {
         self.dispatch_matmul_in_pass(pass, layer, in_buf, out_buf, n_tokens);
@@ -1501,8 +1521,8 @@ impl GpuEngine {
         &self,
         pass: &mut wgpu::ComputePass<'_>,
         layer: &dyn LinearLayer,
-        in_packed_buf: &wgpu::Buffer,
-        out_buf: &wgpu::Buffer,
+        in_packed_buf: wgpu::BindingResource<'_>,
+        out_buf: wgpu::BindingResource<'_>,
         n_tokens: usize,
     ) {
         self.dispatch_matmul_packed_input_in_pass(pass, layer, in_packed_buf, out_buf, n_tokens);
@@ -1711,7 +1731,7 @@ impl GpuEngine {
             self.forward_block_gpu_inner(&mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch, capture, None, None, None);
         }
         self.dispatch_rmsnorm_into(
-            &mut encoder, &hidden_buf, self.final_norm_weight_buf.binding(), &normed_buf,
+            &mut encoder, hidden_buf.as_entire_binding(), self.final_norm_weight_buf.binding(), normed_buf.as_entire_binding(),
             self.embed_dim, n_tokens, self.final_norm_eps,
         );
         encoder.copy_buffer_to_buffer(&normed_buf, 0, &normed_staging, 0, bytes);
@@ -1866,7 +1886,7 @@ impl GpuEngine {
         }
         // Final RMSNorm — gives the final post-norm hidden state shims read.
         self.dispatch_rmsnorm_into(
-            &mut encoder, &hidden_buf, self.final_norm_weight_buf.binding(), &normed_buf,
+            &mut encoder, hidden_buf.as_entire_binding(), self.final_norm_weight_buf.binding(), normed_buf.as_entire_binding(),
             self.embed_dim, n_tokens, self.final_norm_eps,
         );
         encoder.copy_buffer_to_buffer(&normed_buf, 0, &normed_staging, 0, hidden_bytes);
@@ -2772,7 +2792,7 @@ impl GpuEngine {
         {
             let mut pass = self.begin_timed_pass(&mut encoder, "final_norm");
             self.dispatch_rmsnorm_packed_to_packed_in_pass(
-                &mut pass, &hidden_buf, self.final_norm_weight_buf.binding(), &normed_buf,
+                &mut pass, hidden_buf.as_entire_binding(), self.final_norm_weight_buf.binding(), normed_buf.as_entire_binding(),
                 self.embed_dim, n_tokens, self.final_norm_eps,
             );
         }
@@ -3138,7 +3158,7 @@ impl GpuEngine {
                 timestamp_writes: None,
             });
             self.dispatch_rmsnorm_packed_to_packed_in_pass(
-                &mut pass, &hidden_buf, self.final_norm_weight_buf.binding(), &normed_buf,
+                &mut pass, hidden_buf.as_entire_binding(), self.final_norm_weight_buf.binding(), normed_buf.as_entire_binding(),
                 self.embed_dim, n_tokens, self.final_norm_eps,
             );
         }
@@ -3507,7 +3527,7 @@ impl GpuEngine {
             });
             // C3: hidden packed, normed packed.
             self.dispatch_rmsnorm_packed_to_packed_in_pass(
-                &mut pass, &hidden_buf, self.final_norm_weight_buf.binding(), &normed_buf,
+                &mut pass, hidden_buf.as_entire_binding(), self.final_norm_weight_buf.binding(), normed_buf.as_entire_binding(),
                 self.embed_dim, n_tokens, self.final_norm_eps,
             );
         }
@@ -3648,39 +3668,39 @@ impl GpuEngine {
             // C3: hidden_buf is packed — use packed broadcast.
             if let Some(delta_buf) = pre_block_hidden_inject {
                 self.dispatch_add_broadcast_in_pass(
-                    &mut pass, hidden_buf, delta_buf, embed_dim, n_tokens,
+                    &mut pass, hidden_buf.as_entire_binding(), delta_buf, embed_dim, n_tokens,
                 );
             }
 
             // 1. attn_norm: hidden packed → normed packed.
             self.dispatch_rmsnorm_packed_to_packed_in_pass(
-                &mut pass, hidden_buf, block_gpu.attn_norm_weight_buf.binding(), &scratch.normed,
+                &mut pass, hidden_buf.as_entire_binding(), block_gpu.attn_norm_weight_buf.binding(), scratch.normed.binding(),
                 embed_dim, n_tokens, block_gpu.attn_norm_eps,
             );
 
             // 2-4. Q, K, V projections (+ optional Qwen-style biases).
             // C3: scratch.q/k/v packed → packed_io dispatcher; bias add
             // and RoPE use their packed variants.
-            self.dispatch_linear_batch_packed_io_in_pass(&mut pass, attn.q_proj(), &scratch.normed, &scratch.q, n_tokens);
+            self.dispatch_linear_batch_packed_io_in_pass(&mut pass, attn.q_proj(), scratch.normed.binding(), scratch.q.binding(), n_tokens);
             if let Some(buf) = block_gpu.q_bias_buf.as_ref() {
-                self.dispatch_bias_add_packed_in_pass(&mut pass, &scratch.q, buf.binding(), q_dim, n_tokens);
+                self.dispatch_bias_add_packed_in_pass(&mut pass, scratch.q.binding(), buf.binding(), q_dim, n_tokens);
             }
-            self.dispatch_linear_batch_packed_io_in_pass(&mut pass, attn.k_proj(), &scratch.normed, &scratch.k, n_tokens);
+            self.dispatch_linear_batch_packed_io_in_pass(&mut pass, attn.k_proj(), scratch.normed.binding(), scratch.k.binding(), n_tokens);
             if let Some(buf) = block_gpu.k_bias_buf.as_ref() {
-                self.dispatch_bias_add_packed_in_pass(&mut pass, &scratch.k, buf.binding(), kv_dim, n_tokens);
+                self.dispatch_bias_add_packed_in_pass(&mut pass, scratch.k.binding(), buf.binding(), kv_dim, n_tokens);
             }
-            self.dispatch_linear_batch_packed_io_in_pass(&mut pass, attn.v_proj(), &scratch.normed, &scratch.v, n_tokens);
+            self.dispatch_linear_batch_packed_io_in_pass(&mut pass, attn.v_proj(), scratch.normed.binding(), scratch.v.binding(), n_tokens);
             if let Some(buf) = block_gpu.v_bias_buf.as_ref() {
-                self.dispatch_bias_add_packed_in_pass(&mut pass, &scratch.v, buf.binding(), kv_dim, n_tokens);
+                self.dispatch_bias_add_packed_in_pass(&mut pass, scratch.v.binding(), buf.binding(), kv_dim, n_tokens);
             }
 
             // 5. RoPE on Q and K (in-place packed).
             self.dispatch_rope_packed_in_pass(
-                &mut pass, &scratch.q, self.rope_cos_buf.binding(), self.rope_sin_buf.binding(),
+                &mut pass, scratch.q.binding(), self.rope_cos_buf.binding(), self.rope_sin_buf.binding(),
                 n_heads, head_dim, start_pos, n_tokens,
             );
             self.dispatch_rope_packed_in_pass(
-                &mut pass, &scratch.k, self.rope_cos_buf.binding(), self.rope_sin_buf.binding(),
+                &mut pass, scratch.k.binding(), self.rope_cos_buf.binding(), self.rope_sin_buf.binding(),
                 n_kv_heads, head_dim, start_pos, n_tokens,
             );
 
@@ -3690,7 +3710,7 @@ impl GpuEngine {
             // so we re-emit .binding() at each consumption site).
             if let Some((k_cache, v_cache)) = kv_cache_target {
                 self.dispatch_kv_write_in_pass(
-                    &mut pass, &scratch.k, &scratch.v,
+                    &mut pass, scratch.k.binding(), scratch.v.binding(),
                     k_cache.binding(), v_cache.binding(),
                     kv_dim, start_pos, n_tokens,
                 );
@@ -3704,7 +3724,7 @@ impl GpuEngine {
         // splits inside `dispatch_attention_inner`.
         let (k_for_attn, v_for_attn, attn_max_seq) = match kv_cache_target {
             Some((kc, vc)) => (kc.binding(), vc.binding(), start_pos + n_tokens),
-            None => (scratch.k.as_entire_binding(), scratch.v.as_entire_binding(), n_tokens),
+            None => (scratch.k.binding(), scratch.v.binding(), n_tokens),
         };
         // Perf-bisect: see CORTEX_SKIP_SCORE / SOFTMAX / VALUE inside
         // `dispatch_attention_inner` — per-stage skip flags that bypass
@@ -3714,8 +3734,8 @@ impl GpuEngine {
         // flags are the correct path.)
         self.dispatch_attention_inner(
             encoder,
-            &scratch.q, k_for_attn, v_for_attn,
-            &scratch.scores, &scratch.attn_out,
+            scratch.q.binding(), k_for_attn, v_for_attn,
+            &scratch.scores, scratch.attn_out.binding(),
             n_heads, n_kv_heads, head_dim,
             start_pos, attn_max_seq, n_tokens,
             pre_softmax_capture,
@@ -3731,14 +3751,14 @@ impl GpuEngine {
             // 7. O projection — C3 restored: packed attn_out → packed projected.
             // (BitNet sub-norm branches removed with the 2026-05-29 un-merge;
             // float models never had o_sub_norm_weight_buf set.)
-            self.dispatch_linear_batch_packed_io_in_pass(&mut pass, attn.o_proj(), &scratch.attn_out, &scratch.projected, n_tokens);
+            self.dispatch_linear_batch_packed_io_in_pass(&mut pass, attn.o_proj(), scratch.attn_out.binding(), scratch.projected.binding(), n_tokens);
 
             // 8. Residual: hidden (packed) += projected (packed) — C3.
-            self.dispatch_add_packed_in_pass(&mut pass, hidden_buf, &scratch.projected, embed_dim, n_tokens);
+            self.dispatch_add_packed_in_pass(&mut pass, hidden_buf.as_entire_binding(), scratch.projected.binding(), embed_dim, n_tokens);
 
             // 9. ffn_norm: hidden packed → normed packed — C3.
             self.dispatch_rmsnorm_packed_to_packed_in_pass(
-                &mut pass, hidden_buf, block_gpu.ffn_norm_weight_buf.binding(), &scratch.normed,
+                &mut pass, hidden_buf.as_entire_binding(), block_gpu.ffn_norm_weight_buf.binding(), scratch.normed.binding(),
                 embed_dim, n_tokens, block_gpu.ffn_norm_eps,
             );
 
@@ -3750,23 +3770,23 @@ impl GpuEngine {
             // for BitNet).
             let fused_ok = n_tokens >= 16 && self.dispatch_gate_up_fused_in_pass(
                 &mut pass, swiglu.gate_proj(), swiglu.up_proj(),
-                &scratch.normed, &scratch.gate, &scratch.up, n_tokens,
+                scratch.normed.binding(), scratch.gate.binding(), scratch.up.binding(), n_tokens,
             );
             if !fused_ok {
-                self.dispatch_linear_batch_packed_io_in_pass(&mut pass, swiglu.gate_proj(), &scratch.normed, &scratch.gate, n_tokens);
-                self.dispatch_linear_batch_packed_io_in_pass(&mut pass, swiglu.up_proj(),   &scratch.normed, &scratch.up,   n_tokens);
+                self.dispatch_linear_batch_packed_io_in_pass(&mut pass, swiglu.gate_proj(), scratch.normed.binding(), scratch.gate.binding(), n_tokens);
+                self.dispatch_linear_batch_packed_io_in_pass(&mut pass, swiglu.up_proj(),   scratch.normed.binding(), scratch.up.binding(),   n_tokens);
             }
 
             // 12. silu(gate) * up — packed in C2.
-            self.dispatch_gate_mul_packed_in_pass(&mut pass, &scratch.gate, &scratch.up, &scratch.activated, intermediate, n_tokens, swiglu.activation());
+            self.dispatch_gate_mul_packed_in_pass(&mut pass, scratch.gate.binding(), scratch.up.binding(), scratch.activated.binding(), intermediate, n_tokens, swiglu.activation());
 
             // 13. Down projection — C3: packed input, packed output.
             // (BitNet ffn_sub_norm branch removed with the 2026-05-29 un-merge;
             // float models never had ffn_sub_norm_weight_buf set.)
-            self.dispatch_linear_batch_packed_io_in_pass(&mut pass, swiglu.down_proj(), &scratch.activated, &scratch.projected, n_tokens);
+            self.dispatch_linear_batch_packed_io_in_pass(&mut pass, swiglu.down_proj(), scratch.activated.binding(), scratch.projected.binding(), n_tokens);
 
             // 14. Residual: hidden (packed) += projected (packed) — C3.
-            self.dispatch_add_packed_in_pass(&mut pass, hidden_buf, &scratch.projected, embed_dim, n_tokens);
+            self.dispatch_add_packed_in_pass(&mut pass, hidden_buf.as_entire_binding(), scratch.projected.binding(), embed_dim, n_tokens);
             // pass2 ends here (drop)
         }
 
@@ -4077,7 +4097,7 @@ impl GpuEngine {
             label: Some("gpu_engine.rope.pass"),
             timestamp_writes: None,
         });
-        self.dispatch_rope_in_pass(&mut pass, x_buf, cos_buf, sin_buf, n_heads, head_dim, start_pos, n_tokens);
+        self.dispatch_rope_in_pass(&mut pass, x_buf.as_entire_binding(), cos_buf, sin_buf, n_heads, head_dim, start_pos, n_tokens);
     }
 
     /// In-pass variant. See `dispatch_rope_into`.
@@ -4085,7 +4105,7 @@ impl GpuEngine {
     pub fn dispatch_rope_in_pass(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
-        x_buf: &wgpu::Buffer,
+        x_buf: wgpu::BindingResource<'_>,
         cos_buf: wgpu::BindingResource<'_>,
         sin_buf: wgpu::BindingResource<'_>,
         n_heads: usize,
@@ -4110,7 +4130,7 @@ impl GpuEngine {
         let bind_group = self.gpu.make_bind_group_with(
             pipeline,
             vec![
-                x_buf.as_entire_binding(),
+                x_buf,
                 cos_buf,
                 sin_buf,
                 params_buf.as_entire_binding(),
@@ -4181,7 +4201,7 @@ impl GpuEngine {
     pub fn dispatch_rope_packed_in_pass(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
-        x_buf: &wgpu::Buffer,
+        x_buf: wgpu::BindingResource<'_>,
         cos_buf: wgpu::BindingResource<'_>,
         sin_buf: wgpu::BindingResource<'_>,
         n_heads: usize,
@@ -4208,7 +4228,7 @@ impl GpuEngine {
         let bind_group = self.gpu.make_bind_group_with(
             pipeline,
             vec![
-                x_buf.as_entire_binding(),
+                x_buf,
                 cos_buf,
                 sin_buf,
                 params_buf.as_entire_binding(),
@@ -4245,7 +4265,7 @@ impl GpuEngine {
         q_buf: &wgpu::Buffer,
         k_buf: &wgpu::Buffer,
         v_buf: &wgpu::Buffer,
-        scores_buf: &wgpu::Buffer,
+        scores_buf: &::vram_heap::VramAllocation,
         out_buf: &wgpu::Buffer,
         n_heads: usize,
         n_kv_heads: usize,
@@ -4255,8 +4275,12 @@ impl GpuEngine {
         n_tokens: usize,
     ) {
         self.dispatch_attention_inner(
-            encoder, q_buf, k_buf.as_entire_binding(), v_buf.as_entire_binding(),
-            scores_buf, out_buf,
+            encoder,
+            q_buf.as_entire_binding(),
+            k_buf.as_entire_binding(),
+            v_buf.as_entire_binding(),
+            scores_buf,
+            out_buf.as_entire_binding(),
             n_heads, n_kv_heads, head_dim, start_pos, max_seq, n_tokens,
             None,
         );
@@ -4270,17 +4294,23 @@ impl GpuEngine {
     #[allow(clippy::too_many_arguments)]
     /// Phase F (vram-heap): `k_buf` and `v_buf` are `BindingResource` so
     /// GpuKvCache sub-allocations (cached path) bind at sub-ranges; the
-    /// prefill path passes `scratch.k.as_entire_binding()` /
-    /// `scratch.v.as_entire_binding()`.
+    /// prefill path passes `scratch.k.binding()` / `scratch.v.binding()`.
+    ///
+    /// Phase I: `q_buf`, `scores_buf`, `out_buf` become `BindingResource`
+    /// too — they're all BlockScratch fields on the f32 path.
+    /// `scores_buf` is consumed three times internally (attn_score W,
+    /// optional capture R, softmax RW, attn_value R); the function takes
+    /// `&VramAllocation` so it can call `.binding()` at each consumption
+    /// site (BindingResource is move-only).
     #[allow(clippy::too_many_arguments)]
     fn dispatch_attention_inner(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        q_buf: &wgpu::Buffer,
+        q_buf: wgpu::BindingResource<'_>,
         k_buf: wgpu::BindingResource<'_>,
         v_buf: wgpu::BindingResource<'_>,
-        scores_buf: &wgpu::Buffer,
-        out_buf: &wgpu::Buffer,
+        scores_buf: &::vram_heap::VramAllocation,
+        out_buf: wgpu::BindingResource<'_>,
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
@@ -4331,10 +4361,10 @@ impl GpuEngine {
             let bind = self.gpu.make_bind_group_with(
                 pipeline,
                 vec![
-                    q_buf.as_entire_binding(),
+                    q_buf,
                     k_buf,
                     v_buf,
-                    out_buf.as_entire_binding(),
+                    out_buf,
                     params_buf.as_entire_binding(),
                 ],
             );
@@ -4375,9 +4405,9 @@ impl GpuEngine {
         let score_bind = self.gpu.make_bind_group_with(
             score_pipeline,
             vec![
-                q_buf.as_entire_binding(),
+                q_buf,
                 k_buf,
-                scores_buf.as_entire_binding(),
+                scores_buf.binding(),
                 score_params_buf.as_entire_binding(),
             ],
         );
@@ -4396,7 +4426,10 @@ impl GpuEngine {
         // ---- 1.5. (optional) capture pre-softmax scores ----
         if let Some(capture_buf) = pre_softmax_capture {
             let bytes = (n_tokens * n_heads * max_seq * std::mem::size_of::<f32>()) as u64;
-            encoder.copy_buffer_to_buffer(scores_buf, 0, capture_buf, 0, bytes);
+            encoder.copy_buffer_to_buffer(
+                scores_buf.buffer(), scores_buf.offset(),
+                capture_buf, 0, bytes,
+            );
         }
 
         // ---- 2. softmax: in-place over scores ----
@@ -4408,9 +4441,12 @@ impl GpuEngine {
         };
         let softmax_params_buf = self.gpu.create_params_buffer(&softmax_params);
         let softmax_pipeline = &self.gpu.pipelines.softmax_batch;
-        let softmax_bind = self.gpu.make_bind_group(
+        let softmax_bind = self.gpu.make_bind_group_with(
             softmax_pipeline,
-            &[scores_buf, &softmax_params_buf],
+            vec![
+                scores_buf.binding(),
+                softmax_params_buf.as_entire_binding(),
+            ],
         );
         // One workgroup per (tok, head) pair.
         let softmax_groups = (n_tokens * n_heads) as u32;
@@ -4437,9 +4473,9 @@ impl GpuEngine {
         let value_bind = self.gpu.make_bind_group_with(
             value_pipeline,
             vec![
-                scores_buf.as_entire_binding(),
+                scores_buf.binding(),
                 v_buf,
-                out_buf.as_entire_binding(),
+                out_buf,
                 value_params_buf.as_entire_binding(),
             ],
         );
@@ -4458,12 +4494,13 @@ impl GpuEngine {
     /// `[n_tokens, n]` flat. Used by the SwiGLU FFN. SiLU activation only;
     /// ReLU² (BitNet variant) needs a separate shader and is deferred until
     /// the ternary fused path lands.
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch_silu_mul_into(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        gate_buf: &wgpu::Buffer,
-        up_buf: &wgpu::Buffer,
-        out_buf: &wgpu::Buffer,
+        gate_buf: wgpu::BindingResource<'_>,
+        up_buf: wgpu::BindingResource<'_>,
+        out_buf: wgpu::BindingResource<'_>,
         n: usize,
         n_tokens: usize,
     ) {
@@ -4477,12 +4514,13 @@ impl GpuEngine {
     /// or `relu2_mul_batch` based on the SwiGLU's activation kind.
     /// Both pipelines share the same binding layout, so the buffer
     /// arguments are interchangeable.
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch_gate_mul_into(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        gate_buf: &wgpu::Buffer,
-        up_buf: &wgpu::Buffer,
-        out_buf: &wgpu::Buffer,
+        gate_buf: wgpu::BindingResource<'_>,
+        up_buf: wgpu::BindingResource<'_>,
+        out_buf: wgpu::BindingResource<'_>,
         n: usize,
         n_tokens: usize,
         activation: crate::layers::swiglu::GateActivation,
@@ -4499,9 +4537,9 @@ impl GpuEngine {
     pub fn dispatch_gate_mul_in_pass(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
-        gate_buf: &wgpu::Buffer,
-        up_buf: &wgpu::Buffer,
-        out_buf: &wgpu::Buffer,
+        gate_buf: wgpu::BindingResource<'_>,
+        up_buf: wgpu::BindingResource<'_>,
+        out_buf: wgpu::BindingResource<'_>,
         n: usize,
         n_tokens: usize,
         activation: crate::layers::swiglu::GateActivation,
@@ -4512,9 +4550,9 @@ impl GpuEngine {
         // Float-only after BitNet un-merge: SiLU is the only activation.
         let _ = activation;
         let pipeline = &self.gpu.pipelines.silu_mul_batch;
-        let bind = self.gpu.make_bind_group(
+        let bind = self.gpu.make_bind_group_with(
             pipeline,
-            &[gate_buf, up_buf, out_buf, &params_buf],
+            vec![gate_buf, up_buf, out_buf, params_buf.as_entire_binding()],
         );
 
         let total = (n * n_tokens) as u32;
@@ -4533,9 +4571,9 @@ impl GpuEngine {
     pub fn dispatch_gate_mul_packed_in_pass(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
-        gate_buf: &wgpu::Buffer,
-        up_buf: &wgpu::Buffer,
-        out_buf: &wgpu::Buffer,
+        gate_buf: wgpu::BindingResource<'_>,
+        up_buf: wgpu::BindingResource<'_>,
+        out_buf: wgpu::BindingResource<'_>,
         n: usize,
         n_tokens: usize,
         activation: crate::layers::swiglu::GateActivation,
@@ -4545,9 +4583,9 @@ impl GpuEngine {
 
         let _ = activation;
         let pipeline = &self.gpu.pipelines.silu_mul_batch_packed;
-        let bind = self.gpu.make_bind_group(
+        let bind = self.gpu.make_bind_group_with(
             pipeline,
-            &[gate_buf, up_buf, out_buf, &params_buf],
+            vec![gate_buf, up_buf, out_buf, params_buf.as_entire_binding()],
         );
 
         // Half the elements since each u32 packs 2.
@@ -4573,8 +4611,8 @@ impl GpuEngine {
     pub fn dispatch_kv_write_into(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        k_src: &wgpu::Buffer,
-        v_src: &wgpu::Buffer,
+        k_src: wgpu::BindingResource<'_>,
+        v_src: wgpu::BindingResource<'_>,
         k_cache: wgpu::BindingResource<'_>,
         v_cache: wgpu::BindingResource<'_>,
         kv_dim: usize,
@@ -4593,8 +4631,8 @@ impl GpuEngine {
     pub fn dispatch_kv_write_in_pass(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
-        k_src: &wgpu::Buffer,
-        v_src: &wgpu::Buffer,
+        k_src: wgpu::BindingResource<'_>,
+        v_src: wgpu::BindingResource<'_>,
         k_cache: wgpu::BindingResource<'_>,
         v_cache: wgpu::BindingResource<'_>,
         kv_dim: usize,
@@ -4613,8 +4651,8 @@ impl GpuEngine {
         let bind = self.gpu.make_bind_group_with(
             pipeline,
             vec![
-                k_src.as_entire_binding(),
-                v_src.as_entire_binding(),
+                k_src,
+                v_src,
                 k_cache,
                 v_cache,
                 params_buf.as_entire_binding(),
@@ -4647,14 +4685,14 @@ impl GpuEngine {
             label: Some("gpu_engine.bias_add.pass"),
             timestamp_writes: None,
         });
-        self.dispatch_bias_add_in_pass(&mut pass, a_buf, bias_buf, n, n_tokens);
+        self.dispatch_bias_add_in_pass(&mut pass, a_buf.as_entire_binding(), bias_buf, n, n_tokens);
     }
 
     /// In-pass variant. See `dispatch_bias_add_into`.
     pub fn dispatch_bias_add_in_pass(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
-        a_buf: &wgpu::Buffer,
+        a_buf: wgpu::BindingResource<'_>,
         bias_buf: wgpu::BindingResource<'_>,
         n: usize,
         n_tokens: usize,
@@ -4666,7 +4704,7 @@ impl GpuEngine {
         let bind = self.gpu.make_bind_group_with(
             pipeline,
             vec![
-                a_buf.as_entire_binding(),
+                a_buf,
                 bias_buf,
                 params_buf.as_entire_binding(),
             ],
@@ -4716,7 +4754,7 @@ impl GpuEngine {
     pub fn dispatch_bias_add_packed_in_pass(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
-        a_buf: &wgpu::Buffer,
+        a_buf: wgpu::BindingResource<'_>,
         bias_buf: wgpu::BindingResource<'_>,
         n: usize,
         n_tokens: usize,
@@ -4727,7 +4765,7 @@ impl GpuEngine {
         let bind = self.gpu.make_bind_group_with(
             pipeline,
             vec![
-                a_buf.as_entire_binding(),
+                a_buf,
                 bias_buf,
                 params_buf.as_entire_binding(),
             ],
@@ -4753,7 +4791,7 @@ impl GpuEngine {
             label: Some("gpu_engine.add.pass"),
             timestamp_writes: None,
         });
-        self.dispatch_add_in_pass(&mut pass, a_buf, b_buf, n, n_tokens);
+        self.dispatch_add_in_pass(&mut pass, a_buf.as_entire_binding(), b_buf.as_entire_binding(), n, n_tokens);
     }
 
     /// Phase C3: packed-`a` packed-`b` variant of dispatch_add_in_pass.
@@ -4761,15 +4799,18 @@ impl GpuEngine {
     pub fn dispatch_add_packed_in_pass(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
-        a_buf: &wgpu::Buffer,
-        b_buf: &wgpu::Buffer,
+        a_buf: wgpu::BindingResource<'_>,
+        b_buf: wgpu::BindingResource<'_>,
         n: usize,
         n_tokens: usize,
     ) {
         let params = AddInplaceBatchParams { n: n as u32, n_tokens: n_tokens as u32 };
         let params_buf = self.gpu.create_params_buffer(&params);
         let pipeline = &self.gpu.pipelines.add_inplace_batch_packed;
-        let bind = self.gpu.make_bind_group(pipeline, &[a_buf, b_buf, &params_buf]);
+        let bind = self.gpu.make_bind_group_with(
+            pipeline,
+            vec![a_buf, b_buf, params_buf.as_entire_binding()],
+        );
         let total = (n * n_tokens / 2) as u32;
         let groups = (total + 255) / 256;
         pass.set_pipeline(pipeline);
@@ -4814,8 +4855,8 @@ impl GpuEngine {
     pub fn dispatch_add_in_pass(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
-        a_buf: &wgpu::Buffer,
-        b_buf: &wgpu::Buffer,
+        a_buf: wgpu::BindingResource<'_>,
+        b_buf: wgpu::BindingResource<'_>,
         n: usize,
         n_tokens: usize,
     ) {
@@ -4823,9 +4864,9 @@ impl GpuEngine {
         let params_buf = self.gpu.create_params_buffer(&params);
 
         let pipeline = &self.gpu.pipelines.add_inplace_batch;
-        let bind = self.gpu.make_bind_group(
+        let bind = self.gpu.make_bind_group_with(
             pipeline,
-            &[a_buf, b_buf, &params_buf],
+            vec![a_buf, b_buf, params_buf.as_entire_binding()],
         );
 
         // Phase B: `a` is packed f16 (2 per u32). Dispatch one thread
@@ -4873,7 +4914,7 @@ impl GpuEngine {
     pub fn dispatch_add_broadcast_in_pass(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
-        a_buf: &wgpu::Buffer,
+        a_buf: wgpu::BindingResource<'_>,
         delta_buf: &wgpu::Buffer,
         n: usize,
         n_tokens: usize,
@@ -4882,9 +4923,13 @@ impl GpuEngine {
         let params_buf = self.gpu.create_params_buffer(&params);
 
         let pipeline = &self.gpu.pipelines.add_broadcast_batch;
-        let bind = self.gpu.make_bind_group(
+        let bind = self.gpu.make_bind_group_with(
             pipeline,
-            &[a_buf, delta_buf, &params_buf],
+            vec![
+                a_buf,
+                delta_buf.as_entire_binding(),
+                params_buf.as_entire_binding(),
+            ],
         );
 
         // Phase B: `a` is packed f16 (2 per u32). Halve dispatch count.
@@ -5523,12 +5568,11 @@ mod tests {
             usage: wgpu::BufferUsages::STORAGE,
         });
         let scores_bytes = (n_tokens * n_heads * max_seq * std::mem::size_of::<f32>()) as u64;
-        let scores_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("attn_test.scores"),
-            size: scores_bytes,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
+        let scores_buf = gpu.transient_heap_b.allocate(
+            scores_bytes,
+            ::vram_heap::STORAGE_BUFFER_OFFSET_ALIGNMENT_NVIDIA,
+            "attn_test.scores",
+        ).expect("transient_heap_b capacity for attn_test.scores");
         // C3: out buffer packed (half size).
         let out_bytes = (n_tokens * q_dim * 2) as u64;
         let out_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -5613,10 +5657,11 @@ mod tests {
             usage: wgpu::BufferUsages::STORAGE,
         });
         let scores_bytes = (n_tokens * n_heads * max_seq * 4) as u64;
-        let scores_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("attn_test1.scores"), size: scores_bytes,
-            usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false,
-        });
+        let scores_buf = gpu.transient_heap_b.allocate(
+            scores_bytes,
+            ::vram_heap::STORAGE_BUFFER_OFFSET_ALIGNMENT_NVIDIA,
+            "attn_test1.scores",
+        ).expect("transient_heap_b capacity for attn_test1.scores");
         let out_bytes = (n_tokens * q_dim * 4) as u64;
         let out_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("attn_test1.out"), size: out_bytes,
