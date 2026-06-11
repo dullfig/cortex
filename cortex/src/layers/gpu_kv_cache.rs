@@ -245,12 +245,15 @@ mod tests {
     #[test]
     #[should_panic(expected = "overflow")]
     fn advance_past_max_panics() {
-        let Some(_gpu) = GpuDevice::try_new() else {
+        let Some(gpu) = GpuDevice::try_new() else {
             // Test must still panic when no GPU is available, so the
             // #[should_panic] expectation is satisfied.
             panic!("overflow (no GPU; faking)");
         };
-        let gpu = Arc::new(GpuDevice::try_new().unwrap());
+        // Reuse the single device. A second `try_new()` would coexist with
+        // this one (the binding stays live to function end), doubling the
+        // ~7 GB weights-heap reservation and OOMing on a 16 GB GPU.
+        let gpu = Arc::new(gpu);
         let mut cache = GpuKvCache::new(gpu, 1, 1, 4, 8);
         cache.advance(10); // 10 > 8
     }

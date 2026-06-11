@@ -979,10 +979,13 @@ mod tests {
     fn from_f32_cache_gpu_layer_mismatch_panics() {
         use crate::layers::gpu_kv_cache::GpuKvCache;
 
-        let Some(_gpu) = GpuDevice::try_new() else {
+        let Some(gpu) = GpuDevice::try_new() else {
             panic!("polar n_layers (no GPU; faking)");
         };
-        let gpu = Arc::new(GpuDevice::try_new().unwrap());
+        // Reuse the single device. A second `try_new()` would coexist with
+        // this one (the binding stays live to function end), doubling the
+        // ~7 GB weights-heap reservation and OOMing on a 16 GB GPU.
+        let gpu = Arc::new(gpu);
 
         let f32_cache = GpuKvCache::new(gpu.clone(), /*layers*/ 3, 1, 8, 4);
         let mut polar = GpuPolarKvCache::new(gpu.clone(), /*layers*/ 2, 1, 8, 4, 42);
