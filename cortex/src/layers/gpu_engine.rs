@@ -215,6 +215,37 @@ impl HiddenCaptures {
     }
 }
 
+/// Pure Lane-B prefill chunk-size math, factored out of
+/// [`GpuEngine::safe_prefill_chunk_size`] so it can be unit-tested without
+/// a GPU. Returns the largest token count `n` whose f32 `BlockScratch`
+/// Lane-B footprint fits `budget` bytes at attention `start_pos`:
+///
+/// ```text
+///   normed(n)    = n · embed · 2
+///   activated(n) = n · intermediate · 2
+///   scores(n)    = n · n_heads · (start_pos + n) · 4
+///   normed + activated + scores ≤ budget
+/// ```
+///
+/// Substituting `A = n_heads·4` (scores' quadratic coeff) and
+/// `L = (embed + intermediate)·2` (the linear normed+activated coeff)
+/// gives `A·n² + (A·start + L)·n − budget ≤ 0`, solved for the positive
+/// root. Always returns at least 1 (a single token's scores is tiny at
+/// any realistic `max_seq`, so the floor never starves the prefill).
+fn lane_b_chunk_size(
+    start_pos: usize,
+    n_heads: usize,
+    embed: usize,
+    intermediate: usize,
+    budget: u64,
+) -> usize {
+    let a = (n_heads * 4) as f64;
+    let l = ((embed + intermediate) * 2) as f64;
+    let lin = a * start_pos as f64 + l;
+    let n = ((-lin + (lin * lin + 4.0 * a * budget as f64).sqrt()) / (2.0 * a)).floor();
+    (n as usize).max(1)
+}
+
 /// Per-block scratch buffers reused across all dispatches inside a single
 /// `forward_block_gpu` call.
 ///
@@ -2162,6 +2193,22 @@ impl GpuEngine {
             .intermediate_size();
         let n_heads = attn0.n_heads();
         let head_dim = attn0.head_dim();
+        // The polar retrieve path is unchunked (unlike cache_load's f32
+        // prefill, which chunks via `safe_prefill_chunk_size`). Retrieve
+        // queries are normally short, so `scores`
+        // (n_tokens · n_heads · attn_max_seq · 4) stays small — but a long
+        // query against a large shard can exceed Lane B. Fail with a clear,
+        // actionable message instead of the opaque `OutOfMemory` the
+        // `PolarBlockScratch::allocate` `.expect` would otherwise emit.
+        let scores_bytes =
+            (n_tokens * n_heads * attn_max_seq * std::mem::size_of::<f32>()) as u64;
+        let lane_b = self.gpu.transient_heap_b.capacity();
+        assert!(
+            scores_bytes <= lane_b,
+            "polar retrieve scratch too large: scores need {scores_bytes} B on Lane B \
+             (capacity {lane_b} B) for {n_tokens} query tokens against a {start_pos}-token \
+             shard. Shorten the query or raise CORTEX_VRAM_HEAP_B_MB.",
+        );
         let scratch = PolarBlockScratch::allocate(
             &self.gpu, n_tokens, self.embed_dim,
             n_heads, attn0.n_kv_heads(), head_dim,
@@ -4980,6 +5027,33 @@ impl GpuEngine {
         self.cpu.n_layers()
     }
 
+    /// Largest token count whose f32 `BlockScratch` (normed + activated +
+    /// scores) fits a single `transient_heap_b` (Lane B) at the given
+    /// attention start position.
+    ///
+    /// Replaces the stale 512 MB `SCORES_BUDGET_BYTES` constant that lived
+    /// in cortex-cloud's `safe_chunk_size`. That constant predated Phase I
+    /// moving `scores` onto the 128 MB Lane B heap, so the chunker
+    /// overcommitted Lane B ~4× and large prefills OOM'd (the so-called
+    /// "2271-token device-lost" — actually a `vram_heap::OutOfMemory`).
+    /// Reading the real heap capacity here means the chunker auto-adapts to
+    /// whatever Lane B is sized to, on any GPU.
+    pub fn safe_prefill_chunk_size(&self, start_pos: usize) -> usize {
+        let n_heads = self.cpu.blocks()[0].attention().n_heads();
+        let embed = self.embed_dim();
+        let intermediate = self.cpu.blocks()[0]
+            .ffn()
+            .as_any()
+            .downcast_ref::<crate::layers::swiglu::SwiGLU>()
+            .map(|f| f.intermediate_size())
+            .unwrap_or(embed * 4);
+        // ~3% slack against alignment padding / fragmentation. Lane B is
+        // freshly empty each prefill forward (RAII drops the prior scratch),
+        // so nearly the full capacity is available.
+        let budget = self.gpu.transient_heap_b.capacity() * 97 / 100;
+        lane_b_chunk_size(start_pos, n_heads, embed, intermediate, budget)
+    }
+
     /// Block until all submitted GPU work has completed AND the deferred-
     /// destroy queue for dropped buffers has been processed. wgpu uses a
     /// lazy destruction model — wgpu::Buffer's Drop only queues the
@@ -5208,6 +5282,66 @@ fn read_back_buffer_f16_unpack(gpu: &GpuDevice, staging: &wgpu::Buffer, packed_b
 impl std::fmt::Debug for GpuEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "GpuEngine(wrapping {:?})", self.cpu)
+    }
+}
+
+/// Pure-math tests for the Lane-B prefill chunker. GPU-free — they
+/// exercise `lane_b_chunk_size` directly, so they run on CI without a
+/// device (unlike the gated parity tests below).
+#[cfg(test)]
+mod chunk_size_tests {
+    use super::lane_b_chunk_size;
+
+    /// Exact Lane-B footprint (bytes) of an f32 BlockScratch for `n`
+    /// tokens at attention `start`, mirroring `BlockScratch::allocate`'s
+    /// three Lane-B fields (normed + activated + scores).
+    fn lane_b_bytes(n: usize, start: usize, n_heads: usize, embed: usize, intermediate: usize) -> u64 {
+        let normed = (n * embed * 2) as u64;
+        let activated = (n * intermediate * 2) as u64;
+        let scores = (n * n_heads * (start + n) * 4) as u64;
+        normed + activated + scores
+    }
+
+    #[test]
+    fn fits_budget_is_maximal_and_shrinks() {
+        // Qwen 2.5 3B dims.
+        let (n_heads, embed, intermediate) = (16usize, 2048usize, 11008usize);
+        let budget: u64 = 128 * 1024 * 1024 * 97 / 100; // matches the 3% slack
+
+        let mut prev = usize::MAX;
+        for &start in &[0usize, 256, 1000, 2000, 4000, 50_000] {
+            let n = lane_b_chunk_size(start, n_heads, embed, intermediate, budget);
+
+            // (a) never zero.
+            assert!(n >= 1, "start={start}: chunk size starved to 0");
+
+            // (b) the chosen chunk fits the Lane-B budget...
+            assert!(
+                lane_b_bytes(n, start, n_heads, embed, intermediate) <= budget,
+                "start={start}: chunk n={n} overflows budget {budget}",
+            );
+            // ...and is maximal — one more token would overflow (above the
+            // n>=1 floor, where even a single token may exceed).
+            if n > 1 {
+                assert!(
+                    lane_b_bytes(n + 1, start, n_heads, embed, intermediate) > budget,
+                    "start={start}: chunk n={n} not maximal",
+                );
+            }
+
+            // (c) monotonically non-increasing as the attention window grows.
+            assert!(n <= prev, "start={start}: chunk n={n} grew vs prev {prev}");
+            prev = n;
+        }
+    }
+
+    #[test]
+    fn scales_with_budget() {
+        let (n_heads, embed, intermediate) = (16usize, 2048usize, 11008usize);
+        let small = lane_b_chunk_size(0, n_heads, embed, intermediate, 128 * 1024 * 1024);
+        let big = lane_b_chunk_size(0, n_heads, embed, intermediate, 512 * 1024 * 1024);
+        // A 4× larger Lane B admits a meaningfully larger first chunk.
+        assert!(big > small, "bigger budget should allow a bigger chunk: {big} vs {small}");
     }
 }
 

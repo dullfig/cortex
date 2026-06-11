@@ -2802,11 +2802,10 @@ async fn cache_load(
         // Chunk to keep BlockScratch.scores under the safe budget — same
         // wedge protection as cache_append. Uses the no-LM-head forward
         // variant since cache_load discards logits.
-        let n_heads = state.engine.cpu().blocks()[0].attention().n_heads();
         let cache_id_for_log = req.cache_id.clone();
         tokio::task::block_in_place(|| {
             forward_chunked_into_cache(
-                &state.engine, &all_tokens, &mut cache, n_heads,
+                &state.engine, &all_tokens, &mut cache,
                 |chunk_idx, chunk_size, new_seq_len, chunk_ms| {
                     tracing::debug!(
                         cache_id = %cache_id_for_log,
@@ -2914,36 +2913,17 @@ async fn cache_load(
     ))
 }
 
-/// POST /v1/cache/append — extend an existing cache with new tokens.
-///
-/// Runs forward_cached on the new tokens against the existing cache.
-/// "append extends" — the cache grows by the new tokens.
-/// Largest n_tokens to feed into a single `forward_full_gpu_with_cache`
-/// call given the existing cache size. The attention scratch buffer
-/// (`BlockScratch.scores`) is sized as `n_tokens * n_heads * (start_pos
-/// + n_tokens) * 4` bytes. wgpu/Vulkan begins to silently hang the
-/// forward at scratch sizes around 1 GB on typical hardware (4080
-/// Laptop, 12 GB VRAM, Vulkan), so we budget 512 MB and chunk
-/// accordingly.
-///
-/// Solving `n * (start_pos + n) * n_heads * 4 < BUDGET`:
-///   n^2 + start_pos * n - BUDGET / (n_heads * 4) < 0
-///   n < (-start_pos + sqrt(start_pos^2 + BUDGET / n_heads)) / 2
-fn safe_chunk_size(start_pos: usize, n_heads: usize) -> usize {
-    const SCORES_BUDGET_BYTES: usize = 512 * 1024 * 1024;
-    let term = SCORES_BUDGET_BYTES / (n_heads * std::mem::size_of::<f32>());
-    let sp = start_pos as f64;
-    let disc = (sp * sp + term as f64).sqrt();
-    let n_max = ((-sp + disc) * 0.5).floor() as usize;
-    n_max.max(1)
-}
-
 /// Run `forward_full_gpu_with_cache_returning_hidden` on `tokens` in
 /// safe-sized chunks against `cache`. Used by both `cache_load` and
 /// `cache_append` to prevent wgpu from wedging on huge BlockScratch.scores
 /// allocations at large cumulative seq_len. Caller is responsible for
 /// ensuring the cache has capacity (`cache.seq_len() + tokens.len() <=
 /// cache.max_seq_len()`); this fn does NOT validate.
+///
+/// Chunk sizing comes from [`GpuEngine::safe_prefill_chunk_size`], which
+/// reads the real Lane B (`transient_heap_b`) capacity so each chunk's
+/// `scores` (+ `normed` + `activated`) fits — auto-adapting to whatever
+/// the heap is sized to, on any GPU.
 ///
 /// The `progress` callback fires after each chunk with the chunk index,
 /// chunk size, and new cumulative seq_len. Use it for tracing or to
@@ -2952,7 +2932,6 @@ fn forward_chunked_into_cache<F>(
     engine: &GpuEngine,
     tokens: &[u32],
     cache: &mut GpuKvCache,
-    n_heads: usize,
     mut progress: F,
 )
 where
@@ -2962,7 +2941,7 @@ where
     let mut chunk_idx = 0usize;
     while !tokens_remaining.is_empty() {
         let start = cache.seq_len();
-        let chunk_size = safe_chunk_size(start, n_heads).min(tokens_remaining.len());
+        let chunk_size = engine.safe_prefill_chunk_size(start).min(tokens_remaining.len());
         let chunk = &tokens_remaining[..chunk_size];
         chunk_idx += 1;
         let t0 = Instant::now();
@@ -2979,6 +2958,10 @@ where
     }
 }
 
+/// POST /v1/cache/append — extend an existing cache with new tokens.
+///
+/// Runs forward_cached on the new tokens against the existing cache.
+/// "append extends" — the cache grows by the new tokens.
 async fn cache_append(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<CacheAppendRequest>,
@@ -3041,7 +3024,6 @@ async fn cache_append(
     } else {
         // Pre-flight overflow check using a snapshot of current seq_len.
         // Uses f32 cache when present, else polar.
-        let n_heads = state.engine.cpu().blocks()[0].attention().n_heads();
         let (start_seq, max_seq) = {
             let pool = state.cache_pool.lock().await;
             let e = pool.get(&req.cache_id).unwrap();
@@ -3090,7 +3072,7 @@ async fn cache_append(
         let mut tokens_remaining = &req.tokens[..];
         while !tokens_remaining.is_empty() {
             let next_start = current_start;
-            let chunk_size = safe_chunk_size(next_start, n_heads).min(tokens_remaining.len());
+            let chunk_size = state.engine.safe_prefill_chunk_size(next_start).min(tokens_remaining.len());
             let chunk = &tokens_remaining[..chunk_size];
 
             // Hold the pool lock only across the GPU work for THIS chunk.
