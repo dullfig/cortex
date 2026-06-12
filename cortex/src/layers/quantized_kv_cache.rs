@@ -35,8 +35,17 @@ pub struct QuantizedKvCache {
     /// Shape: [max_seq_len, n_kv_heads, sign_bytes] stored flat.
     k_qjl_signs: Option<Vec<u8>>,
 
-    /// Packed sign bits for V residual correction.
+    /// Packed sign bits for V residual correction. Phase O: sized by
+    /// the V projection set (`DEFAULT_V_N_PROJECTIONS` = 256 → 32
+    /// bytes/entry), NOT by the K set — V reconstructs a full residual
+    /// vector, which needs far more bits than K's scalar correction.
     v_qjl_signs: Option<Vec<u8>>,
+
+    /// Per-entry V residual norms (Phase O). Shape:
+    /// [max_seq_len, n_kv_heads]. The Γ-scaled estimator multiplies
+    /// the sign-mean direction by this stored norm — see
+    /// `QjlProjection::reconstruct_residual`.
+    v_residual_norm: Option<Vec<f32>>,
 
     // -- Fixed per-layer state (regenerated from seed, not stored) --
     /// Orthogonal rotation matrix [head_dim, head_dim].
@@ -45,8 +54,13 @@ pub struct QuantizedKvCache {
     /// Angle lookup table (shared across all positions/heads).
     lut: AngleLUT,
 
-    /// QJL projections (None if QJL disabled).
+    /// K-side QJL projections (None if QJL disabled). n_proj = 32.
     qjl: Option<QjlProjection>,
+
+    /// V-side QJL projections (None if QJL disabled). n_proj = 256
+    /// (`DEFAULT_V_N_PROJECTIONS`), seed derived from the K seed so
+    /// the two sets are decorrelated but deterministic.
+    v_qjl: Option<QjlProjection>,
 
     // -- Dimensions --
     n_kv_heads: usize,
@@ -69,8 +83,12 @@ pub struct CompressedEntry {
     pub k_radius: f32,
     /// V radius scale.
     pub v_radius: f32,
-    /// Optional QJL sign bits (k_signs, v_signs).
+    /// Optional QJL sign bits (k_signs, v_signs). NOTE: since Phase O
+    /// the two have different lengths (K: n_proj=32 → 4 bytes; V:
+    /// n_proj=256 → 32 bytes).
     pub qjl_signs: Option<(Vec<u8>, Vec<u8>)>,
+    /// V residual norm (Phase O); present iff `qjl_signs` is.
+    pub v_residual_norm: Option<f32>,
 }
 
 impl QuantizedKvCache {
@@ -89,9 +107,11 @@ impl QuantizedKvCache {
             v_radius: vec![0.0f32; radius_capacity],
             k_qjl_signs: None,
             v_qjl_signs: None,
+            v_residual_norm: None,
             rotation_matrix: polar::generate_rotation_matrix(head_dim, seed),
             lut: AngleLUT::new(),
             qjl: None,
+            v_qjl: None,
             n_kv_heads,
             head_dim,
             max_seq_len,
@@ -99,7 +119,9 @@ impl QuantizedKvCache {
         }
     }
 
-    /// Create with QJL correction enabled.
+    /// Create with QJL correction enabled (K: 32 projections; V: 256
+    /// projections + stored residual norm — see Phase O notes on the
+    /// `v_qjl_signs` field).
     pub fn with_qjl(
         n_kv_heads: usize,
         head_dim: usize,
@@ -110,12 +132,22 @@ impl QuantizedKvCache {
         let mut cache = Self::new(n_kv_heads, head_dim, max_seq_len, rotation_seed);
 
         let qjl = QjlProjection::new(head_dim, qjl_seed);
-        let sign_bytes = qjl.sign_bytes();
-        let sign_capacity = max_seq_len * n_kv_heads * sign_bytes;
+        let k_sign_capacity = max_seq_len * n_kv_heads * qjl.sign_bytes();
 
-        cache.k_qjl_signs = Some(vec![0u8; sign_capacity]);
-        cache.v_qjl_signs = Some(vec![0u8; sign_capacity]);
+        // V projections: distinct deterministic seed (golden-ratio
+        // offset) so K and V sets are decorrelated.
+        let v_qjl = QjlProjection::with_n_projections(
+            head_dim,
+            crate::ops::qjl::DEFAULT_V_N_PROJECTIONS,
+            qjl_seed.wrapping_add(0x9E37_79B9_7F4A_7C15),
+        );
+        let v_sign_capacity = max_seq_len * n_kv_heads * v_qjl.sign_bytes();
+
+        cache.k_qjl_signs = Some(vec![0u8; k_sign_capacity]);
+        cache.v_qjl_signs = Some(vec![0u8; v_sign_capacity]);
+        cache.v_residual_norm = Some(vec![0.0f32; max_seq_len * n_kv_heads]);
         cache.qjl = Some(qjl);
+        cache.v_qjl = Some(v_qjl);
         cache
     }
 
@@ -193,18 +225,23 @@ impl QuantizedKvCache {
             self.v_angles[angle_off..angle_off + n_pairs].copy_from_slice(&angles);
             self.v_radius[pos * self.n_kv_heads + head] = radius;
 
-            // QJL correction for V.
-            if let (Some(qjl), Some(signs_buf)) = (&self.qjl, &mut self.v_qjl_signs) {
+            // QJL correction for V (Phase O): 256-projection signs +
+            // stored residual norm for the Γ-scaled estimator.
+            if let (Some(v_qjl), Some(signs_buf), Some(rnorm_buf)) =
+                (&self.v_qjl, &mut self.v_qjl_signs, &mut self.v_residual_norm)
+            {
                 let reconstructed = polar::from_polar_quantized(&angles, radius, &self.lut);
                 let residual: Vec<f32> = rotated
                     .iter()
                     .zip(reconstructed.iter())
                     .map(|(&r, &q)| r - q)
                     .collect();
-                let signs = qjl.encode_signs(&residual);
-                let sign_bytes = qjl.sign_bytes();
+                let signs = v_qjl.encode_signs(&residual);
+                let sign_bytes = v_qjl.sign_bytes();
                 let sign_off = (pos * self.n_kv_heads + head) * sign_bytes;
                 signs_buf[sign_off..sign_off + sign_bytes].copy_from_slice(&signs);
+                rnorm_buf[pos * self.n_kv_heads + head] =
+                    residual.iter().map(|r| r * r).sum::<f32>().sqrt();
             }
         }
 
@@ -251,6 +288,13 @@ impl QuantizedKvCache {
     /// Dequantize the V vector at (pos, head) back to f32.
     ///
     /// Returns a Vec<f32> of length head_dim in original (non-rotated) space.
+    ///
+    /// Phase O: when QJL is enabled the stored V residual signs (written
+    /// by `append_one` since the original QJL landing, but unread until
+    /// now) refine the LUT dequant: `v̂ += reconstruct_residual(signs)`
+    /// in rotated space, before the unrotate. This is the V-side
+    /// counterpart of `dot_key`'s K correction and closes most of the
+    /// attention-output cosine gap PolarQuant alone leaves (~0.84).
     pub fn value_at_dequant(&self, pos: usize, kv_head: usize) -> Vec<f32> {
         debug_assert!(pos < self.len);
         debug_assert!(kv_head < self.n_kv_heads);
@@ -260,7 +304,20 @@ impl QuantizedKvCache {
         let radius = self.v_radius[pos * self.n_kv_heads + kv_head];
         let angles = &self.v_angles[angle_off..angle_off + n_pairs];
 
-        let rotated = polar::from_polar_quantized(angles, radius, &self.lut);
+        let mut rotated = polar::from_polar_quantized(angles, radius, &self.lut);
+
+        if let (Some(v_qjl), Some(signs_buf), Some(rnorm_buf)) =
+            (&self.v_qjl, &self.v_qjl_signs, &self.v_residual_norm)
+        {
+            let sign_bytes = v_qjl.sign_bytes();
+            let sign_off = (pos * self.n_kv_heads + kv_head) * sign_bytes;
+            let signs = &signs_buf[sign_off..sign_off + sign_bytes];
+            let rnorm = rnorm_buf[pos * self.n_kv_heads + kv_head];
+            let residual = v_qjl.reconstruct_residual(signs, rnorm);
+            for (r, d) in rotated.iter_mut().zip(&residual) {
+                *r += d;
+            }
+        }
 
         let mut out = vec![0.0f32; self.head_dim];
         polar::rotate_transpose(&self.rotation_matrix, &rotated, &mut out);
@@ -305,18 +362,24 @@ impl QuantizedKvCache {
         let k_radius = self.k_radius[radius_off];
         let v_radius = self.v_radius[radius_off];
 
-        let qjl_signs = if let (Some(qjl), Some(k_signs), Some(v_signs)) =
-            (&self.qjl, &self.k_qjl_signs, &self.v_qjl_signs)
+        let qjl_signs = if let (Some(qjl), Some(v_qjl), Some(k_signs), Some(v_signs)) =
+            (&self.qjl, &self.v_qjl, &self.k_qjl_signs, &self.v_qjl_signs)
         {
-            let sb = qjl.sign_bytes();
-            let sign_off = (pos * self.n_kv_heads + head) * sb;
+            let ksb = qjl.sign_bytes();
+            let vsb = v_qjl.sign_bytes();
+            let k_off = (pos * self.n_kv_heads + head) * ksb;
+            let v_off = (pos * self.n_kv_heads + head) * vsb;
             Some((
-                k_signs[sign_off..sign_off + sb].to_vec(),
-                v_signs[sign_off..sign_off + sb].to_vec(),
+                k_signs[k_off..k_off + ksb].to_vec(),
+                v_signs[v_off..v_off + vsb].to_vec(),
             ))
         } else {
             None
         };
+        let v_residual_norm = self
+            .v_residual_norm
+            .as_ref()
+            .map(|buf| buf[pos * self.n_kv_heads + head]);
 
         CompressedEntry {
             k_angles,
@@ -324,6 +387,7 @@ impl QuantizedKvCache {
             k_radius,
             v_radius,
             qjl_signs,
+            v_residual_norm,
         }
     }
 
@@ -344,16 +408,22 @@ impl QuantizedKvCache {
         self.k_radius[radius_off] = entry.k_radius;
         self.v_radius[radius_off] = entry.v_radius;
 
-        if let (Some(qjl), Some(k_signs), Some(v_signs), Some((ek, ev))) = (
+        if let (Some(qjl), Some(v_qjl), Some(k_signs), Some(v_signs), Some((ek, ev))) = (
             &self.qjl,
+            &self.v_qjl,
             &mut self.k_qjl_signs,
             &mut self.v_qjl_signs,
             &entry.qjl_signs,
         ) {
-            let sb = qjl.sign_bytes();
-            let sign_off = (pos * self.n_kv_heads + head) * sb;
-            k_signs[sign_off..sign_off + sb].copy_from_slice(ek);
-            v_signs[sign_off..sign_off + sb].copy_from_slice(ev);
+            let ksb = qjl.sign_bytes();
+            let vsb = v_qjl.sign_bytes();
+            let k_off = (pos * self.n_kv_heads + head) * ksb;
+            let v_off = (pos * self.n_kv_heads + head) * vsb;
+            k_signs[k_off..k_off + ksb].copy_from_slice(ek);
+            v_signs[v_off..v_off + vsb].copy_from_slice(ev);
+        }
+        if let (Some(rnorm_buf), Some(rn)) = (&mut self.v_residual_norm, entry.v_residual_norm) {
+            rnorm_buf[pos * self.n_kv_heads + head] = rn;
         }
     }
 
@@ -490,6 +560,70 @@ mod tests {
         let without = QuantizedKvCache::new(4, 64, 2048, 42);
         let with = QuantizedKvCache::with_qjl(4, 64, 2048, 42, 99);
         assert!(with.memory_bytes() > without.memory_bytes());
+    }
+
+    /// Phase O: the stored V residual signs must measurably improve
+    /// `value_at_dequant` fidelity vs PolarQuant alone. Random vectors
+    /// at Qwen head_dim (128), n_proj = 32 default.
+    #[test]
+    fn v_qjl_correction_improves_dequant_cosine() {
+        let n_kv_heads = 2;
+        let head_dim = 128;
+        let kv_dim = n_kv_heads * head_dim;
+        let n_vecs = 16;
+
+        let mut plain = QuantizedKvCache::new(n_kv_heads, head_dim, 64, 42);
+        let mut qjl = QuantizedKvCache::with_qjl(n_kv_heads, head_dim, 64, 42, 99);
+
+        // Deterministic pseudo-random vectors (LCG, same recipe as the
+        // gpu_floatlinear tests).
+        let mut rng: u64 = 0xC0FFEE42;
+        let mut next = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng >> 33) as i32 % 1000 - 500) as f32 * 0.002
+        };
+        let mut originals: Vec<Vec<f32>> = Vec::new();
+        for _ in 0..n_vecs {
+            let key: Vec<f32> = (0..kv_dim).map(|_| next()).collect();
+            let value: Vec<f32> = (0..kv_dim).map(|_| next()).collect();
+            plain.append_one(&key, &value);
+            qjl.append_one(&key, &value);
+            originals.push(value);
+        }
+
+        fn cosine(a: &[f32], b: &[f32]) -> f32 {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            dot / (na * nb)
+        }
+
+        let mut sum_plain = 0.0f32;
+        let mut sum_qjl = 0.0f32;
+        for (pos, original) in originals.iter().enumerate() {
+            for h in 0..n_kv_heads {
+                let orig = &original[h * head_dim..(h + 1) * head_dim];
+                sum_plain += cosine(&plain.value_at_dequant(pos, h), orig);
+                sum_qjl += cosine(&qjl.value_at_dequant(pos, h), orig);
+            }
+        }
+        let n = (n_vecs * n_kv_heads) as f32;
+        let mean_plain = sum_plain / n;
+        let mean_qjl = sum_qjl / n;
+
+        println!("V dequant cosine: plain={mean_plain:.4} qjl256={mean_qjl:.4}");
+        // Strict improvement, by a real margin — not float noise.
+        assert!(
+            mean_qjl > mean_plain + 0.05,
+            "V QJL-256 correction should improve dequant cosine substantially: \
+             plain={mean_plain:.4} qjl={mean_qjl:.4}",
+        );
+        // Absolute floor: theory says ~0.91 at n_proj=256/head_dim=128
+        // from a 0.797 polar baseline. Pin conservatively below.
+        assert!(
+            mean_qjl > 0.88,
+            "V QJL-256 dequant cosine below expected floor: {mean_qjl:.4}",
+        );
     }
 
     #[test]

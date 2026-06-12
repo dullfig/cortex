@@ -4,6 +4,29 @@ use super::*;
 use super::dispatch::SoftmaxBatchParams;
 
 impl GpuEngine {
+    /// Phase O: per-forward Lane C scratch for the V QJL correction's
+    /// C accumulator (`[n_tokens, n_heads, n_v_proj]` f32). `None`
+    /// when the cache has no QJL. Allocated once per forward and
+    /// reused across blocks — see `forward_block_gpu_polar_inner`'s
+    /// `qjl_c_buf` param for why per-block allocation would be wrong.
+    fn alloc_qjl_c_buf(
+        &self,
+        polar_cache: &crate::layers::gpu_polar_kv_cache::GpuPolarKvCache,
+        n_tokens: usize,
+        n_heads: usize,
+    ) -> Option<::vram_heap::VramAllocation> {
+        if polar_cache.n_qjl_proj() == 0 {
+            return None;
+        }
+        let bytes = (n_tokens * n_heads * polar_cache.n_v_qjl_proj()
+            * std::mem::size_of::<f32>()) as u64;
+        Some(self.gpu.transient_heap_c.allocate(
+            bytes,
+            ::vram_heap::STORAGE_BUFFER_OFFSET_ALIGNMENT_NVIDIA,
+            "qjl_value_weights.c",
+        ).expect("transient_heap_c capacity for qjl C accumulator"))
+    }
+
     /// Polar variant of `forward_full_gpu_with_cache_traced`. Runs the
     /// transformer forward over `query_tokens` against a resident
     /// PolarQuant-compressed KV cache, capturing per-layer pre-softmax
@@ -115,6 +138,7 @@ impl GpuEngine {
             ::vram_heap::STORAGE_BUFFER_OFFSET_ALIGNMENT_NVIDIA,
             "forward_polar_traced.rotated",
         ).expect("transient_heap_a capacity");
+        let qjl_c_buf = self.alloc_qjl_c_buf(polar_cache, n_tokens, n_heads);
 
         // Per-captured-layer scores. Same shape as the f32 path:
         // [n_tokens, n_heads, attn_max_seq].
@@ -188,7 +212,7 @@ impl GpuEngine {
             let capture = capture_lookup.get(&i).copied();
             self.forward_block_gpu_polar_inner(
                 &mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch,
-                &rotated_buf, polar_cache, capture, None, None,
+                &rotated_buf, polar_cache, qjl_c_buf.as_ref(), capture, None, None,
             );
             layers_in_encoder += 1;
             if !single_submit
@@ -367,6 +391,7 @@ impl GpuEngine {
             ::vram_heap::STORAGE_BUFFER_OFFSET_ALIGNMENT_NVIDIA,
             "forward_polar_advance_only.rotated",
         ).expect("transient_heap_a capacity");
+        let qjl_c_buf = self.alloc_qjl_c_buf(polar_cache, n_tokens, n_heads);
 
         let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("forward_polar_advance_only.encoder"),
@@ -374,7 +399,7 @@ impl GpuEngine {
         for i in 0..n_layers {
             self.forward_block_gpu_polar_inner(
                 &mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch,
-                &rotated_buf, &*polar_cache, None, None, None,
+                &rotated_buf, &*polar_cache, qjl_c_buf.as_ref(), None, None, None,
             );
         }
         self.gpu.queue.submit(Some(encoder.finish()));
@@ -474,6 +499,7 @@ impl GpuEngine {
             ::vram_heap::STORAGE_BUFFER_OFFSET_ALIGNMENT_NVIDIA,
             "forward_polar_argmax.rotated",
         ).expect("transient_heap_a capacity");
+        let qjl_c_buf = self.alloc_qjl_c_buf(polar_cache, n_tokens, n_heads);
 
         if !inject_deltas.is_empty() {
             assert_eq!(
@@ -536,7 +562,7 @@ impl GpuEngine {
             let capture = if debug_finite { Some(&debug_captures[i]) } else { None };
             self.forward_block_gpu_polar_inner(
                 &mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch,
-                &rotated_buf, &*polar_cache, None, capture, inject,
+                &rotated_buf, &*polar_cache, qjl_c_buf.as_ref(), None, capture, inject,
             );
             if debug_finite {
                 encoder.copy_buffer_to_buffer(&debug_captures[i], 0, &debug_stagings[i], 0, hidden_bytes);
@@ -658,6 +684,12 @@ impl GpuEngine {
         scratch: &PolarBlockScratch,
         rotated_buf: &::vram_heap::VramAllocation,
         polar_cache: &crate::layers::gpu_polar_kv_cache::GpuPolarKvCache,
+        // Phase O: per-forward scratch for the V QJL correction's C
+        // accumulator ([n_tokens, n_heads, n_v_proj] f32, Lane C).
+        // `Some` iff the cache has QJL; reused across blocks (each
+        // block fully rewrites it before reading — per-block
+        // allocation would let RAII recycle the range mid-encoder).
+        qjl_c_buf: Option<&::vram_heap::VramAllocation>,
         pre_softmax_capture: Option<&wgpu::Buffer>,
         post_block_hidden_capture: Option<&wgpu::Buffer>,
         pre_block_hidden_inject: Option<&wgpu::Buffer>,
@@ -750,6 +782,13 @@ impl GpuEngine {
             scratch.k.binding(), n_tokens, start_pos,
         );
 
+        // 5.7 Phase O: V residual signs + norms for the value-side
+        // correction. Same compress-then-encode ordering as K.
+        crate::layers::gpu_polar::qjl_encode_v_layer(
+            &self.gpu, encoder, polar_cache, block_idx,
+            scratch.v.binding(), n_tokens, start_pos,
+        );
+
         // 6a. rotate_q: packed scratch.q → f32 rotated_buf.
         crate::layers::gpu_polar::dispatch_rotate_q_packed(
             &self.gpu, encoder, scratch.q.binding(),
@@ -821,15 +860,47 @@ impl GpuEngine {
             pass.dispatch_workgroups((n_tokens * n_heads) as u32, 1, 1);
         }
 
-        // 6e. attn_value_polar_batch: scratch.scores * V_polar → rotated_buf
-        //     (overwriting rq, no longer needed)
-        crate::layers::gpu_polar::dispatch_attn_value_polar_batch(
-            &self.gpu, encoder, scratch.scores.binding(),
-            polar_cache.v_angles_layer(block_idx).binding(),
-            polar_cache.v_radius_layer(block_idx).binding(),
-            rotated_buf.binding(), polar_cache.lut_buffer().binding(),
-            n_heads, n_kv_heads, head_dim, start_pos, n_tokens, attn_max_seq,
-        );
+        // 6e. attn_value: scratch.scores * V_polar → rotated_buf
+        //     (overwriting rq, no longer needed). Phase O: when the
+        //     cache has QJL, run the two-pass corrected variant —
+        //     pass A accumulates C_j = Σ_t w_t·rnorm_t·s_tj, pass B
+        //     adds the Γ-scaled residual estimate to the weighted sum.
+        if polar_cache.n_qjl_proj() > 0 {
+            let c_buf = qjl_c_buf
+                .expect("qjl_c_buf must be provided when polar_cache has QJL");
+            crate::layers::gpu_polar::dispatch_qjl_value_weights(
+                &self.gpu, encoder, scratch.scores.binding(),
+                polar_cache.v_qjl_signs_layer(block_idx)
+                    .expect("v_qjl_signs_layer must exist when n_qjl_proj > 0")
+                    .binding(),
+                polar_cache.v_qjl_rnorm_layer(block_idx)
+                    .expect("v_qjl_rnorm_layer must exist when n_qjl_proj > 0")
+                    .binding(),
+                c_buf.binding(),
+                n_heads, n_kv_heads, polar_cache.n_v_qjl_proj(),
+                start_pos, n_tokens, attn_max_seq,
+            );
+            crate::layers::gpu_polar::dispatch_attn_value_polar_qjl_batch(
+                &self.gpu, encoder, scratch.scores.binding(),
+                polar_cache.v_angles_layer(block_idx).binding(),
+                polar_cache.v_radius_layer(block_idx).binding(),
+                c_buf.binding(),
+                polar_cache.v_qjl_projection_layer(block_idx)
+                    .expect("v_qjl_projection_layer must exist when n_qjl_proj > 0")
+                    .binding(),
+                rotated_buf.binding(), polar_cache.lut_buffer().binding(),
+                n_heads, n_kv_heads, head_dim, start_pos, n_tokens, attn_max_seq,
+                polar_cache.n_v_qjl_proj(),
+            );
+        } else {
+            crate::layers::gpu_polar::dispatch_attn_value_polar_batch(
+                &self.gpu, encoder, scratch.scores.binding(),
+                polar_cache.v_angles_layer(block_idx).binding(),
+                polar_cache.v_radius_layer(block_idx).binding(),
+                rotated_buf.binding(), polar_cache.lut_buffer().binding(),
+                n_heads, n_kv_heads, head_dim, start_pos, n_tokens, attn_max_seq,
+            );
+        }
 
         // 6f. derotate: f32 rotated_buf → packed scratch.attn_out (C3).
         //     Treat (n_tokens * n_heads) as effective head count — R is per-layer.

@@ -12,6 +12,41 @@
 /// 32 gives a good accuracy/storage tradeoff.
 const DEFAULT_N_PROJECTIONS: usize = 32;
 
+/// Number of projections for the V-side residual correction (Phase O).
+///
+/// V needs far more bits than K: the K correction is effectively a
+/// 1-dimensional quantity (a score adjustment along the query), while V
+/// must reconstruct the full residual VECTOR. At head_dim = 128,
+/// direction quality scales as sqrt(nκ²/(1+nκ²)) with κ² = 2/(π·d):
+/// n=32 → dir-cos 0.38, n=128 → 0.62, n=256 → 0.75 (≈0.91 dequant
+/// cosine after correction vs 0.797 for PolarQuant alone). 256 signs =
+/// 32 B/entry; with angles + radius + rnorm the V entry is 104 B vs
+/// 256 B f16 — still 2.5x compression on V.
+pub const DEFAULT_V_N_PROJECTIONS: usize = 256;
+
+/// Scale constant for the V residual estimate (Phase O):
+///
+/// ```text
+/// r̂ = Γ(n,d) · ||r|| · (1/n) Σ_j sign_j · p_j
+/// Γ(n,d) = sqrt(nκ² / (1+nκ²)) / sqrt(κ² + (1−κ²)/n),  κ² = 2/(π·d)
+/// ```
+///
+/// The numerator is the expected direction-cosine of the sign-mean
+/// against the true residual; the denominator is the expected norm of
+/// the sign-mean. Using the analytic constant instead of per-vector
+/// normalization keeps the estimate LINEAR in the sign bits, which is
+/// what lets the GPU value shader sum-swap the correction
+/// (`C_j = Σ_t w_t·rnorm_t·s_tj` then one 256-MAC pass per output
+/// element). Numerically validated: at n=256, d=128, Γ = 7.951 achieves
+/// residual-energy ratio 0.436 vs the theoretical optimum 0.44.
+pub fn v_correction_gamma(n_proj: usize, dim: usize) -> f32 {
+    let k2 = 2.0 / (std::f32::consts::PI * dim as f32);
+    let nk2 = n_proj as f32 * k2;
+    let dir_cos2 = nk2 / (1.0 + nk2);
+    let mv_norm2 = k2 + (1.0 - k2) / n_proj as f32;
+    (dir_cos2 / mv_norm2).sqrt()
+}
+
 /// Random projection matrix + encoding/decoding for QJL correction.
 pub struct QjlProjection {
     /// Random projection vectors: `[n_proj, dim]`, row-major.
@@ -126,6 +161,34 @@ impl QjlProjection {
         }
 
         correction / self.n_proj as f32
+    }
+
+    /// Reconstruct a residual-vector estimate from packed sign bits and
+    /// the stored residual norm (Phase O, V-side):
+    ///
+    /// `r̂ = Γ(n,d) · residual_norm · (1/n) Σ_j sign_j · projection_j`
+    ///
+    /// The vector counterpart of `correction_dot` (which computes
+    /// `q · r̂`-like scalars without materializing the vector). Used by
+    /// the V-side correction: attention output adds `Σ_t w_t · r̂_t`,
+    /// so the residual estimate itself is needed. See
+    /// [`v_correction_gamma`] for why the analytic Γ constant replaces
+    /// per-vector normalization.
+    pub fn reconstruct_residual(&self, signs: &[u8], residual_norm: f32) -> Vec<f32> {
+        let mut out = vec![0.0f32; self.dim];
+        for j in 0..self.n_proj {
+            let row_off = j * self.dim;
+            let sign_bit = (signs[j / 8] >> (j % 8)) & 1;
+            let sign = if sign_bit == 1 { 1.0f32 } else { -1.0f32 };
+            for (o, &p) in out.iter_mut().zip(&self.projections[row_off..row_off + self.dim]) {
+                *o += sign * p;
+            }
+        }
+        let scale = v_correction_gamma(self.n_proj, self.dim) * residual_norm / self.n_proj as f32;
+        for o in &mut out {
+            *o *= scale;
+        }
+        out
     }
 }
 

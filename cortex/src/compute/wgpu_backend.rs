@@ -276,6 +276,18 @@ pub struct Pipelines {
     /// Drop-in for `attn_score_polar_batch` when the polar cache has
     /// QJL signs. Brings ~0.84 → ~0.95 cosine vs f32 attention.
     pub attn_score_polar_qjl_batch: wgpu::ComputePipeline,
+    /// Phase O: QJL encoder for V residuals — multi-word signs
+    /// (n_proj=256 → 8 u32/entry) + residual norm output for the
+    /// Γ-scaled value correction.
+    pub kv_qjl_encode_v: wgpu::ComputePipeline,
+    /// Phase O pass A: per-(query, head, projection) sign-weighted
+    /// softmax mass `C_j = Σ_t w_t·rnorm_t·s_tj` — the sum-swap that
+    /// makes the V vector correction affordable.
+    pub qjl_value_weights: wgpu::ComputePipeline,
+    /// Phase O pass B: attn_value_polar_batch + the Γ-scaled residual
+    /// correction from pass A's C accumulator. Drop-in for
+    /// `attn_value_polar_batch` when the polar cache has QJL.
+    pub attn_value_polar_qjl_batch: wgpu::ComputePipeline,
 }
 
 impl Pipelines {
@@ -352,6 +364,9 @@ impl Pipelines {
             argmax_vocab: make(include_str!("shaders/argmax_vocab.wgsl"), "argmax_vocab"),
             kv_qjl_encode: make(include_str!("shaders/kv_qjl_encode.wgsl"), "kv_qjl_encode"),
             attn_score_polar_qjl_batch: make(include_str!("shaders/attn_score_polar_qjl_batch.wgsl"), "attn_score_polar_qjl_batch"),
+            kv_qjl_encode_v: make(include_str!("shaders/kv_qjl_encode_v.wgsl"), "kv_qjl_encode_v"),
+            qjl_value_weights: make(include_str!("shaders/qjl_value_weights.wgsl"), "qjl_value_weights"),
+            attn_value_polar_qjl_batch: make(include_str!("shaders/attn_value_polar_qjl_batch.wgsl"), "attn_value_polar_qjl_batch"),
         }
     }
 }
@@ -662,7 +677,7 @@ impl GpuDevice {
         }
 
         let pipelines = Pipelines::compile(&device);
-        tracing::info!("compiled 34 GPU compute pipelines");
+        tracing::info!("compiled 37 GPU compute pipelines");
 
         let params_pool = ParamsBufferPool::new(&device);
         tracing::info!(

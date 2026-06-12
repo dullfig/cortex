@@ -99,6 +99,23 @@ pub struct GpuPolarKvCache {
     /// Uploaded once at construction, read-only thereafter.
     k_qjl_projection_buffers: Vec<::vram_heap::VramAllocation>,
 
+    /// Per-layer V-side QJL sign storage (Phase O). Empty when QJL is
+    /// disabled. V uses `DEFAULT_V_N_PROJECTIONS` (256) projections —
+    /// 8 u32 words per (pos, head) entry; word `w` bit `b` is the sign
+    /// for projection `w*32 + b` (matches CPU `encode_signs` packing).
+    v_qjl_signs_buffers: Vec<::vram_heap::VramAllocation>,
+
+    /// Per-layer V-side projection matrices (256 × head_dim f32,
+    /// row-major). Seed: `(qjl_seed_base + layer) + golden-ratio
+    /// offset` — same derivation as the CPU cache so parity tests can
+    /// reproduce them. Const lane, uploaded once.
+    v_qjl_projection_buffers: Vec<::vram_heap::VramAllocation>,
+
+    /// Per-layer V residual norms (Phase O): `max_seq * n_kv_heads`
+    /// f32, written by the V encode shader, read by the value
+    /// correction (Γ-scaled estimator). Signs lane.
+    v_qjl_rnorm_buffers: Vec<::vram_heap::VramAllocation>,
+
     n_layers: usize,
     n_kv_heads: usize,
     head_dim: usize,
@@ -192,6 +209,24 @@ impl GpuPolarKvCache {
             (n_qjl_proj * head_dim * std::mem::size_of::<f32>()) as u64
         } else { 0 };
 
+        // Phase O: V-side QJL (256 projections + per-entry residual
+        // norm). V reconstructs a full residual VECTOR, which needs far
+        // more sign bits than K's effectively-scalar score correction.
+        let n_v_qjl_proj = if qjl_enabled {
+            crate::ops::qjl::DEFAULT_V_N_PROJECTIONS
+        } else { 0 };
+        let v_sign_words_per_entry = (n_v_qjl_proj + 31) / 32;
+        let v_signs_bytes = if qjl_enabled {
+            (max_seq_len * n_kv_heads * v_sign_words_per_entry
+                * std::mem::size_of::<u32>()) as u64
+        } else { 0 };
+        let v_projection_bytes = if qjl_enabled {
+            (n_v_qjl_proj * head_dim * std::mem::size_of::<f32>()) as u64
+        } else { 0 };
+        let v_rnorm_bytes = if qjl_enabled {
+            (max_seq_len * n_kv_heads * std::mem::size_of::<f32>()) as u64
+        } else { 0 };
+
         // Heap capacity = sum of per-allocation bytes + alignment slack.
         // STORAGE_BUFFER_OFFSET_ALIGNMENT_NVIDIA = 256; allocations are
         // many KB to many MB, so padding overhead is negligible.
@@ -201,12 +236,16 @@ impl GpuPolarKvCache {
 
         let const_size = round_up(rotation_bytes) * n_layers as u64
             + round_up(lut_bytes)
-            + if qjl_enabled { round_up(projection_bytes) * n_layers as u64 } else { 0 }
-            + pad_per_alloc * (n_layers as u64 * 2 + 1); // slack
+            + if qjl_enabled {
+                (round_up(projection_bytes) + round_up(v_projection_bytes)) * n_layers as u64
+            } else { 0 }
+            + pad_per_alloc * (n_layers as u64 * 3 + 1); // slack
         let data_size = (round_up(angles_bytes) + round_up(radius_bytes)) * 2 * n_layers as u64
             + pad_per_alloc * (n_layers as u64 * 4);
         let signs_size = if qjl_enabled {
-            round_up(signs_bytes) * n_layers as u64 + pad_per_alloc * n_layers as u64
+            (round_up(signs_bytes) + round_up(v_signs_bytes) + round_up(v_rnorm_bytes))
+                * n_layers as u64
+                + pad_per_alloc * (n_layers as u64 * 3)
         } else { 0 };
 
         // Phase M: all three lane heaps reserve against the device VRAM
@@ -275,9 +314,14 @@ impl GpuPolarKvCache {
         lut_buffer.write(&gpu.queue, bytemuck::cast_slice(&lut));
 
         // QJL buffers — only allocated when QJL is enabled.
-        let (k_qjl_signs_buffers, k_qjl_projection_buffers) = if qjl_enabled {
+        let (k_qjl_signs_buffers, k_qjl_projection_buffers,
+             v_qjl_signs_buffers, v_qjl_projection_buffers, v_qjl_rnorm_buffers) =
+        if qjl_enabled {
             let mut signs = Vec::with_capacity(n_layers);
             let mut projs = Vec::with_capacity(n_layers);
+            let mut v_signs = Vec::with_capacity(n_layers);
+            let mut v_projs = Vec::with_capacity(n_layers);
+            let mut v_rnorms = Vec::with_capacity(n_layers);
             let signs_heap_ref = signs_heap.as_ref()
                 .expect("signs_heap must exist when n_qjl_proj > 0");
             for layer in 0..n_layers {
@@ -298,10 +342,33 @@ impl GpuPolarKvCache {
                 ).expect("polar_kv const_heap capacity for projection");
                 proj_alloc.write(&gpu.queue, bytemuck::cast_slice(qjl.projections()));
                 projs.push(proj_alloc);
+
+                // Phase O: V-side signs + rnorm + projections. Seed
+                // derivation mirrors the CPU cache: per-layer K seed
+                // plus the golden-ratio offset, so CPU/GPU parity
+                // tests can reconstruct identical projection sets.
+                v_signs.push(signs_heap_ref.allocate(
+                    v_signs_bytes, align,
+                    &format!("polar_kv.v_qjl_signs.layer{layer}"),
+                ).expect("polar_kv signs_heap capacity for v_signs"));
+                v_rnorms.push(signs_heap_ref.allocate(
+                    v_rnorm_bytes, align,
+                    &format!("polar_kv.v_qjl_rnorm.layer{layer}"),
+                ).expect("polar_kv signs_heap capacity for v_rnorm"));
+                let v_qjl = crate::ops::qjl::QjlProjection::with_n_projections(
+                    head_dim, n_v_qjl_proj,
+                    (qjl_seed_base + layer as u64).wrapping_add(0x9E37_79B9_7F4A_7C15),
+                );
+                let v_proj_alloc = const_heap.allocate(
+                    v_projection_bytes, align,
+                    &format!("polar_kv.v_qjl_projection.layer{layer}"),
+                ).expect("polar_kv const_heap capacity for v_projection");
+                v_proj_alloc.write(&gpu.queue, bytemuck::cast_slice(v_qjl.projections()));
+                v_projs.push(v_proj_alloc);
             }
-            (signs, projs)
+            (signs, projs, v_signs, v_projs, v_rnorms)
         } else {
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
         };
 
         Self {
@@ -317,6 +384,9 @@ impl GpuPolarKvCache {
             lut_buffer,
             k_qjl_signs_buffers,
             k_qjl_projection_buffers,
+            v_qjl_signs_buffers,
+            v_qjl_projection_buffers,
+            v_qjl_rnorm_buffers,
             n_layers,
             n_kv_heads,
             head_dim,
@@ -474,6 +544,17 @@ impl GpuPolarKvCache {
                 n_tokens,
                 /*start_pos*/ 0,
             );
+            // Phase O: V residual signs + norms for the value-side
+            // correction. Same ordering constraint as K.
+            crate::layers::gpu_polar::qjl_encode_v_layer(
+                &self.gpu,
+                &mut encoder,
+                self,
+                layer,
+                f32_cache.v_layer(layer).binding(),
+                n_tokens,
+                /*start_pos*/ 0,
+            );
             layers_in_encoder += 1;
             if !single_submit
                 && layers_in_encoder >= chunk_layers
@@ -544,6 +625,29 @@ impl GpuPolarKvCache {
         self.k_qjl_projection_buffers.get(idx)
     }
 
+    /// Number of V-side QJL projections (Phase O). 0 when QJL disabled;
+    /// `DEFAULT_V_N_PROJECTIONS` (256) otherwise.
+    pub fn n_v_qjl_proj(&self) -> usize {
+        if self.n_qjl_proj == 0 { 0 } else { crate::ops::qjl::DEFAULT_V_N_PROJECTIONS }
+    }
+
+    /// V QJL signs buffer for layer `idx` (8 u32 words per entry at
+    /// n=256). `None` when QJL disabled.
+    pub fn v_qjl_signs_layer(&self, idx: usize) -> Option<&::vram_heap::VramAllocation> {
+        self.v_qjl_signs_buffers.get(idx)
+    }
+
+    /// V QJL projection matrix buffer for layer `idx`. `None` when
+    /// QJL disabled.
+    pub fn v_qjl_projection_layer(&self, idx: usize) -> Option<&::vram_heap::VramAllocation> {
+        self.v_qjl_projection_buffers.get(idx)
+    }
+
+    /// V residual norm buffer for layer `idx`. `None` when QJL disabled.
+    pub fn v_qjl_rnorm_layer(&self, idx: usize) -> Option<&::vram_heap::VramAllocation> {
+        self.v_qjl_rnorm_buffers.get(idx)
+    }
+
     /// VRAM bytes used (compressed K+V + rotation + optional QJL;
     /// LUT excluded).
     pub fn memory_bytes(&self) -> u64 {
@@ -556,7 +660,16 @@ impl GpuPolarKvCache {
             let signs_per_layer = (self.max_seq_len * self.n_kv_heads
                 * self.qjl_sign_bytes_per_entry()) as u64;
             let proj_per_layer = (self.n_qjl_proj * self.head_dim * 4) as u64;
-            (signs_per_layer + proj_per_layer) * self.n_layers as u64
+            // Phase O: V-side signs (8 words/entry at n=256) + rnorm
+            // (1 f32/entry) + V projections.
+            let nv = self.n_v_qjl_proj();
+            let v_signs_per_layer =
+                (self.max_seq_len * self.n_kv_heads * ((nv + 31) / 32) * 4) as u64;
+            let v_rnorm_per_layer = (self.max_seq_len * self.n_kv_heads * 4) as u64;
+            let v_proj_per_layer = (nv * self.head_dim * 4) as u64;
+            (signs_per_layer + proj_per_layer
+                + v_signs_per_layer + v_rnorm_per_layer + v_proj_per_layer)
+                * self.n_layers as u64
         } else {
             0
         };
@@ -822,16 +935,32 @@ mod tests {
         for i in 0..n_layers {
             assert!(with_qjl.k_qjl_signs_layer(i).is_some());
             assert!(with_qjl.k_qjl_projection_layer(i).is_some());
+            // Phase O: V-side correction storage materializes too.
+            assert!(with_qjl.v_qjl_signs_layer(i).is_some());
+            assert!(with_qjl.v_qjl_projection_layer(i).is_some());
+            assert!(with_qjl.v_qjl_rnorm_layer(i).is_some());
         }
-        // QJL must add memory: signs (max_seq * n_kv_heads * 4 bytes per layer)
-        // + projections (n_proj * head_dim * 4 bytes per layer).
+        assert_eq!(
+            with_qjl.n_v_qjl_proj(),
+            crate::ops::qjl::DEFAULT_V_N_PROJECTIONS,
+        );
+        // QJL must add memory. K: signs (max_seq * n_kv_heads * 4 B) +
+        // projections (32 * head_dim * 4 B) per layer. Phase O adds V:
+        // signs (max_seq * n_kv_heads * n_v/8 B) + rnorm (max_seq *
+        // n_kv_heads * 4 B) + projections (n_v * head_dim * 4 B).
+        let n_v = crate::ops::qjl::DEFAULT_V_N_PROJECTIONS;
         let expected_signs_per = max_seq * n_kv_heads * 4;
         let expected_proj_per = 32 * head_dim * 4;
-        let expected_qjl = (expected_signs_per + expected_proj_per) * n_layers;
+        let expected_v_signs_per = max_seq * n_kv_heads * (n_v / 8);
+        let expected_v_rnorm_per = max_seq * n_kv_heads * 4;
+        let expected_v_proj_per = n_v * head_dim * 4;
+        let expected_qjl = (expected_signs_per + expected_proj_per
+            + expected_v_signs_per + expected_v_rnorm_per + expected_v_proj_per)
+            * n_layers;
         assert_eq!(
             with_qjl.memory_bytes() - plain.memory_bytes(),
             expected_qjl as u64,
-            "memory_bytes delta should equal QJL signs+projections total"
+            "memory_bytes delta should equal QJL signs+projections total (K + V)"
         );
     }
 

@@ -832,6 +832,165 @@ pub fn dispatch_attn_value_polar_batch(
     pass.dispatch_workgroups(groups, 1, 1);
 }
 
+/// Params for `qjl_value_weights.wgsl` (Phase O pass A).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct QjlValueWeightsParams {
+    n_heads: u32,
+    n_kv_heads: u32,
+    n_proj: u32,
+    start_pos: u32,
+    max_seq: u32,
+    heads_per_kv: u32,
+    n_tokens: u32,
+    _pad: u32,
+}
+
+/// Phase O pass A: accumulate `C[tok, head, j] = Σ_t w_t·rnorm_t·s_tj`
+/// into `c_out_buf` (`[n_tokens, n_heads, n_proj]` f32). The sum-swap
+/// that makes the V vector correction affordable — see
+/// `attn_value_polar_qjl_batch.wgsl` for pass B.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_qjl_value_weights(
+    gpu: &Arc<GpuDevice>,
+    encoder: &mut wgpu::CommandEncoder,
+    softmax_buf: wgpu::BindingResource<'_>,
+    v_signs_buf: wgpu::BindingResource<'_>,
+    rnorm_buf: wgpu::BindingResource<'_>,
+    c_out_buf: wgpu::BindingResource<'_>,
+    n_heads: usize,
+    n_kv_heads: usize,
+    n_proj: usize,
+    start_pos: usize,
+    n_tokens: usize,
+    max_seq: usize,
+) {
+    assert!(n_proj % 32 == 0, "qjl_value_weights requires whole sign words");
+    assert!(n_heads % n_kv_heads == 0);
+    assert!(start_pos + n_tokens <= max_seq);
+
+    let params = QjlValueWeightsParams {
+        n_heads: n_heads as u32,
+        n_kv_heads: n_kv_heads as u32,
+        n_proj: n_proj as u32,
+        start_pos: start_pos as u32,
+        max_seq: max_seq as u32,
+        heads_per_kv: (n_heads / n_kv_heads) as u32,
+        n_tokens: n_tokens as u32,
+        _pad: 0,
+    };
+    let params_buf = gpu.create_params_buffer(&params);
+
+    let pipeline = &gpu.pipelines.qjl_value_weights;
+    let bind = gpu.make_bind_group_with(
+        pipeline,
+        vec![
+            softmax_buf,
+            v_signs_buf,
+            rnorm_buf,
+            c_out_buf,
+            params_buf.as_entire_binding(),
+        ],
+    );
+
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("qjl_value_weights.dispatch"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, &bind, &[]);
+    let threads = (n_tokens * n_heads * n_proj) as u32;
+    let groups = (threads + 255) / 256;
+    pass.dispatch_workgroups(groups, 1, 1);
+}
+
+/// Params for `attn_value_polar_qjl_batch.wgsl` (Phase O pass B).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct AttnValuePolarQjlBatchParams {
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    start_pos: u32,
+    max_seq: u32,
+    heads_per_kv: u32,
+    n_pairs: u32,
+    n_tokens: u32,
+    n_proj: u32,
+    gamma: f32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+/// Phase O pass B: QJL-corrected weighted value sum. Drop-in for
+/// `dispatch_attn_value_polar_batch` when the cache has QJL — adds the
+/// Γ-scaled residual correction from pass A's `c_weights_buf`.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_attn_value_polar_qjl_batch(
+    gpu: &Arc<GpuDevice>,
+    encoder: &mut wgpu::CommandEncoder,
+    softmax_buf: wgpu::BindingResource<'_>,
+    v_angles_buf: wgpu::BindingResource<'_>,
+    v_radius_buf: wgpu::BindingResource<'_>,
+    c_weights_buf: wgpu::BindingResource<'_>,
+    projection_buf: wgpu::BindingResource<'_>,
+    output_buf: wgpu::BindingResource<'_>,
+    lut_buf: wgpu::BindingResource<'_>,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    start_pos: usize,
+    n_tokens: usize,
+    max_seq: usize,
+    n_proj: usize,
+) {
+    assert!(head_dim % 2 == 0);
+    assert!(n_heads % n_kv_heads == 0);
+    assert!(start_pos + n_tokens <= max_seq);
+    assert!(n_proj % 32 == 0);
+
+    let params = AttnValuePolarQjlBatchParams {
+        n_heads: n_heads as u32,
+        n_kv_heads: n_kv_heads as u32,
+        head_dim: head_dim as u32,
+        start_pos: start_pos as u32,
+        max_seq: max_seq as u32,
+        heads_per_kv: (n_heads / n_kv_heads) as u32,
+        n_pairs: (head_dim / 2) as u32,
+        n_tokens: n_tokens as u32,
+        n_proj: n_proj as u32,
+        gamma: crate::ops::qjl::v_correction_gamma(n_proj, head_dim),
+        _pad0: 0,
+        _pad1: 0,
+    };
+    let params_buf = gpu.create_params_buffer(&params);
+
+    let pipeline = &gpu.pipelines.attn_value_polar_qjl_batch;
+    let bind = gpu.make_bind_group_with(
+        pipeline,
+        vec![
+            softmax_buf,
+            v_angles_buf,
+            v_radius_buf,
+            c_weights_buf,
+            projection_buf,
+            output_buf,
+            params_buf.as_entire_binding(),
+            lut_buf,
+        ],
+    );
+
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("attn_value_polar_qjl_batch.dispatch"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, &bind, &[]);
+    let threads = (n_tokens * n_heads * head_dim) as u32;
+    let groups = (threads + 255) / 256;
+    pass.dispatch_workgroups(groups, 1, 1);
+}
+
 // ---------------------------------------------------------------------------
 // Compress shader dispatch — f32 K/V → polar cache buffers (no CPU round-trip).
 // ---------------------------------------------------------------------------
@@ -1078,6 +1237,113 @@ pub fn qjl_encode_k_layer(
         cache.lut_buffer().binding(),
         n_tokens, start_pos,
         cache.n_kv_heads(), cache.head_dim(), cache.n_qjl_proj(),
+        cache.max_seq_len(),
+    );
+}
+
+/// Phase O: encode V-side QJL signs + residual norms. Mirror of
+/// `dispatch_kv_qjl_encode` but with multi-word sign output (V uses
+/// `n_proj` = 256 → 8 u32 words per entry) and an extra rnorm output
+/// buffer for the Γ-scaled value correction.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_kv_qjl_encode_v(
+    gpu: &Arc<GpuDevice>,
+    encoder: &mut wgpu::CommandEncoder,
+    v_in_buf: wgpu::BindingResource<'_>,
+    rotation_buf: wgpu::BindingResource<'_>,
+    v_angles_buf: wgpu::BindingResource<'_>,
+    v_radius_buf: wgpu::BindingResource<'_>,
+    projection_buf: wgpu::BindingResource<'_>,
+    signs_buf: wgpu::BindingResource<'_>,
+    rnorm_buf: wgpu::BindingResource<'_>,
+    lut_buf: wgpu::BindingResource<'_>,
+    n_tokens: usize,
+    start_pos: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    n_proj: usize,
+    max_seq: usize,
+) {
+    assert!(
+        head_dim % 8 == 0,
+        "kv_qjl_encode_v requires head_dim divisible by 8 (got {head_dim})"
+    );
+    assert!(head_dim <= 128, "kv_qjl_encode_v shader register array sized for head_dim <= 128");
+    assert!(n_proj % 32 == 0, "kv_qjl_encode_v requires n_proj as a multiple of 32 (whole sign words)");
+    assert!(start_pos + n_tokens <= max_seq);
+
+    let n_pairs = head_dim / 2;
+    let params = KvQjlEncodeParams {
+        n_tokens: n_tokens as u32,
+        start_pos: start_pos as u32,
+        n_kv_heads: n_kv_heads as u32,
+        head_dim: head_dim as u32,
+        n_pairs: n_pairs as u32,
+        n_proj: n_proj as u32,
+        max_seq: max_seq as u32,
+        _pad: 0,
+    };
+    let params_buf = gpu.create_params_buffer(&params);
+
+    let pipeline = &gpu.pipelines.kv_qjl_encode_v;
+    let bind = gpu.make_bind_group_with(
+        pipeline,
+        vec![
+            v_in_buf,
+            rotation_buf,
+            v_angles_buf,
+            v_radius_buf,
+            projection_buf,
+            signs_buf,
+            rnorm_buf,
+            lut_buf,
+            params_buf.as_entire_binding(),
+        ],
+    );
+
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("kv_qjl_encode_v.dispatch"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, &bind, &[]);
+    let threads = (n_tokens * n_kv_heads) as u32;
+    let groups = (threads + 63) / 64;
+    pass.dispatch_workgroups(groups, 1, 1);
+}
+
+/// Phase O convenience: encode V QJL signs + rnorm for one layer of a
+/// polar cache. No-op when QJL is disabled. Must run AFTER
+/// `compress_layer_into_polar` for the same `(layer, n_tokens,
+/// start_pos)` so V angles + radius are up to date.
+pub fn qjl_encode_v_layer(
+    gpu: &Arc<GpuDevice>,
+    encoder: &mut wgpu::CommandEncoder,
+    cache: &GpuPolarKvCache,
+    layer: usize,
+    v_in_buf: wgpu::BindingResource<'_>,
+    n_tokens: usize,
+    start_pos: usize,
+) {
+    if cache.n_qjl_proj() == 0 { return; }
+    let signs_buf = cache.v_qjl_signs_layer(layer)
+        .expect("v_qjl_signs_layer must exist when n_qjl_proj > 0");
+    let proj_buf = cache.v_qjl_projection_layer(layer)
+        .expect("v_qjl_projection_layer must exist when n_qjl_proj > 0");
+    let rnorm_buf = cache.v_qjl_rnorm_layer(layer)
+        .expect("v_qjl_rnorm_layer must exist when n_qjl_proj > 0");
+    dispatch_kv_qjl_encode_v(
+        gpu, encoder,
+        v_in_buf,
+        cache.rotation_layer(layer).binding(),
+        cache.v_angles_layer(layer).binding(),
+        cache.v_radius_layer(layer).binding(),
+        proj_buf.binding(),
+        signs_buf.binding(),
+        rnorm_buf.binding(),
+        cache.lut_buffer().binding(),
+        n_tokens, start_pos,
+        cache.n_kv_heads(), cache.head_dim(), cache.n_v_qjl_proj(),
         cache.max_seq_len(),
     );
 }
@@ -3057,5 +3323,211 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Phase O end-to-end parity: GPU V encode (signs + rnorm) + the
+    /// two-pass Γ-scaled value correction must match a CPU reference
+    /// computing the same weighted sum + correction directly.
+    #[test]
+    fn v_qjl_value_correction_matches_cpu() {
+        use crate::compute::wgpu_backend::GpuDevice;
+        use crate::layers::gpu_polar_kv_cache::GpuPolarKvCache;
+        use crate::ops::{polar, qjl::QjlProjection, qjl::v_correction_gamma};
+        use std::sync::Arc;
+
+        let Some(gpu) = GpuDevice::try_new() else { return };
+        let gpu = Arc::new(gpu);
+
+        let n_kv_heads = 2usize;
+        let n_heads = 4usize; // heads_per_kv = 2 (GQA shape)
+        let head_dim = 8usize;
+        let max_seq = 4usize;
+        let n_tokens = 3usize;
+        let rot_seed = 7u64;
+        let qjl_seed = 17u64;
+        let layer = 0usize;
+
+        let cache = GpuPolarKvCache::new_with_qjl(
+            gpu.clone(),
+            /*n_layers*/ 1, n_kv_heads, head_dim, max_seq,
+            rot_seed, /*n_qjl_proj (K)*/ 32, qjl_seed,
+        );
+        let n_v_proj = cache.n_v_qjl_proj();
+        assert!(n_v_proj > 0 && n_v_proj % 32 == 0);
+
+        // Deterministic V input.
+        let kv_dim = n_kv_heads * head_dim;
+        let mut v_data = Vec::with_capacity(n_tokens * kv_dim);
+        for t in 0..n_tokens {
+            for c in 0..kv_dim {
+                v_data.push((((t as f32 * 0.47) + c as f32 * 0.19).cos() * 0.6) as f32);
+            }
+        }
+        let v_packed = GpuDevice::pack_f16(&v_data);
+        let v_in_buf = gpu.create_storage_buffer(
+            bytemuck::cast_slice(&v_packed), "test.v_qjl.v_in",
+        );
+
+        // Synthetic softmax weights [n_tokens, n_heads, max_seq].
+        let mut weights = vec![0.0f32; n_tokens * n_heads * max_seq];
+        for tok in 0..n_tokens {
+            for h in 0..n_heads {
+                for t in 0..=tok {
+                    weights[tok * n_heads * max_seq + h * max_seq + t] =
+                        0.2 + 0.1 * (tok + h + t) as f32 / 10.0;
+                }
+            }
+        }
+        let weights_buf = gpu.create_storage_buffer(
+            bytemuck::cast_slice(&weights), "test.v_qjl.softmax",
+        );
+
+        // C accumulator + output buffers.
+        let c_bytes = (n_tokens * n_heads * n_v_proj * 4) as u64;
+        let c_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test.v_qjl.c"),
+            size: c_bytes,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let out_bytes = (n_tokens * n_heads * head_dim * 4) as u64;
+        let out_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test.v_qjl.out"),
+            size: out_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging = gpu.create_staging_buffer(out_bytes);
+
+        // GPU: compress V → encode V signs/rnorm → pass A → pass B.
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test.v_qjl.encoder"),
+        });
+        dispatch_kv_compress_polar(
+            &gpu, &mut encoder,
+            v_in_buf.as_entire_binding(),
+            cache.rotation_layer(layer).binding(),
+            cache.v_angles_layer(layer).binding(),
+            cache.v_radius_layer(layer).binding(),
+            n_tokens, /*start_pos*/ 0,
+            n_kv_heads, head_dim, max_seq,
+        );
+        qjl_encode_v_layer(
+            &gpu, &mut encoder, &cache, layer,
+            v_in_buf.as_entire_binding(), n_tokens, /*start_pos*/ 0,
+        );
+        dispatch_qjl_value_weights(
+            &gpu, &mut encoder,
+            weights_buf.as_entire_binding(),
+            cache.v_qjl_signs_layer(layer).unwrap().binding(),
+            cache.v_qjl_rnorm_layer(layer).unwrap().binding(),
+            c_buf.as_entire_binding(),
+            n_heads, n_kv_heads, n_v_proj, /*start_pos*/ 0, n_tokens, max_seq,
+        );
+        dispatch_attn_value_polar_qjl_batch(
+            &gpu, &mut encoder,
+            weights_buf.as_entire_binding(),
+            cache.v_angles_layer(layer).binding(),
+            cache.v_radius_layer(layer).binding(),
+            c_buf.as_entire_binding(),
+            cache.v_qjl_projection_layer(layer).unwrap().binding(),
+            out_buf.as_entire_binding(),
+            cache.lut_buffer().binding(),
+            n_heads, n_kv_heads, head_dim, /*start_pos*/ 0, n_tokens, max_seq,
+            n_v_proj,
+        );
+        encoder.copy_buffer_to_buffer(&out_buf, 0, &staging, 0, out_bytes);
+        gpu.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+        gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+        rx.recv().expect("out readback").expect("out map");
+        let raw = slice.get_mapped_range();
+        let gpu_out: Vec<f32> = raw.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        drop(raw);
+        staging.unmap();
+
+        // CPU reference. Same seed derivation as the cache's V set.
+        let r_matrix = polar::generate_rotation_matrix(head_dim, rot_seed);
+        let v_qjl_cpu = QjlProjection::with_n_projections(
+            head_dim, n_v_proj,
+            (qjl_seed + layer as u64).wrapping_add(0x9E37_79B9_7F4A_7C15),
+        );
+        let lut = polar::AngleLUT::new();
+        let gamma = v_correction_gamma(n_v_proj, head_dim);
+
+        // Per (t, kv_h): rotated-dequant vector, residual signs, rnorm.
+        // NOTE: the GPU pipeline quantizes the f16-PACKED V (pack_f16
+        // round-trips through half precision before rotate); mirror
+        // that on CPU or the angle buckets can differ at the edges.
+        let v_f16: Vec<f32> = v_packed.iter().flat_map(|w| {
+            let lo = half::f16::from_bits((w & 0xFFFF) as u16).to_f32();
+            let hi = half::f16::from_bits((w >> 16) as u16).to_f32();
+            [lo, hi]
+        }).collect();
+        let mut dq_rot = vec![vec![0.0f32; head_dim]; n_tokens * n_kv_heads];
+        let mut signs_store = Vec::with_capacity(n_tokens * n_kv_heads);
+        let mut rnorm_store = vec![0.0f32; n_tokens * n_kv_heads];
+        for t in 0..n_tokens {
+            for h in 0..n_kv_heads {
+                let off = t * kv_dim + h * head_dim;
+                let mut rotated = vec![0.0f32; head_dim];
+                polar::rotate(&r_matrix, &v_f16[off..off + head_dim], &mut rotated);
+                let (angles, radius) = polar::to_polar_quantized(&rotated);
+                let dq = polar::from_polar_quantized(&angles, radius, &lut);
+                let residual: Vec<f32> =
+                    rotated.iter().zip(&dq).map(|(a, b)| a - b).collect();
+                rnorm_store[t * n_kv_heads + h] =
+                    residual.iter().map(|r| r * r).sum::<f32>().sqrt();
+                signs_store.push(v_qjl_cpu.encode_signs(&residual));
+                dq_rot[t * n_kv_heads + h] = dq;
+            }
+        }
+
+        // CPU output = weighted dq sum + (Γ/n)·Σ_j C_j·p_jd.
+        let projections = v_qjl_cpu.projections();
+        let mut max_rel = 0.0f32;
+        for tok in 0..n_tokens {
+            for head in 0..n_heads {
+                let kv_h = head / (n_heads / n_kv_heads);
+                let w_base = tok * n_heads * max_seq + head * max_seq;
+                // C_j accumulation.
+                let mut c = vec![0.0f32; n_v_proj];
+                for t in 0..=tok {
+                    let entry = t * n_kv_heads + kv_h;
+                    let w = weights[w_base + t] * rnorm_store[entry];
+                    let signs = &signs_store[entry];
+                    for j in 0..n_v_proj {
+                        let bit = (signs[j / 8] >> (j % 8)) & 1;
+                        c[j] += if bit == 1 { w } else { -w };
+                    }
+                }
+                for d in 0..head_dim {
+                    let mut acc = 0.0f32;
+                    for t in 0..=tok {
+                        acc += weights[w_base + t] * dq_rot[t * n_kv_heads + kv_h][d];
+                    }
+                    let mut corr = 0.0f32;
+                    for j in 0..n_v_proj {
+                        corr += c[j] * projections[j * head_dim + d];
+                    }
+                    acc += gamma * corr / n_v_proj as f32;
+
+                    let g = gpu_out[tok * n_heads * head_dim + head * head_dim + d];
+                    let denom = acc.abs().max(1e-3);
+                    let rel = (g - acc).abs() / denom;
+                    max_rel = max_rel.max(rel);
+                    assert!(
+                        rel < 1e-3,
+                        "(tok={tok}, head={head}, d={d}): gpu={g} cpu={acc} rel={rel}",
+                    );
+                }
+            }
+        }
+        println!("v_qjl value correction parity: max_rel={max_rel:.2e}");
     }
 }
