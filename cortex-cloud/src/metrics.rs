@@ -29,7 +29,6 @@
 //! served via `GET /metrics` with content-type `text/plain; version=0.0.4`.
 
 use std::fmt::Write;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
