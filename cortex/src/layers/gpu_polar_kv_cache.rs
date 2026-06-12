@@ -209,21 +209,27 @@ impl GpuPolarKvCache {
             round_up(signs_bytes) * n_layers as u64 + pad_per_alloc * n_layers as u64
         } else { 0 };
 
-        let const_heap = ::vram_heap::VramHeap::new(
+        // Phase M: all three lane heaps reserve against the device VRAM
+        // budget (loud BudgetExceeded on over-commit; auto-released when
+        // the cache drops with the pool eviction / request end).
+        let const_heap = ::vram_heap::VramHeap::new_in_budget(
             &gpu.device,
+            &gpu.vram_budget,
             ::vram_heap::MemoryTier::DeviceLocal,
             const_size,
             "polar_kv.const",
         ).expect("polar_kv const_heap construction failed");
-        let data_heap = ::vram_heap::VramHeap::new(
+        let data_heap = ::vram_heap::VramHeap::new_in_budget(
             &gpu.device,
+            &gpu.vram_budget,
             ::vram_heap::MemoryTier::DeviceLocal,
             data_size,
             "polar_kv.data",
         ).expect("polar_kv data_heap construction failed");
         let signs_heap = if qjl_enabled {
-            Some(::vram_heap::VramHeap::new(
+            Some(::vram_heap::VramHeap::new_in_budget(
                 &gpu.device,
+                &gpu.vram_budget,
                 ::vram_heap::MemoryTier::DeviceLocal,
                 signs_size,
                 "polar_kv.signs",

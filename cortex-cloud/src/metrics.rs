@@ -204,6 +204,11 @@ pub struct Metrics {
     cache_pool_tokens_total: AtomicU64,
     vram_heap_bytes: [AtomicU64; 5],
     params_pool_acquired_total: AtomicU64,
+    // Phase M: device VRAM budget (total is static post-boot; committed
+    // moves with per-cache heap create/drop). committed/total is the
+    // "how close is the card to full" capacity meter.
+    vram_budget_total: AtomicU64,
+    vram_budget_committed: AtomicU64,
 
     // Static labels for the model_info gauge.
     model_name: String,
@@ -234,6 +239,8 @@ impl Metrics {
                 AtomicU64::new(0), AtomicU64::new(0),
             ],
             params_pool_acquired_total: AtomicU64::new(0),
+            vram_budget_total: AtomicU64::new(0),
+            vram_budget_committed: AtomicU64::new(0),
             model_name,
             build_version,
         }
@@ -266,6 +273,13 @@ impl Metrics {
     /// `rate()` over this counter.
     pub fn record_params_pool(&self, total_acquired: u64) {
         self.params_pool_acquired_total.store(total_acquired, Ordering::Relaxed);
+    }
+
+    /// Update the device VRAM budget gauges (Phase M). Called by the
+    /// sampler task from `GpuDevice::vram_budget_snapshot()`.
+    pub fn record_vram_budget(&self, total: u64, committed: u64) {
+        self.vram_budget_total.store(total, Ordering::Relaxed);
+        self.vram_budget_committed.store(committed, Ordering::Relaxed);
     }
 
     /// Record one completed request: increments the endpoint × status
@@ -379,6 +393,13 @@ impl Metrics {
         let _ = writeln!(out, "cortex_params_pool_acquired_total {}",
             self.params_pool_acquired_total.load(Ordering::Relaxed));
 
+        let _ = writeln!(out, "# HELP cortex_vram_budget_bytes Device VRAM budget: total detected capacity and bytes committed by live DeviceLocal heaps. committed/total is the card-fullness capacity meter.");
+        let _ = writeln!(out, "# TYPE cortex_vram_budget_bytes gauge");
+        let _ = writeln!(out, "cortex_vram_budget_bytes{{kind=\"total\"}} {}",
+            self.vram_budget_total.load(Ordering::Relaxed));
+        let _ = writeln!(out, "cortex_vram_budget_bytes{{kind=\"committed\"}} {}",
+            self.vram_budget_committed.load(Ordering::Relaxed));
+
         out
     }
 }
@@ -462,6 +483,7 @@ mod tests {
         m.record_vram_heap(VramHeapLabel::TransientA, 12_000_000);
         m.record_vram_heap(VramHeapLabel::Weights, 6_000_000_000);
         m.record_params_pool(123_456);
+        m.record_vram_budget(12_000_000_000, 7_500_000_000);
         let out = m.render_prometheus();
         // Spot-check: every metric name appears.
         for needle in [
@@ -484,6 +506,9 @@ mod tests {
             "cortex_vram_heap_bytes{heap=\"weights\"} 6000000000",
             "cortex_vram_heap_bytes{heap=\"host_readback\"} 0",
             "cortex_params_pool_acquired_total 123456",
+            // Phase M
+            "cortex_vram_budget_bytes{kind=\"total\"} 12000000000",
+            "cortex_vram_budget_bytes{kind=\"committed\"} 7500000000",
         ] {
             assert!(out.contains(needle), "missing line: {needle}\nfull output:\n{out}");
         }

@@ -4065,6 +4065,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // ParamsBufferPool cumulative acquire count.
             let p = gpu.params_pool.stats();
             sampler_state.metrics.record_params_pool(p.total_acquired as u64);
+
+            // Device VRAM budget (Phase M): total + committed across all
+            // live DeviceLocal heaps (globals + per-cache).
+            let (budget_total, budget_committed) = gpu.vram_budget_snapshot();
+            sampler_state.metrics.record_vram_budget(budget_total, budget_committed);
         }
     });
 

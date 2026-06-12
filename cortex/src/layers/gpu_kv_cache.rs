@@ -76,8 +76,14 @@ impl GpuKvCache {
         let heap_size = round_up(bytes_per_buffer) * 2 * n_layers as u64
             + pad_per_alloc * (n_layers as u64 * 2);
 
-        let kv_heap = ::vram_heap::VramHeap::new(
+        // Phase M: reserve against the device VRAM budget so a cache
+        // pool growing past physical VRAM fails with a loud
+        // BudgetExceeded (request-level panic the tokio boundary
+        // contains) instead of a driver-level OOM. The reservation
+        // auto-releases when the cache (and its heap) drops.
+        let kv_heap = ::vram_heap::VramHeap::new_in_budget(
             &gpu.device,
+            &gpu.vram_budget,
             ::vram_heap::MemoryTier::DeviceLocal,
             heap_size,
             "gpu_kv.heap",

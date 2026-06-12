@@ -526,6 +526,15 @@ pub struct GpuDevice {
     pub queue: wgpu::Queue,
     pub pipelines: Pipelines,
     pub params_pool: ParamsBufferPool,
+    /// Device VRAM budget (Phase M). Detected through the Vulkan
+    /// backend at startup (fallback: CORTEX_VRAM_TOTAL_MB, default
+    /// 8 GB). Every DeviceLocal heap — the four globals below plus the
+    /// per-cache `gpu_kv` / `polar_kv` heaps — reserves against it via
+    /// `new_in_budget`, so VRAM over-commit fails loudly at heap
+    /// construction (`BudgetExceeded` naming label/requested/committed/
+    /// total) instead of as a driver-level OOM mid-inference. Heap drop
+    /// auto-releases its reservation.
+    pub vram_budget: Arc<::vram_heap::DeviceBudget>,
     /// Lane-A device-local heap. Holds `hidden_buf`, `rotated_buf`,
     /// `PolarBlockScratch::{gate, up}`.
     pub transient_heap_a: Arc<::vram_heap::VramHeap>,
@@ -663,54 +672,107 @@ impl GpuDevice {
             "params buffer pool allocated",
         );
 
+        // Phase M: device VRAM budget. wgpu's safe API won't report
+        // total VRAM, so vram-heap queries it through the Vulkan
+        // backend (ash); on non-Vulkan backends detection returns None
+        // and the 8 GB fallback applies (conservative). All DeviceLocal
+        // heaps reserve against this budget, so over-committing the
+        // card is a loud BudgetExceeded at construction instead of a
+        // driver-level OOM mid-inference.
+        //
+        // CORTEX_VRAM_TOTAL_MB, when set, is an explicit OVERRIDE (not
+        // a detection fallback): the operator's word beats the query.
+        // Use it to leave VRAM for other processes on a shared card, or
+        // to test budget-exceeded behavior.
+        let vram_budget = match std::env::var("CORTEX_VRAM_TOTAL_MB")
+            .ok().and_then(|s| s.parse::<u64>().ok())
+        {
+            Some(mb) => ::vram_heap::DeviceBudget::explicit(mb * 1024 * 1024),
+            None => ::vram_heap::DeviceBudget::detect_or(&adapter, 8192 * 1024 * 1024),
+        };
+        tracing::info!(
+            total_mb = vram_budget.total() / (1024 * 1024),
+            source = ?vram_budget.source(),
+            "device VRAM budget",
+        );
+
         // vram-heap arenas. Three device-local heaps form the 3-lane
         // scheme that the polar forward path uses to keep R inputs
         // and RW outputs on different backings within one dispatch
         // (wgpu/Vulkan rejects same-buffer R+RW even at disjoint
         // sub-ranges). Phase D required a 3rd lane because the
         // hidden_buf/rotated_buf + BlockScratch conflict graph is
-        // not 2-colorable. Sizes default to 128 MB each — enough for
-        // Qwen 3B at typical query sizes (worst single allocation:
-        // ~63 MB scores at 989 tokens); tunable via env vars.
-        let heap_a_mb: u64 = std::env::var("CORTEX_VRAM_HEAP_A_MB")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(128);
-        let heap_b_mb: u64 = std::env::var("CORTEX_VRAM_HEAP_B_MB")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(128);
-        let heap_c_mb: u64 = std::env::var("CORTEX_VRAM_HEAP_C_MB")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(128);
-        // Phase G: static weights heap sized for Qwen 3B-class models
-        // (~6 GB at packed f16) with ~1 GB slack. Set to 0 (or smaller)
-        // for TinyLlama / smaller models; the loader will OOM with a
-        // clear "polar_kv const_heap capacity"-style message naming
-        // the field that overflowed.
+        // not 2-colorable.
+        //
+        // Phase M sizing: env vars always win; otherwise lane sizes
+        // derive from the budget headroom left after the weights heap.
+        // Floors are the old 128 MB defaults (never regress); caps are
+        // where extra capacity stops buying prefill throughput — Lane B
+        // past ~2.3 GB is wasted because the single `scores` storage
+        // binding is capped at max_storage_buffer_binding_size (~2 GB),
+        // and the chunker (`safe_prefill_chunk_size`) enforces all
+        // lane + binding constraints, so any sizing here is *correct*;
+        // bigger lanes just mean fewer, larger prefill chunks. The
+        // remaining headroom is deliberately left unreserved for the
+        // per-cache heaps (gpu_kv / polar_kv) that come and go with
+        // the cache pool.
+        //
+        // Phase G note (weights): sized for Qwen 3B-class models
+        // (~6 GB at packed f16) with ~1 GB slack; model size isn't
+        // known at device init, so this stays env-driven rather than
+        // derived. Set CORTEX_VRAM_HEAP_WEIGHTS_MB smaller for
+        // TinyLlama-class models or bigger for 7B+.
         let heap_weights_mb: u64 = std::env::var("CORTEX_VRAM_HEAP_WEIGHTS_MB")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(7168);
         let heap_readback_mb: u64 = std::env::var("CORTEX_VRAM_HEAP_READBACK_MB")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(256);
-        let transient_heap_a = ::vram_heap::VramHeap::new(
+        let total_mb = vram_budget.total() / (1024 * 1024);
+        let headroom_mb = total_mb.saturating_sub(heap_weights_mb);
+        let derived = |frac_of: u64, floor: u64, cap: u64| frac_of.clamp(floor, cap);
+        let heap_a_mb: u64 = std::env::var("CORTEX_VRAM_HEAP_A_MB")
+            .ok().and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| derived(headroom_mb / 8, 128, 1152));
+        let heap_b_mb: u64 = std::env::var("CORTEX_VRAM_HEAP_B_MB")
+            .ok().and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| derived(headroom_mb / 4, 128, 2304));
+        let heap_c_mb: u64 = std::env::var("CORTEX_VRAM_HEAP_C_MB")
+            .ok().and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| derived(headroom_mb / 16, 128, 576));
+        tracing::info!(
+            lane_a_mb = heap_a_mb, lane_b_mb = heap_b_mb, lane_c_mb = heap_c_mb,
+            weights_mb = heap_weights_mb, readback_mb = heap_readback_mb,
+            "vram heap sizes (env override or budget-derived)",
+        );
+        let transient_heap_a = ::vram_heap::VramHeap::new_in_budget(
             &device,
+            &vram_budget,
             ::vram_heap::MemoryTier::DeviceLocal,
             heap_a_mb * 1024 * 1024,
             "cortex.transient.a",
         ).expect("vram-heap A construction failed");
-        let transient_heap_b = ::vram_heap::VramHeap::new(
+        let transient_heap_b = ::vram_heap::VramHeap::new_in_budget(
             &device,
+            &vram_budget,
             ::vram_heap::MemoryTier::DeviceLocal,
             heap_b_mb * 1024 * 1024,
             "cortex.transient.b",
         ).expect("vram-heap B construction failed");
-        let transient_heap_c = ::vram_heap::VramHeap::new(
+        let transient_heap_c = ::vram_heap::VramHeap::new_in_budget(
             &device,
+            &vram_budget,
             ::vram_heap::MemoryTier::DeviceLocal,
             heap_c_mb * 1024 * 1024,
             "cortex.transient.c",
         ).expect("vram-heap C construction failed");
-        let weights_heap = ::vram_heap::VramHeap::new(
+        let weights_heap = ::vram_heap::VramHeap::new_in_budget(
             &device,
+            &vram_budget,
             ::vram_heap::MemoryTier::DeviceLocal,
             heap_weights_mb * 1024 * 1024,
             "cortex.weights",
         ).expect("vram-heap weights construction failed");
+        // HostReadback is host-visible system RAM, not device VRAM —
+        // deliberately NOT budgeted.
         let host_readback_heap = ::vram_heap::VramHeap::new(
             &device,
             ::vram_heap::MemoryTier::HostReadback,
@@ -719,7 +781,7 @@ impl GpuDevice {
         ).expect("vram-heap readback construction failed");
 
         Some(Self {
-            device, queue, pipelines, params_pool,
+            device, queue, pipelines, params_pool, vram_budget,
             transient_heap_a, transient_heap_b, transient_heap_c, weights_heap, host_readback_heap,
         })
     }
@@ -874,6 +936,16 @@ impl GpuDevice {
             (VramHeapId::Weights, self.weights_heap.stats().used_payload),
             (VramHeapId::HostReadback, self.host_readback_heap.stats().used_payload),
         ]
+    }
+
+    /// Snapshot of the device VRAM budget: `(total, committed)` bytes.
+    /// Committed counts every live DeviceLocal heap's reservation — the
+    /// four globals plus per-cache gpu_kv/polar_kv heaps. The Phase K
+    /// metrics sampler exports these as `cortex_vram_budget_bytes`;
+    /// `committed / total` is the "how close is the card to full"
+    /// capacity meter for the scaling dashboard.
+    pub fn vram_budget_snapshot(&self) -> (u64, u64) {
+        (self.vram_budget.total(), self.vram_budget.committed())
     }
 
     pub fn pack_f16(data: &[f32]) -> Vec<u32> {
