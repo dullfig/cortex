@@ -42,16 +42,23 @@ def main():
     ap.add_argument("--polar", action="store_true",
                     help="load shards polar_only (server must have --enable-polar-cache)")
     ap.add_argument("--label", default="run")
+    ap.add_argument("--qd", default=QD, help="Q/D json path")
+    ap.add_argument("--holdout", choices=["shard"], default=None,
+                    help="by-shard train/test: greedy-select heads on train-split "
+                         "queries, validate on test-split (unseen-document) queries")
     ap.add_argument("--skip-drive", action="store_true",
                     help="analyze existing dumps only (records.json must exist)")
     args = ap.parse_args()
     os.makedirs(args.dumps, exist_ok=True)
     records_path = os.path.join(args.dumps, "records.json")
 
-    qd = json.load(open(QD, encoding="utf-8"))
+    qd = json.load(open(args.qd, encoding="utf-8"))
     by_shard = {}
     for q in qd["queries"]:
         by_shard.setdefault(q["gold_shard"], []).append(q)
+    # qid -> split, from each query's gold_shard's split (default "train")
+    shard_split = {s["id"]: s.get("split", "train") for s in qd["shards"]}
+    split_of = {q["id"]: shard_split.get(q["gold_shard"], "train") for q in qd["queries"]}
 
     # ---- drive phase: fire queries, server writes dumps in order ----
     if not args.skip_drive:
@@ -64,7 +71,7 @@ def main():
         json.dump(records, open(records_path, "w"))
         print(f"drove {len(records)} queries; dumps + records in {args.dumps}")
     records = json.load(open(records_path))
-    analyze(args, records)
+    analyze(args, records, split_of)
 
 def drive(args, qd, by_shard, records):
         for shard in qd["shards"]:
@@ -102,7 +109,7 @@ def drive(args, qd, by_shard, records):
                 })
             delete(args.server, sid)
 
-def analyze(args, records):
+def analyze(args, records, split_of=None):
     # ---- analysis phase ----
     dumps = sorted(f for f in os.listdir(args.dumps) if f.startswith("headdump-"))
     assert len(dumps) == len(records), f"{len(dumps)} dumps vs {len(records)} records"
@@ -162,11 +169,15 @@ def analyze(args, records):
         row = "".join(f"{head_recall[(l, h)][2]:>5}" for h in range(n_heads))
         print(f"L{l:<4} {row}")
 
-    # all-heads MAX sanity vs production
-    def combined_recall(head_set):
+    # all-heads MAX sanity vs production. `subset` = list of (d, rec, diffs)
+    # to evaluate over; defaults to all queries.
+    def combined_recall(head_set, subset=None):
         """elementwise max of diffs over the head set (matches production MAX agg)"""
+        items = subset if subset is not None else per_query_diff
+        if not items:
+            return [0.0, 0.0, 0.0]
         counts = [0, 0, 0]
-        for d, rec, diffs in per_query_diff:
+        for d, rec, diffs in items:
             sink = d["sink_tokens"]
             clen = d["corpus_len"]
             combo = [max(diffs[(li, h)][k]
@@ -176,31 +187,57 @@ def analyze(args, records):
             offs = rank_hits(combo, sink, rec["gold_start"], rec["gold_end"])
             for i, kk in enumerate(KS):
                 counts[i] += is_hit(offs, rec["gold_start"], rec["gold_end"], kk)
-        return [c / n for c in counts]
+        return [c / len(items) for c in counts]
 
     all_heads = {(l, h) for l in layers for h in range(n_heads)}
     allr = combined_recall(all_heads)
     print(f"\nall-heads MAX-combined (≈ production w/ MAX-differential): "
           f"R@1={allr[0]:.2f} R@5={allr[1]:.2f} R@10={allr[2]:.2f}")
 
-    # greedy subset selection by R@10 then R@5 then R@1
-    chosen = set()
-    best_score = (-1.0, -1.0, -1.0)
-    print("\n=== greedy head-subset selection ===")
-    for _step in range(8):
-        best_h, best_r = None, best_score
-        for cand in all_heads - chosen:
-            r = combined_recall(chosen | {cand})
-            key = (r[2], r[1], r[0])
-            if key > best_r:
-                best_r, best_h = key, cand
-        if best_h is None:
-            break
-        chosen.add(best_h)
-        best_score = best_r
+    def greedy_select(train_items, steps=8):
+        """greedy head-subset maximizing (R@10,R@5,R@1) on train_items.
+        Returns list of (chosen_set_copy, train_r) per step."""
+        chosen, best = set(), (-1.0, -1.0, -1.0)
+        history = []
+        for _ in range(steps):
+            best_h, best_r = None, best
+            for cand in all_heads - chosen:
+                r = combined_recall(chosen | {cand}, train_items)
+                key = (r[2], r[1], r[0])
+                if key > best_r:
+                    best_r, best_h = key, cand
+            if best_h is None:
+                break
+            chosen.add(best_h); best = best_r
+            history.append((set(chosen), best_r))
+        return history
+
+    # ---- whole-set greedy (selection-biased; for description only) ----
+    print("\n=== greedy head-subset selection (WHOLE set — selection-biased) ===")
+    for chosen, r in greedy_select(per_query_diff):
         spec = ",".join(f"{l}:{h}" for l, h in sorted(chosen))
-        print(f"  +L{best_h[0]}:H{best_h[1]}  ->  R@1={best_r[2]:.2f} R@5={best_r[1]:.2f} "
-              f"R@10={best_r[0]:.2f}   CORTEX_RETRIEVE_HEADS={spec}")
+        last = sorted(chosen)[-1]
+        print(f"  +L{last[0]}:H{last[1]}  ->  R@1={r[2]:.2f} R@5={r[1]:.2f} "
+              f"R@10={r[0]:.2f}   ({len(chosen)} heads)  CORTEX_RETRIEVE_HEADS={spec}")
+
+    # ---- by-shard holdout: the trustworthy number ----
+    if args.holdout == "shard" and split_of is not None:
+        train_items = [(d, rec, df) for (d, rec, df) in per_query_diff
+                       if split_of.get(rec["qid"]) == "train"]
+        test_items = [(d, rec, df) for (d, rec, df) in per_query_diff
+                      if split_of.get(rec["qid"]) == "test"]
+        print(f"\n=== BY-SHARD HOLDOUT (train {len(train_items)} q / "
+              f"test {len(test_items)} q, unseen documents) ===")
+        all_test = combined_recall(all_heads, test_items)
+        print(f"all-heads on TEST: R@1={all_test[0]:.2f} R@5={all_test[1]:.2f} R@10={all_test[2]:.2f}")
+        print(f"{'#heads':>6} {'trainR@10':>10} {'testR@10':>9} {'gap':>6}  heads")
+        for chosen, train_r in greedy_select(train_items):
+            test_r = combined_recall(chosen, test_items)
+            spec = ",".join(f"{l}:{h}" for l, h in sorted(chosen))
+            gap = train_r[0] - test_r[0]
+            print(f"{len(chosen):>6} {train_r[0]:>10.2f} {test_r[0]:>9.2f} {gap:>+6.2f}  {spec}")
+        print("\nThe TEST R@10 column is the trustworthy 'generalizes to unseen "
+              "documents' number; train-test gap = overfitting.")
 
 if __name__ == "__main__":
     main()
