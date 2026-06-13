@@ -758,14 +758,20 @@ impl GpuEngine {
         }
 
         // 5. RoPE on Q and K — C3 packed (in-place).
-        self.dispatch_rope_packed_into(
-            encoder, scratch.q.binding(), self.rope_cos_buf.binding(), self.rope_sin_buf.binding(),
-            n_heads, head_dim, start_pos, n_tokens,
-        );
-        self.dispatch_rope_packed_into(
-            encoder, scratch.k.binding(), self.rope_cos_buf.binding(), self.rope_sin_buf.binding(),
-            n_kv_heads, head_dim, start_pos, n_tokens,
-        );
+        // Phase P.2 (diagnostic): skip under CORTEX_RETRIEVE_OFFSET_ZERO
+        // so the query is encoded position-free, matching the
+        // position-free corpus prefill — scores become pure content
+        // dots. See the f32 inner forward for the full rationale + caveat.
+        if std::env::var("CORTEX_RETRIEVE_OFFSET_ZERO").is_err() {
+            self.dispatch_rope_packed_into(
+                encoder, scratch.q.binding(), self.rope_cos_buf.binding(), self.rope_sin_buf.binding(),
+                n_heads, head_dim, start_pos, n_tokens,
+            );
+            self.dispatch_rope_packed_into(
+                encoder, scratch.k.binding(), self.rope_cos_buf.binding(), self.rope_sin_buf.binding(),
+                n_kv_heads, head_dim, start_pos, n_tokens,
+            );
+        }
 
         // 5.5 Compress K and V into the polar cache at [start_pos, start_pos+n_tokens).
         // kv_compress_polar reads packed-f16 input (fixed 2026-05-27).

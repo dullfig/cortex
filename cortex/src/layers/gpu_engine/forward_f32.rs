@@ -1429,14 +1429,28 @@ impl GpuEngine {
             }
 
             // 5. RoPE on Q and K (in-place packed).
-            self.dispatch_rope_packed_in_pass(
-                &mut pass, scratch.q.binding(), self.rope_cos_buf.binding(), self.rope_sin_buf.binding(),
-                n_heads, head_dim, start_pos, n_tokens,
-            );
-            self.dispatch_rope_packed_in_pass(
-                &mut pass, scratch.k.binding(), self.rope_cos_buf.binding(), self.rope_sin_buf.binding(),
-                n_kv_heads, head_dim, start_pos, n_tokens,
-            );
+            //
+            // Phase P.2 (diagnostic): CORTEX_RETRIEVE_OFFSET_ZERO skips
+            // RoPE entirely. With the corpus prefilled position-free here
+            // AND the polar query forward skipping RoPE too, attention
+            // scores become pure content dot products (relative offset 0
+            // for every key) — a test of whether the position/distance
+            // prior is what's swamping retrieval. NOTE: this changes the
+            // REPRESENTATIONS (a no-RoPE forward differs at every layer),
+            // not just the scoring geometry; it is a coarse probe, not
+            // the rigorous "real-representation, de-roped scoring" version.
+            // Server-wide flag — only set it on a retrieval diagnostic
+            // deployment.
+            if std::env::var("CORTEX_RETRIEVE_OFFSET_ZERO").is_err() {
+                self.dispatch_rope_packed_in_pass(
+                    &mut pass, scratch.q.binding(), self.rope_cos_buf.binding(), self.rope_sin_buf.binding(),
+                    n_heads, head_dim, start_pos, n_tokens,
+                );
+                self.dispatch_rope_packed_in_pass(
+                    &mut pass, scratch.k.binding(), self.rope_cos_buf.binding(), self.rope_sin_buf.binding(),
+                    n_kv_heads, head_dim, start_pos, n_tokens,
+                );
+            }
 
             // 5.5 (cached path) Write K/V into the layer's resident cache.
             // Phase F: kv_cache_target carries &VramAllocation. Build a
