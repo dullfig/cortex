@@ -515,6 +515,14 @@ pub(crate) async fn cache_delete(
         drop(pool);
         // Composition might reference the evicted shard; safest to drop.
         *state.composition.lock().await = None;
+        // Flush wgpu's deferred-destroy queue so the evicted cache's
+        // backing buffers (f32 kv_heap + polar const/data/signs heaps)
+        // are actually freed NOW. Without this, repeated
+        // load/retrieve/delete cycles accumulate destroyed-but-unfreed
+        // buffers until wgpu-29 surfaces a delayed "Validation Error"
+        // panic at the next Device::poll (observed at ~8-10 cycles).
+        // Same mitigation as the polar_only drop in cache_load.
+        tokio::task::block_in_place(|| state.engine.poll_wait());
         info!(cache_id = %cache_id, pool_size = pool_size, "cache evicted");
         Ok(StatusCode::NO_CONTENT)
     } else {

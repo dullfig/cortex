@@ -916,7 +916,24 @@ pub(crate) async fn chat_completions(
             .unwrap_or_else(|_| "last".to_string());
         let agg_all_q = agg_mode == "all" || agg_mode == "all_mean";
         let agg_mean = agg_mode == "mean" || agg_mode == "all_mean";
-        let aggregate_score = |per_layer: &[Vec<f32>], n_q: usize, attn_max: usize| -> Vec<f32> {
+        // Phase P: optional (layer, head) mask for the aggregation —
+        // CORTEX_RETRIEVE_HEADS="35:7,34:2,..." (absolute layer indices
+        // from `layers_used`). When set, only listed pairs contribute to
+        // BOTH query and baseline aggregation. Retrieval-heads
+        // experiment knob (Wu et al. 2404.15574): aggregate attention
+        // mass is mostly plumbing; recall lives in a sparse head subset.
+        let head_mask: Option<std::collections::HashSet<(usize, usize)>> =
+            std::env::var("CORTEX_RETRIEVE_HEADS").ok().map(|spec| {
+                spec.split(',')
+                    .filter_map(|pair| {
+                        let (l, h) = pair.trim().split_once(':')?;
+                        Some((l.trim().parse().ok()?, h.trim().parse().ok()?))
+                    })
+                    .collect()
+            });
+        let capture_layers_ref = &capture_layers;
+        let head_mask_ref = &head_mask;
+        let aggregate_score = move |per_layer: &[Vec<f32>], n_q: usize, attn_max: usize| -> Vec<f32> {
             let q_range_start = if agg_all_q { 0 } else { n_q - 1 };
             let q_range_end = n_q;
             let mut out = vec![f32::NEG_INFINITY; corpus_len];
@@ -925,8 +942,13 @@ pub(crate) async fn chat_completions(
                 let mut sum = 0.0f32;
                 let mut count = 0usize;
                 for q in q_range_start..q_range_end {
-                    for layer_scores in per_layer {
+                    for (li, layer_scores) in per_layer.iter().enumerate() {
                         for h in 0..n_heads {
+                            if let Some(mask) = head_mask_ref {
+                                if !mask.contains(&(capture_layers_ref[li], h)) {
+                                    continue;
+                                }
+                            }
                             let idx = q * n_heads * attn_max + h * attn_max + k;
                             let v = layer_scores[idx];
                             if v.is_finite() {
@@ -948,16 +970,84 @@ pub(crate) async fn chat_completions(
         };
         let aggregate_max = aggregate_score;
 
-        let query_max = aggregate_max(&per_layer_scores, n_query, attn_max_seq);
-        let baseline_max = aggregate_max(&baseline_per_layer, baseline_tokens.len(), baseline_attn_max);
+        // Phase P: head-resolved dump for the per-head retrieval sweep.
+        // CORTEX_RETRIEVE_HEAD_DUMP=<dir> writes one JSON per retrieve
+        // request with the RAW last-query-row scores per (layer, head,
+        // corpus position) for query AND baseline — the offline script
+        // (pinky/retrieval-heads/sweep.py) recomputes any aggregation /
+        // differential variant from these without further server runs.
+        if let Ok(dump_dir) = std::env::var("CORTEX_RETRIEVE_HEAD_DUMP") {
+            static DUMP_SEQ: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let seq = DUMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let last_row = |per_layer: &[Vec<f32>], n_q: usize, attn_max: usize| -> Vec<Vec<Vec<f32>>> {
+                per_layer.iter().map(|layer_scores| {
+                    (0..n_heads).map(|h| {
+                        let base = (n_q - 1) * n_heads * attn_max + h * attn_max;
+                        layer_scores[base..base + corpus_len].to_vec()
+                    }).collect()
+                }).collect()
+            };
+            let dump = serde_json::json!({
+                "n_heads": n_heads,
+                "corpus_len": corpus_len,
+                "layers": capture_layers,
+                "sink_tokens": SINK_TOKENS,
+                "shards": shard_map.entries,
+                "query": last_row(&per_layer_scores, n_query, attn_max_seq),
+                "baseline": last_row(&baseline_per_layer, baseline_tokens.len(), baseline_attn_max),
+            });
+            let path = format!("{dump_dir}/headdump-{seq:04}.json");
+            if let Err(e) = std::fs::write(&path, dump.to_string()) {
+                tracing::warn!(path, error = %e, "head dump write failed");
+            }
+        }
 
         // Differential score: query attention - baseline attention. Positions
         // that are "always hot" (high in both) drop to zero; positions that
         // are query-specific stay high.
+        //
+        // Phase P: CORTEX_RETRIEVE_AGG=perhead computes the differential
+        // PER (layer, head) and THEN takes the max — each head calibrated
+        // against its own baseline before combining. The per-head sweep
+        // showed this is the form under which sparse retrieval heads
+        // dominate (single head L35:H13 R@10 0.50 vs 0.12 for
+        // diff-of-maxes over all heads); diff-of-maxes lets plumbing
+        // heads (sinks, syntax) saturate both maxes and cancel the
+        // signal. Respects CORTEX_RETRIEVE_HEADS. Uses the last query /
+        // baseline row (the "last" q-convention).
         let mut scores = vec![f32::NEG_INFINITY; corpus_len];
-        for k in 0..corpus_len {
-            if query_max[k].is_finite() && baseline_max[k].is_finite() {
-                scores[k] = query_max[k] - baseline_max[k];
+        if agg_mode == "perhead" {
+            let qn = n_query;
+            let bn = baseline_tokens.len();
+            for k in 0..corpus_len {
+                let mut best = f32::NEG_INFINITY;
+                for (li, (q_layer, b_layer)) in per_layer_scores.iter()
+                    .zip(baseline_per_layer.iter()).enumerate()
+                {
+                    for h in 0..n_heads {
+                        if let Some(mask) = &head_mask {
+                            if !mask.contains(&(capture_layers[li], h)) {
+                                continue;
+                            }
+                        }
+                        let qv = q_layer[(qn - 1) * n_heads * attn_max_seq + h * attn_max_seq + k];
+                        let bv = b_layer[(bn - 1) * n_heads * baseline_attn_max + h * baseline_attn_max + k];
+                        if qv.is_finite() && bv.is_finite() {
+                            let d = qv - bv;
+                            if d > best { best = d; }
+                        }
+                    }
+                }
+                if best.is_finite() { scores[k] = best; }
+            }
+        } else {
+            let query_max = aggregate_max(&per_layer_scores, n_query, attn_max_seq);
+            let baseline_max = aggregate_max(&baseline_per_layer, baseline_tokens.len(), baseline_attn_max);
+            for k in 0..corpus_len {
+                if query_max[k].is_finite() && baseline_max[k].is_finite() {
+                    scores[k] = query_max[k] - baseline_max[k];
+                }
             }
         }
         let selected_layers = capture_layers;
@@ -990,6 +1080,13 @@ pub(crate) async fn chat_completions(
             })
             .take(top_k)
             .collect();
+
+        // Flush wgpu's deferred-destroy queue: each traced forward drops
+        // per-layer capture buffers + stagings at exit, and repeated
+        // retrieves accumulate them until wgpu-29 panics with a delayed
+        // Validation Error at a later Device::poll (observed at ~8-10
+        // load/retrieve/delete cycles). Mirrors the cache_delete flush.
+        tokio::task::block_in_place(|| state.engine.poll_wait());
 
         let retrieval_ms = retrieve_start.elapsed().as_millis() as u64;
 
