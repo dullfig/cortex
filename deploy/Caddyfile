@@ -1,0 +1,43 @@
+# Caddy reverse proxy for cortex-server (Phase Q).
+# TLS termination + static API-key (Bearer) gate. cortex itself has no
+# auth — this is the only door.
+#
+# Config via env (see docker-compose.yml / .env):
+#   CORTEX_DOMAIN   public hostname -> automatic Let's Encrypt TLS.
+#                   Leave BLANK for a bare-IP box (address becomes :443).
+#   CORTEX_API_KEY  required Bearer token for every request except /health.
+#
+# TLS modes:
+#   * Domain set  -> this config is correct as-is (Caddy auto-provisions
+#                    a public cert; needs ports 80+443 reachable + DNS).
+#   * Bare IP     -> CORTEX_DOMAIN blank makes the address ":443"; Caddy
+#                    can't get a public cert without a hostname, so
+#                    UNCOMMENT the `tls internal` line below to serve its
+#                    own CA cert (AgentOS must then trust/pin it).
+#                    Do NOT enable `tls internal` when using a real
+#                    domain — it disables Let's Encrypt for that site.
+
+{
+	admin off
+}
+
+{$CORTEX_DOMAIN::443} {
+	# Bare-IP only — uncomment for a domain-less box:
+	# tls internal
+
+	# Liveness probe, unauthenticated, for orchestrator health checks.
+	handle /health {
+		reverse_proxy cortex:8100
+	}
+
+	# Everything else requires Authorization: Bearer <CORTEX_API_KEY>.
+	@authed header Authorization "Bearer {$CORTEX_API_KEY}"
+	handle @authed {
+		reverse_proxy cortex:8100
+	}
+
+	# Missing / wrong key -> 403.
+	handle {
+		respond "forbidden" 403
+	}
+}

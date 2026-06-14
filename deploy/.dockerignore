@@ -1,0 +1,13 @@
+# Keep the build context small. Context is the repo root.
+target/
+**/target/
+pinky/
+models/
+.git/
+*.gguf
+*.md
+!Cargo.toml
+docs/
+deploy/models/
+.claude/
+*.log
