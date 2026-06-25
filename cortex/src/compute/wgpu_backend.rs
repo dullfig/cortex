@@ -572,6 +572,13 @@ pub struct GpuDevice {
     /// host-mapped for read. Capture-staging buffers in retrieval
     /// trace forwards land here.
     pub host_readback_heap: Arc<::vram_heap::VramHeap>,
+    /// The device-probe `DeviceProfile` cortex was built on: which
+    /// adapter was selected and its queried + measured capabilities
+    /// (VRAM, binding/workgroup limits, supports-f16, and the measured
+    /// f16/bandwidth numbers). Logged at startup; read by future phases
+    /// (tile/workgroup specialization, f16-arith kernel selection) that
+    /// aren't wired yet.
+    pub profile: device_probe::DeviceProfile,
 }
 
 /// Identifier for one of the five vram-heaps cortex constructs on a
@@ -601,79 +608,79 @@ impl VramHeapId {
 
 impl GpuDevice {
     /// Try to create a GPU device with all pipelines compiled.
-    /// Returns `None` if no suitable adapter is found.
+    /// Returns `None` if no usable adapter is found.
+    ///
+    /// Device selection, the live `wgpu::Device`/`Queue`, and the
+    /// authoritative VRAM number come from the `device-probe` crate — the
+    /// leaf of the `device-probe → vram-heap → cortex` stack. It
+    /// enumerates every adapter, profiles each, refuses software/CPU
+    /// fallbacks (silently running on llvmpipe at ~1000× slow is the
+    /// worst failure mode), and picks the best for cortex's
+    /// bandwidth-bound workload (the V100 over a T4 on a heterogeneous
+    /// box — never just adapter 0), then measures what it is actually
+    /// fast at. [`Self::from_selection`] builds everything cortex-specific
+    /// on that warm device. Set `CORTEX_PROBE_NO_MEASURE=1` to skip the
+    /// few-seconds measure pass on ephemeral cold starts.
     pub fn try_new() -> Option<Self> {
-        // wgpu 29: InstanceDescriptor no Default; use new_without_display_handle.
-        // Instance::new takes desc by value.
-        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
-        desc.backends = wgpu::Backends::all();
-        // DIAG: enable Vulkan validation + debug labels so the driver
-        // prints warnings/errors before the device-lost panic. Gated on
-        // CORTEX_WGPU_VALIDATE=1 so it's opt-in (validation has nonzero
-        // overhead and shouldn't ship). Reveal whatever the Vulkan
-        // loader sees before our device-lost mystery: buffer overruns,
-        // memory budget warnings, fence misuse, etc.
-        if std::env::var("CORTEX_WGPU_VALIDATE").as_deref() == Ok("1") {
-            desc.flags = wgpu::InstanceFlags::debugging();
-            eprintln!("[cortex] wgpu validation layers ENABLED via CORTEX_WGPU_VALIDATE=1");
-        }
-        let instance = wgpu::Instance::new(desc);
+        let hint = device_probe::WorkloadHint::BandwidthBound;
+        let sel = if std::env::var("CORTEX_PROBE_NO_MEASURE").as_deref() == Ok("1") {
+            device_probe::select_best(hint)
+        } else {
+            device_probe::select_best_measured(hint)
+        };
+        let sel = match sel {
+            Ok(sel) => sel,
+            Err(e) => {
+                tracing::error!(error = %e, "device-probe found no usable GPU adapter");
+                return None;
+            }
+        };
+        Self::from_selection(sel)
+    }
 
-        // wgpu 29: request_adapter returns Future<Result>, not Future<Option>.
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        })).ok()?;
+    /// Build a `GpuDevice` on a device-probe [`device_probe::Selection`] —
+    /// the warm, already-selected `wgpu::Device`/`Queue` plus its
+    /// `DeviceProfile`. Owns everything cortex-specific: the VRAM budget
+    /// (fed by the profile's authoritative `vram_total_bytes`), the five
+    /// vram-heaps, the compiled pipelines, and the params pool.
+    pub fn from_selection(sel: device_probe::Selection) -> Option<Self> {
+        let device_probe::Selection { profile, device, queue } = sel;
 
-        let info = adapter.get_info();
+        // Log the WHOLE profile at startup (device-probe CLAUDE.md
+        // mandate): the first thing you want when something is
+        // mysteriously slow is what cortex THOUGHT it was running on —
+        // including the measured f16 speedup (a P40 reads ~0.016 here
+        // despite reporting shader-f16 supported).
         tracing::info!(
-            name = %info.name,
-            backend = ?info.backend,
-            device_type = ?info.device_type,
-            "GPU adapter selected"
+            adapter = %profile.adapter_name,
+            backend = ?profile.backend,
+            device_type = ?profile.device_type,
+            vram_total_mb = ?profile.vram_total_bytes.map(|b| b / (1024 * 1024)),
+            max_storage_binding_mb = profile.max_storage_buffer_binding_size / (1024 * 1024),
+            workgroup_storage_bytes = profile.max_compute_workgroup_storage_size,
+            supports_f16 = profile.supports_shader_f16,
+            f16_matmul_speedup = ?profile.f16_matmul_speedup,
+            measured_bandwidth_gbps = ?profile.measured_bandwidth_gbps,
+            "device-probe DeviceProfile",
         );
 
-        // Use the adapter's actual limits instead of wgpu's conservative
-        // defaults. wgpu::Limits::default() caps max_buffer_size at 256 MB,
-        // which is smaller than a 7B model's vocab projection (~600 MB f16).
-        // The 4080 reports 4 GB+; requesting adapter limits keeps resident
-        // weights practical for vocab-sized tensors.
-        let adapter_limits = adapter.limits();
-        // TIMESTAMP_QUERY + TIMESTAMP_QUERY_INSIDE_ENCODERS let us
-        // place encoder-level write_timestamp markers anywhere in the
-        // command stream. Both are widely supported on Vulkan; if the
-        // adapter doesn't expose them, we drop down to no timestamp
-        // tracing (the timestamp_us telemetry just stays zero).
-        let adapter_features = adapter.features();
-        let timestamp_supported = adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY)
-            && adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
-        let mut required_features = wgpu::Features::empty();
-        if timestamp_supported {
-            required_features |= wgpu::Features::TIMESTAMP_QUERY
-                | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
-        }
-        // wgpu 29: request_device takes 1 arg (desc only — trace param moved
-        // INTO DeviceDescriptor as the `trace` field). DeviceDescriptor also
-        // gained `experimental_features`.
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("cortex"),
-                required_features,
-                required_limits: adapter_limits,
-                memory_hints: wgpu::MemoryHints::Performance,
-                experimental_features: wgpu::ExperimentalFeatures::default(),
-                trace: wgpu::Trace::Off,
-            },
-        ))
-        .ok()?;
+        // Timestamp queries: recompute support from the device-probe-
+        // created device's ACTUAL enabled features (not an adapter).
+        // device-probe enables TIMESTAMP_QUERY (and, with the companion
+        // fix, TIMESTAMP_QUERY_INSIDE_ENCODERS) when the adapter supports
+        // them; if INSIDE_ENCODERS isn't enabled this is simply false and
+        // the PASS-bundle timers self-disable (timestamp_us telemetry
+        // stays zero) — no validation error, no breakage.
+        let dev_features = device.features();
+        let timestamp_supported = dev_features.contains(wgpu::Features::TIMESTAMP_QUERY)
+            && dev_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
         if timestamp_supported {
             tracing::info!(
                 period_ns = queue.get_timestamp_period(),
                 "GPU timestamp queries enabled",
             );
         } else {
-            tracing::info!("GPU timestamp queries NOT supported by adapter");
+            tracing::info!("GPU timestamp queries NOT enabled on the device");
         }
 
         let pipelines = Pipelines::compile(&device);
@@ -687,23 +694,25 @@ impl GpuDevice {
             "params buffer pool allocated",
         );
 
-        // Phase M: device VRAM budget. wgpu's safe API won't report
-        // total VRAM, so vram-heap queries it through the Vulkan
-        // backend (ash); on non-Vulkan backends detection returns None
-        // and the 8 GB fallback applies (conservative). All DeviceLocal
-        // heaps reserve against this budget, so over-committing the
-        // card is a loud BudgetExceeded at construction instead of a
-        // driver-level OOM mid-inference.
-        //
-        // CORTEX_VRAM_TOTAL_MB, when set, is an explicit OVERRIDE (not
-        // a detection fallback): the operator's word beats the query.
-        // Use it to leave VRAM for other processes on a shared card, or
-        // to test budget-exceeded behavior.
+        // Phase M device VRAM budget — now SOURCED FROM device-probe.
+        // The profile carries the authoritative device-local VRAM (the
+        // same Vulkan/ash sum vram-heap used; byte-identical per
+        // HANDSHAKE.md §Parity). CORTEX_VRAM_TOTAL_MB still wins as an
+        // explicit operator override (leave VRAM for other processes on a
+        // shared card, or force budget-exceeded behavior); otherwise feed
+        // the profile number into DeviceBudget::explicit. All DeviceLocal
+        // heaps reserve against this budget, so over-committing the card
+        // is a loud BudgetExceeded at construction instead of a
+        // driver-level OOM mid-inference. (vram-heap keeps its own
+        // detect_or as a fallback for non-device-probe callers — this is
+        // the coordinated migration's step 2; do not strand it.)
         let vram_budget = match std::env::var("CORTEX_VRAM_TOTAL_MB")
             .ok().and_then(|s| s.parse::<u64>().ok())
         {
             Some(mb) => ::vram_heap::DeviceBudget::explicit(mb * 1024 * 1024),
-            None => ::vram_heap::DeviceBudget::detect_or(&adapter, 8192 * 1024 * 1024),
+            None => ::vram_heap::DeviceBudget::explicit(
+                profile.vram_budget_or(8192 * 1024 * 1024),
+            ),
         };
         tracing::info!(
             total_mb = vram_budget.total() / (1024 * 1024),
@@ -798,6 +807,7 @@ impl GpuDevice {
         Some(Self {
             device, queue, pipelines, params_pool, vram_budget,
             transient_heap_a, transient_heap_b, transient_heap_c, weights_heap, host_readback_heap,
+            profile,
         })
     }
 
@@ -1004,5 +1014,41 @@ mod tests {
         let hi0 = half::f16::from_bits((packed[0] >> 16) as u16).to_f32();
         assert!((lo0 - 1.0).abs() < 0.01);
         assert!((hi0 - 2.0).abs() < 0.01);
+    }
+
+    // --- device-probe consumption contract (no GPU required) ----------------
+    //
+    // Proves cortex reads the VRAM number device-probe publishes correctly,
+    // against the synthetic profiles, with no hardware present — the
+    // synthetic-profile payoff (device-probe CLAUDE.md "Testability"). These
+    // mirror `from_selection`'s budget seam exactly:
+    //   DeviceBudget::explicit(profile.vram_budget_or(FALLBACK))
+
+    const PROBE_FALLBACK: u64 = 8192 * 1024 * 1024;
+
+    #[test]
+    fn budget_uses_detected_vram_from_profile() {
+        // H100 reports 80 GB → the budget total is the detected number, not
+        // the fallback. This is the whole point of the handshake.
+        let p = device_probe::DeviceProfile::synthetic_h100();
+        let budget = ::vram_heap::DeviceBudget::explicit(p.vram_budget_or(PROBE_FALLBACK));
+        assert_eq!(budget.total(), 80 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn budget_p40_reports_24gb() {
+        let p = device_probe::DeviceProfile::synthetic_p40();
+        assert_eq!(p.vram_budget_or(0), 24 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn budget_falls_back_when_vram_undetectable() {
+        // Non-Vulkan backend → vram_total_bytes is None → fallback applies
+        // (a 0 here would be the dangerous misread the Option exists to stop).
+        let p = device_probe::DeviceProfile {
+            vram_total_bytes: None,
+            ..Default::default()
+        };
+        assert_eq!(p.vram_budget_or(PROBE_FALLBACK), PROBE_FALLBACK);
     }
 }

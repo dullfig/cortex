@@ -9,7 +9,7 @@ categories = ["science", "mathematics"]
 
 [features]
 default = ["gpu"]
-gpu = ["wgpu", "pollster", "bytemuck", "half", "vram-heap"]
+gpu = ["wgpu", "pollster", "bytemuck", "half", "vram-heap", "device-probe"]
 # memory = ["engram"]  # disabled until engram lands on this machine
 
 [dependencies]
@@ -30,6 +30,12 @@ half = { version = "2", optional = true }
 # wgpu-29's allocator pressure ceiling. See C:\src\vram-heap\DESIGN.md
 # for the architectural commitment.
 vram-heap = { path = "../../vram-heap", optional = true }
+# GPU capability DETECTION (leaf of device-probe → vram-heap → cortex).
+# Enumerates adapters, profiles each (queried limits/features + measured
+# f16/bandwidth), selects the best for the workload, and hands cortex the
+# warm wgpu::Device + DeviceProfile (authoritative VRAM, software-fallback
+# refusal). See C:\src\device-probe\CLAUDE.md + HANDSHAKE.md.
+device-probe = { path = "../../device-probe", optional = true }
 # engram lives on the old machine; temporarily disabled until it's copied over or absorbed into cortex per the roadmap.
 # engram = { path = "../../engram", default-features = false, optional = true }
 
