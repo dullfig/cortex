@@ -2,3 +2,5 @@ target/
 .claude/
 *.pdf
 models/
+__pycache__/
+*.pyc
