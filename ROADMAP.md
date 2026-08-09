@@ -1,147 +1,176 @@
 # Cortex Roadmap — Stages
 
-**Date:** 2026-05-18
-**Status:** Living document. Replaces the 2026-04-12 stack-overview roadmap (archived in git history at commit before this one).
+**Date:** 2026-08-09
+**Status:** Living document. Replaces the 2026-05-18 CubeCL-oriented roadmap
+(archived in git history) — the CubeCL migration it planned was **never
+taken**; the engine substrate was rebuilt with `vram-heap` + `device-probe`
+instead (see Stage E). BitNet references are gone (un-merged 2026-05-29 to
+`ternary-rs`).
+
+> **⚠️ PARKED posture (read first).** Per the integration pin
+> `state_of_project_2026-07-24`, **cortex is the next *code* phase, not the
+> next *project* phase.** The engine substrate is done and stable; the
+> project foreground is the mission/corpus track (which needs zero cortex).
+> So **no stage below is actively SHIPPING right now** — this doc is the plan
+> for when cortex resumes as the code critical path, plus the near-term code
+> items that are worth doing whenever a session picks cortex up.
 
 ## How to use this doc
 
-**Stages are sequential capacity tiers.** Each stage exits when its target user-load is sustained at a defined quality bar.
+**Stages are sequential capacity tiers.** Each stage exits when its target
+user-load is sustained at a defined quality bar.
 
-**Concurrent work principle:** while Stage N is SHIPPING (focused human + Claude execution), Stage N+1 is PLANNING (design decisions, sketches), Stage N+2 is RESEARCHING (read-only, can be delegated to a separate Claude session without coordination — different files, different concerns).
+**Concurrent work principle:** while Stage N is SHIPPING, Stage N+1 is
+PLANNING, Stage N+2 is RESEARCHING (read-only, delegable to a separate
+Claude session — different files, different concerns).
 
-The pattern: when Stage N exits, Stage N+1's planning has already converged and shipping starts immediately. No "what do we do now" gap.
-
-See `STATUS.md` for the snapshot of what cortex provides today. See `pinky/cubecl-migration-plan-2026-05-18.md` for Stage 1's detailed file-by-file plan.
+See `STATUS.md` for the snapshot of what cortex provides today. The
+migration/phase history (vram-heap A–K, L chunker, M sizing, N refactor, O
+QJL-V, P retrieve diagnostics, Q deploy, device-probe) lives in the git log
+on `wgpu-29` and the `## Roadmap` checklist in `CLAUDE.md`.
 
 ---
 
-## Stage 0 — Foundation (DONE 2026-05-17/18)
+## Stage E — Engine substrate (DONE 2026-06-13, via vram-heap not CubeCL)
 
-- Phantom-work audit: deleted ~15 unused shaders / pipelines / dispatchers / tests
-- Telemetry MVP: Prometheus `GET /metrics` (request counts, tokens, TTFT histogram)
-- Status board (`STATUS.md`) in cortex-claude / agentos-claude / memex-claude format
-- TTFT cliff diagnosed (wgpu/NVIDIA `vkFreeMemory` accumulated-state cost, not GPU work)
-- Baseline bench harness (`pinky/tools/bench_baseline.py`, `pinky/tools/probe_ttft_stages.sh`)
-- CubeCL spike: reading + technical Go/No-Go, both GREEN. Migration sequenced.
-- M1 scaffold on `cubecl-migration` branch: dep added, feature flag wired, 394/394 tests green
-- **Exit:** CubeCL migration planned + branch live + Go decision committed
+The old roadmap's Stage 0/1 planned to fix cortex's engine problems — chiefly
+the ~17s TTFT cliff — by migrating to CubeCL. That migration was **not
+taken.** The problems were solved a different way, and the engine reached a
+stable, deployable state on 2026-06-13 (device-probe consumption followed
+2026-06-25).
 
-## Stage 1 — Engine (SHIPPING, ~3-5 weeks)
+**What shipped (all on `wgpu-29`):**
+- **vram-heap free-list substrate** (Phases A–I) — RAII + coalescing
+  allocator over pre-allocated heaps; 3-lane scheme for wgpu-29's
+  same-backing R+RW rule; static weights heap; per-cache heaps. **Killed the
+  TTFT cliff** (it was wgpu allocator churn, not GPU work — exactly what
+  CubeCL was going to fix; vram-heap was the answer instead). This is the
+  "mini-OS for GPU memory."
+- **ParamsBufferPool** ring bump + `stats()` (Phase J).
+- **Scaling-stage meters** (Phase K) — concurrent/pool/heap/GPU-busy +
+  VRAM-budget gauges in `/metrics`. These are the Stage 2 trigger (below).
+- **Device-aware heap sizing + binding-clamped chunker** (Phase M).
+- **Source refactor** (Phase N) — `gpu_engine/` module dir; cortex-cloud
+  split into modules.
+- **QJL-256 V-side residual correction** (Phase O) — closed the polar
+  attention-output cosine gap (was a future roadmap item; now done).
+- **Retrieve diagnostics** (Phase P.1–P.3) — per-head sweep, offset-zero
+  probe, by-shard holdout. Verdict: attention-score-readout retrieval is
+  **method-limited** (see Stage M below).
+- **Secure deploy path** (Phase Q) — Docker + Caddy TLS/auth; structurally
+  validated, GPU-in-container unverified on a real Linux box.
+- **device-probe boot integration** — device selection + VRAM budget +
+  measured f16/bandwidth from the `device-probe → vram-heap → cortex` stack.
 
-**Goal:** ~100 concurrent users sustained with competitive single-stream perf on commodity GPU.
+**Still open from the original Stage 1 *perf* goal (competitive single-stream):**
+- **Tensor-core / cooperative-matrix matmul** — the old M6 CUDA target
+  (~40–60 t/s decode). Matmul remains the bottleneck; device-probe now
+  *measures* f16 speedup so the future precision-kernel switch has its input.
+- **C3 packed-perf restoration** — `hidden_buf`/`projected` still f32 from
+  the old BitNet "Option E" revert (no longer load-bearing); restoring
+  packed-f16 recovers ~9% Qwen prefill.
 
-**Work items (in flight on `cubecl-migration` branch):**
-- M2: resolve wgpu 24→29 version collision, wrap `BlockScratch::allocate` via CubeCL `MemoryManagement` → TTFT cliff dies
-- M3: swap `dispatch_attention_inner` for `cubek-attention::launch_ref` → 3 kernels become 1, scores scratch goes away
-- M4: swap float matmul for `cubek-matmul` + custom `MatmulPrecision` impl for (f16 weight, f32 activation)
-- M5: port RMSNorm / RoPE / SiLU / ReLU² / KV-write / bias-add to `#[cube]` macro DSL
-- M6: install CUDA Toolkit + MSVC → flip runtime to `CudaRuntime` → tensor cores (cmma) → decode 21 → 40-60+ t/s
-- M7: port BitNet ternary path (custom — `cubek-quant` has 2-bit but not ternary semantics)
-- M-final: merge `cubecl-migration` → `master`, delete legacy wgpu paths, tag release
+**Exit (met for stability; perf partial):** engine is stable, deployable, no
+TTFT cliff, no panics under normal load. The tensor-core decode win is the
+one unfinished piece of the original perf bar.
 
-**Production hardening (parallel with M2-M7):**
-- Panic recovery: cortex panics on wgpu device-loss today (observed twice on 2026-05-17). Need graceful restart-on-failure, request retry.
-- Concurrency gauge in `/metrics` (closes the 3-of-3 threshold-metric gap from `project_cortex_v1_perf_threshold.md`)
-- `cortex_local::CortexLocal::complete()` over GpuEngine (currently slow CPU `model.generate()` path — direct AgentOS integration win)
+## Stage M — Memory / retrieval (the real next code phase)
 
-**Exit:** 100 concurrent users sustained on a single beefy GPU (24 GB+ VRAM), TTFT <5s for typical prompts, decode ≥40 t/s on CUDA backend, no panics under sustained load.
+Not in the old roadmap, but this is what "cortex resumes" actually means
+next — because the retrieve path's recall is **method-limited, not
+quantization-limited** (f32 control R@10 ≈ 0.10; retrieval-heads do **not**
+generalize on holdout, R@10 = 0.00, Phase P.3). Attention-score readout is a
+dead end for recall.
 
-**Concurrent research-in-parallel for Stage 2** (can be a separate Claude session):
-- Read `vllm/core/scheduler.py` — how do they pick which requests to batch each iteration?
-- Read flash-attention's variable-length API + `cubek-attention`'s strategy enum — can we batch sequences of different lengths in one kernel call?
-- Sketch cortex's request-batching API surface — what does `chat_completions` look like internally when 8 requests share a forward pass?
-- Decide consistent-hashing scheme for multi-instance sharding (Karger? Rendezvous? Jump?)
+**Direction (pins: `project_memex_architecture_direction`,
+`_retrieval_method_bottleneck`, `_retrieval_heads_overfit`):**
+- **Generation-as-index / synopsis-routing** — two-step retrieval (route on
+  synopsis, generate grounded from real chunk text), not attention readout.
+- **Memex foundation experiment** — synopsis/grep step-1 bake-off on the
+  52-query holdout + no-answer adversarial queries; validate generation-as-
+  index on Qwen-2.5-3B-Instruct before building machinery.
+- **DEFECT to fix here:** large one-shot `cache/load` (~6K tokens) panics on
+  wgpu's 65535 workgroup-dim limit (memex report, STATUS §4). Chunk the
+  prefill dispatch + structured error + verify heap-free-on-failure.
+- Move retrieval (bidirectional attention) + HierarchicalCache +
+  consolidation from engram; `project_qk()` on TransformerModel.
 
-## Stage 2 — Batched serving (PLANNING, ~4-6 weeks after Stage 1)
+## Stage 2 — Batched serving (PLANNING; start when Phase-K meters say so)
 
-**Goal:** ~1000 concurrent users via continuous batching + multi-instance sharding.
-
-**Work items:**
-- Continuous batching scheduler in cortex-cloud — pack N requests into one forward pass, each at their own position in their own KV cache
-- Variable-length attention via `cubek-attention` (or custom variant if cubek doesn't expose it)
-- Multi-instance: cortex-cloud runs as a fleet of N processes, user_id consistent-hashed to one instance
-- Load balancer in front (could be nginx, could be a tiny Rust router — TBD during Stage 2 planning)
-- Auth + per-user rate limiting (was a `[?]` in STATUS.md)
-- Multi-tenant isolation: per-tenant cache pool keys, per-tenant rate limits
-
-**Exit:** 1000 concurrent users sustained across 2-4 cortex-cloud instances, p99 TTFT <10s, p95 decode rate >30 t/s.
-
-**Concurrent research-in-parallel for Stage 3:**
-- Tiered cache designs — Redis LFU eviction, PostgreSQL buffer pool clock-sweep
-- Reawaken latency budget — what's an acceptable UX for a returning user? 1s? 5s? Affects tier promotion/demotion policy
-- Cache placement strategies — replication vs sharding vs hierarchical
-- Read PagedAttention paper for what NOT to do (cortex's persistent-cache + reawaken is the alternative)
-
-## Stage 3 — Cortex + AgentOS cache coordination (RESEARCHING, ~3-5 weeks after Stage 2)
-
-**Reframed 2026-05-19** from "cortex internal tiering" to "cortex + AgentOS coordination." Daniel observed that AgentOS already has the semantic knowledge (which Bob, which user, what's likely next) that cortex doesn't have. Letting cortex invent its own LRU heuristics + disk store is reinventing what AgentOS already does well. The cleaner separation:
-
-- **Cortex** = hot VRAM cache + eviction policy + notification hooks (the *mechanism*)
-- **AgentOS** = cold-tier owner + prefetch policy + working-set knowledge (the *policy*)
-
-This makes cortex *smaller* than the original Stage 3 plan, not bigger.
-
-**Goal:** ~5000 concurrent users via cortex/AgentOS protocol. Cortex stays hot-only with a sane default LRU; AgentOS owns warm and cold tiers (system RAM + memex/byte-store + disk).
-
-**Cortex-side work items (small):**
-- Configurable per-instance cache size budget (cap VRAM by total bytes or shard count)
-- Default LRU eviction policy when budget exceeded
-- **Eviction notification hook**: when cortex self-evicts shard X, notify AgentOS so its shadow doesn't drift (webhook or SSE channel — TBD)
-- Bulk inspect endpoint: `GET /v1/cache/` already lists; may add timing/access metadata
-- Tests for eviction-under-pressure + notification delivery
-
-**AgentOS-side work items** (lives in agentos repo, not cortex):
-- Cortex cache shadow — AgentOS tracks which shards cortex currently holds
-- Eviction policy — when to evict from cortex (idle Bob, day boundary, etc.)
-- Prefetch heuristics — warm a shard *before* it's needed based on Bob's planned action
-- Token persistence per shard (probably already exists via memex/agentos-byte-store)
-
-**Exit:** 5000 concurrent across the fleet. AgentOS handles cache-miss reawaken in <5s p95 (push tokens to cortex via `cache_load`, cortex prefills, ready for chat_completions). Cortex never OOMs — eviction kicks in before VRAM exhausted.
-
-**Why this is cleaner than internal tiering:**
-- Cortex doesn't need a disk-tier subsystem (AgentOS already persists tokens)
-- Cortex doesn't need a warm-RAM tier subsystem (AgentOS can re-feed quickly enough)
-- AgentOS's semantic knowledge beats cortex's blind LRU
-- The protocol becomes a stable contract both projects can iterate against
-- vLLM does this internally because it serves anonymous users and has no upper-layer with intent knowledge; AgentOS has that knowledge, so we exploit it
-
-**Concurrent research-in-parallel for Stage 4:**
-- Fleet ops patterns (Kubernetes vs Nomad vs systemd, blue/green deploy strategies)
-- Backup/restore for the persistent cache pool (or: skip — AgentOS persists tokens; cortex cache is purely an acceleration layer that can be rebuilt)
-- Multi-region replication patterns
-- Cortex-AgentOS protocol spec (would have to be designed in Stage 3 anyway; refining for cross-region is a Stage 4 task)
-
-## Stage 4 — Production fleet (PARKED until Stage 3, ongoing thereafter)
-
-**Goal:** RingHub-scale operations (20k members → 1-3k concurrent at peak).
+**Goal:** ~1000 concurrent users via continuous batching + multi-instance
+sharding. **Trigger:** watch the Phase-K gauges (`cortex_concurrent_requests`,
+GPU-busy %) — start when load approaches the single-instance ceiling, not
+before.
 
 **Work items:**
-- Multi-region deployment
-- Zero-downtime config reload, blue/green deploys
-- Backup/restore for cache pool (currently in-memory only; restart loses everything)
-- On-call playbook, alerting hooks beyond `/metrics`
-- Capacity planning automation
-- Cost monitoring (per-tenant compute attribution)
+- Continuous-batching scheduler in cortex-cloud — pack N requests into one
+  forward pass, each at its own position in its own KV cache.
+- Variable-length attention (custom batch variant of the existing shaders).
+- Multi-instance: fleet of N processes, user_id consistent-hashed to one.
+- Load balancer in front (nginx or a tiny Rust router — TBD).
+- Auth + per-user rate limiting; multi-tenant isolation (per-tenant cache
+  keys + limits).
 
-**Exit:** Cortex runs as a real production service, not a research engine.
+**Exit:** 1000 concurrent sustained across 2–4 instances, p99 TTFT <10s, p95
+decode >30 t/s.
 
-## Stage 5+ — Exploratory (LOW-PRIORITY PARALLEL, anytime)
+## Stage 3 — Cortex + AgentOS cache coordination (RESEARCHING)
 
-These are real possibilities, not roadmap commitments. Pick up when there's slack or when a use case forces the issue.
+Cortex stays hot-VRAM-only with a sane default LRU; AgentOS owns warm/cold
+tiers + prefetch policy (it has the semantic knowledge cortex doesn't).
+Cortex = *mechanism*; AgentOS = *policy*. Makes cortex *smaller*, not bigger.
 
-- **BitNet + FPGA pipeline** — the Zynqberry play. Pipeline-parallel BitNet across one-FPGA-per-layer. Genuinely elegant algorithm-hardware fit; multi-quarter hardware project. Cortex's BitNet kernels already exist (shipped 2026-05-10); missing piece is FPGA toolchain. Likely 6-12 months dedicated work IF it becomes a priority.
-- **Tensor parallelism** — split a single model across N GPUs. Only needed if cortex grows toward 70B+ models on consumer hardware. ~6-8 weeks when needed.
-- **Polar/QJL on V dequant** (currently K-only) — closes the cosine-similarity gap on retrieval attention. Was a `[ ]` in STATUS.md. Small work, ~1 week.
-- **Flash-attention variants for polar cache path** — cubek-attention may not natively handle the compressed-K shape. If retrieval path needs more perf, custom kernel.
-- **Bit-packed 3-bit angle representation** for PolarQuant — u8 → 3-bits, ~12× compression vs current ~7.5×. Listed in STATUS.md as `[ ]`.
+**Cortex-side (small):**
+- Configurable per-instance cache budget; default LRU eviction on overflow.
+- **Eviction notification hook** so AgentOS's shadow doesn't drift.
+- Bulk inspect endpoint with access/timing metadata; eviction-under-pressure
+  tests.
+
+**Exit:** ~5000 concurrent across the fleet; AgentOS reawaken (`cache_load`
+→ prefill) <5s p95; cortex never OOMs (eviction before VRAM exhaustion).
+
+## Stage 4 — Production fleet (PARKED until Stage 3)
+
+**Goal:** RingHub-scale (20k members → 1–3k concurrent peak).
+Multi-region deploy; zero-downtime config reload / blue-green; cache-pool
+backup/restore; on-call playbook + alerting beyond `/metrics`; capacity
+planning; per-tenant cost attribution.
+
+**Exit:** cortex runs as a real production service, not a research engine.
+
+## Stage 5+ — Exploratory (low-priority, anytime)
+
+Real possibilities, not commitments — pick up on slack or when a use case
+forces it.
+
+- **RetrievalAttention / ANN-over-KV** (arXiv 2409.10516) — validate on
+  integration's stack first; 4-phase roadmap to a swappable
+  `AttentionBackend` (CPU index + GPU compute). Pin:
+  `project_retrieval_attention_modularization`.
+- **Device-probe-driven pipeline specialization** — tile/workgroup sizes as
+  wgpu pipeline-overridable constants from the `DeviceProfile` (a
+  37-pipeline `const`→`override` refactor); and a native-f16-arith matmul
+  variant gated on measured f16 speedup (cortex is f16-storage/f32-compute
+  today, so this is the tensor-core win from Stage E).
+- **Bit-packed 3-bit angle representation** for PolarQuant — ~12× vs ~7.5×.
+- **Tensor parallelism** — split one model across N GPUs; only if cortex
+  grows toward 70B+ on consumer hardware.
+- **Ternary / BitNet + FPGA** — moved out with the 2026-05-29 un-merge; lives
+  in `ternary-rs` now. The Zynqberry play is that repo's concern, not cortex's.
 
 ---
 
 ## What this roadmap deliberately does NOT include
 
-- **High-throughput public serving** (vLLM-style, millions of users, thousands of concurrent). Different design point. Cortex is optimized for stateful conversations with curated context — Bob/Librarian shape. If RingHub explodes to a public service, the architecture stays the same up through Stage 4 and we lean on horizontal scaling. We don't try to match vLLM's continuous-batching+PagedAttention combo because our shim/cache primitives don't fit that abstraction.
-- **PagedAttention** — wrong cost/benefit for our access pattern.
-- **Training** — cortex is inference-only. Training-related shim work (e.g., training a "should-I-reply" classifier) happens outside cortex.
+- **High-throughput anonymous public serving** (vLLM-style). Different design
+  point. Cortex is optimized for stateful conversations with curated context
+  (Bob/Librarian shape); we scale horizontally through Stage 4 rather than
+  match continuous-batching+PagedAttention, which our shim/cache primitives
+  don't fit.
+- **PagedAttention** — wrong cost/benefit for our persistent-cache + reawaken
+  access pattern.
+- **Training** — cortex is inference-only. Training-adjacent shim work (e.g.
+  a "should-I-reply" classifier) happens outside cortex.
 
 ---
 
@@ -149,8 +178,10 @@ These are real possibilities, not roadmap commitments. Pick up when there's slac
 
 > "I'm picking up cortex work for a session. Where do I start?"
 
-1. Read `STATUS.md` for what cortex provides today.
-2. Find which Stage is currently SHIPPING in this doc.
-3. Open the linked plan doc (e.g. `pinky/cubecl-migration-plan-2026-05-18.md` for Stage 1) for file-by-file detail.
-4. If the user wants help on the SHIPPING stage → focus implementation work.
-5. If the user wants to free your time for parallel research → pick a "research-in-parallel" bullet from the next stage and produce a structured report.
+1. Read `STATUS.md` for what cortex provides today (and the parked posture).
+2. The engine substrate (Stage E) is done; the live next-code-phase is
+   **Stage M** (memory/retrieval) — that's where net-new cortex work goes.
+3. Stages 2–4 are load-gated: don't start Stage 2 until the Phase-K meters
+   say the single-instance ceiling is near.
+4. For a parallel research session, pick a Stage 5+ item (e.g.
+   RetrievalAttention on integration's stack) and produce a structured report.
