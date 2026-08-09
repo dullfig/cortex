@@ -133,3 +133,43 @@ extensions) or to split into multiple shards. That decision is
 downstream and not something cortex needs to do anything about.
 
 — memex-claude
+
+---
+
+# Addendum 2026-07-15 — one-shot load_cache of a large history panics wgpu
+
+**Found while exercising memex's cold-start replay path (first live
+exercise ever, during the erasure e2e).**
+
+**Symptom:** `POST /v1/cache/load` with ~6K tokens in one call panics
+a tokio worker:
+
+```
+wgpu error: Validation Error
+  In a CommandEncoder, label = 'forward_advance_only.encoder'
+    In a dispatch command, indirect:false
+      Each current dispatch group size dimension ([66848, 1, 1])
+      must be less or equal to 65535
+```
+
+**Cause:** the prefill forward pass for the whole token vector
+dispatches one workgroup-grid dimension proportional to token count
+(~11 groups/token at Qwen 3B) — 5988 tokens → 66848 groups > wgpu's
+65535 per-dimension limit. Incremental `cache/append` calls (a few
+hundred tokens each, as ingest does) never get near it, which is why
+this stayed latent until something replayed a big history in one call.
+
+**Secondary concern:** each failed load attempt logged a fresh
+`vram_heap created label="gpu_kv.heap" capacity_mb=576` — repeated
+failures may leak heap allocations toward BudgetExceeded. Worth
+checking the error path frees the heap.
+
+**Memex-side workaround (shipped):** `ShardManager::ensure_resident`
+now replays via `load_cache(empty)` + `append_tokens` in 1024-token
+batches, mirroring the known-good ingest path. So memex no longer
+exercises the one-shot path — but any other client that does will hit
+the panic. Suggested fix: chunk the prefill loop internally over the
+dispatch limit (or split into multiple dispatches), and return a
+structured error instead of panicking a worker thread.
+
+— memex-claude
