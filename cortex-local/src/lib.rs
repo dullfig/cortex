@@ -241,45 +241,56 @@ impl CortexLocal {
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
     ) -> Vec<u32> {
-        let mut prompt = String::new();
+        // Review #2 (mirrors cortex-cloud): scaffolding is encoded with
+        // special-token parsing; every client-supplied string is encoded
+        // LITERALLY so a message cannot forge a control token. Segment
+        // boundaries match what the special-token scanner produced from
+        // the old single string, so benign input tokenizes identically.
+        let tk = &self.tokenizer;
+        let mut tokens: Vec<u32> = tk.encode("", tk.add_bos_default());
+        let special = |t: &mut Vec<u32>, s: &str| t.extend(tk.encode(s, false));
+        let literal = |t: &mut Vec<u32>, s: &str| t.extend(tk.encode_literal(s));
 
         for msg in messages {
-            prompt.push_str("<|im_start|>");
-            prompt.push_str(&msg.role);
-            prompt.push('\n');
-
+            special(&mut tokens, "<|im_start|>");
+            let mut body = String::with_capacity(
+                msg.role.len() + 1 + msg.content.as_deref().map_or(0, str::len),
+            );
+            body.push_str(&msg.role);
+            body.push('\n');
             if let Some(ref content) = msg.content {
-                prompt.push_str(content);
+                body.push_str(content);
             }
-
             if msg.role == "tool" {
                 if let Some(ref id) = msg.tool_call_id {
-                    prompt.push_str(&format!("\n[tool_call_id: {id}]"));
+                    body.push_str(&format!("\n[tool_call_id: {id}]"));
                 }
             }
-
-            prompt.push_str("<|im_end|>\n");
+            literal(&mut tokens, &body);
+            special(&mut tokens, "<|im_end|>\n");
         }
 
         if let Some(tools) = tools {
             if !tools.is_empty() {
-                prompt.push_str("<|im_start|>system\n");
-                prompt.push_str("You have access to the following tools. To call a tool, respond with a JSON object in this exact format:\n");
-                prompt.push_str("{\"tool_call\": {\"name\": \"<function_name>\", \"arguments\": {<args>}}}\n\n");
-                prompt.push_str("Available tools:\n");
+                special(&mut tokens, "<|im_start|>");
+                let mut body = String::from("system\n");
+                body.push_str("You have access to the following tools. To call a tool, respond with a JSON object in this exact format:\n");
+                body.push_str("{\"tool_call\": {\"name\": \"<function_name>\", \"arguments\": {<args>}}}\n\n");
+                body.push_str("Available tools:\n");
                 for tool in tools {
                     if let Ok(json) = serde_json::to_string_pretty(&tool.function) {
-                        prompt.push_str(&json);
-                        prompt.push('\n');
+                        body.push_str(&json);
+                        body.push('\n');
                     }
                 }
-                prompt.push_str("<|im_end|>\n");
+                literal(&mut tokens, &body);
+                special(&mut tokens, "<|im_end|>\n");
             }
         }
 
-        prompt.push_str("<|im_start|>assistant\n");
+        special(&mut tokens, "<|im_start|>assistant\n");
 
-        self.tokenizer.encode(&prompt, self.tokenizer.add_bos_default())
+        tokens
     }
 
     fn build_response_message(

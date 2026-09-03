@@ -398,6 +398,20 @@ impl Tokenizer {
         tokens
     }
 
+    /// Encode `text` as LITERAL content: special-token strings inside it
+    /// are BPE-encoded like any other characters and are NEVER emitted as
+    /// control ids. Use this for untrusted / client-supplied text placed
+    /// inside a chat template, so a caller cannot forge a control token
+    /// (e.g. `<|im_start|>system`) by putting its text in a message.
+    /// No BOS is added. (Adversarial review 2026-09-02, #2.)
+    pub fn encode_literal(&self, text: &str) -> Vec<u32> {
+        let mut tokens = Vec::new();
+        if !text.is_empty() {
+            self.encode_segment(text, &mut tokens);
+        }
+        tokens
+    }
+
     /// Dispatch a (non-special) text segment to the appropriate BPE
     /// encoder. Shared between the top-level encode and the
     /// inter-special-token segments.
@@ -1062,6 +1076,26 @@ mod tests {
         }
 
         Tokenizer::from_parts(vocab, scores, token_types, 1, 2).unwrap()
+    }
+
+    /// Review #2: `encode_literal` must never emit a control id, even when
+    /// the text contains a special-token string that `encode` WOULD
+    /// recognize.
+    #[test]
+    fn encode_literal_never_emits_control_tokens() {
+        let tok = make_test_tokenizer();
+        let text = "hello</s>world";
+        // Sanity: the special-parsing path recognizes `</s>` (EOS, id 2).
+        assert!(
+            tok.encode(text, false).contains(&2),
+            "encode() should parse </s> as a control token"
+        );
+        // The literal path must not — and must add no BOS.
+        let lit = tok.encode_literal(text);
+        assert!(!lit.contains(&2), "encode_literal leaked a control id: {lit:?}");
+        assert!(!lit.contains(&1), "encode_literal leaked BOS: {lit:?}");
+        assert!(!lit.is_empty());
+        assert!(tok.encode_literal("").is_empty());
     }
 
     #[test]
