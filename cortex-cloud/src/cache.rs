@@ -148,7 +148,25 @@ pub(crate) async fn cache_load(
         ));
     }
 
-    let mut cache = state.engine.create_gpu_kv_cache(state.max_seq_len);
+    // Review #11: token ids must be < vocab, or the engine asserts inside
+    // block_in_place AFTER a full-size cache was reserved.
+    crate::chat::check_token_ids(&req.tokens, state.engine.vocab_size())?;
+
+    // Review #6: soft pool cap — cheap early reject before the expensive
+    // allocation + prefill. Replacing an existing id is always allowed.
+    // (The authoritative, race-safe check is under the insert lock below.)
+    {
+        let pool = state.cache_pool.lock().await;
+        if pool.len() >= state.max_cache_shards && !pool.contains_key(&req.cache_id) {
+            return Err(crate::chat::cache_pool_full_err(pool.len(), state.max_cache_shards));
+        }
+    }
+
+    // Review #6: a refused VRAM budget is a 503, not a panic.
+    let mut cache = state
+        .engine
+        .try_create_gpu_kv_cache(state.max_seq_len)
+        .map_err(crate::chat::vram_exhausted_err)?;
 
     // Prepend sink tokens (BOS repeated) to absorb position-0 attention
     // sink artifact. Real content starts at position SINK_TOKENS.
@@ -230,6 +248,13 @@ pub(crate) async fn cache_load(
     let now = Instant::now();
 
     let mut pool = state.cache_pool.lock().await;
+    // Review #6: authoritative pool-cap check under the lock (race-safe).
+    // If the pool filled while we were prefilling, drop what we built.
+    if pool.len() >= state.max_cache_shards && !pool.contains_key(&req.cache_id) {
+        let n = pool.len();
+        drop(pool);
+        return Err(crate::chat::cache_pool_full_err(n, state.max_cache_shards));
+    }
     // If overwriting an existing shard, bump from its current version so the
     // composition cache's staleness check sees the change. New shards start
     // at version 0; any subsequent insert / append bumps it monotonically.
@@ -281,6 +306,9 @@ pub(crate) async fn cache_append(
     Json(req): Json<CacheAppendRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let mut _telemetry = metrics::RequestTimer::new(state.metrics.clone(), metrics::Endpoint::CacheAppend);
+
+    // Review #11: reject out-of-range token ids before any GPU work.
+    crate::chat::check_token_ids(&req.tokens, state.engine.vocab_size())?;
 
     // Verify the cache exists before kicking off any GPU work. Snapshot
     // metadata (current seq_len for chunk sizing, max_seq_len for the

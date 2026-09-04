@@ -52,7 +52,9 @@ pub struct GpuKvCache {
 }
 
 impl GpuKvCache {
-    /// Allocate cache buffers for a model with the given shape.
+    /// Allocate cache buffers for a model with the given shape. Panics if
+    /// the VRAM budget refuses the allocation; see [`Self::try_new`] for the
+    /// fallible form cortex-cloud uses to answer 503 instead.
     pub fn new(
         gpu: Arc<GpuDevice>,
         n_layers: usize,
@@ -60,6 +62,21 @@ impl GpuKvCache {
         head_dim: usize,
         max_seq_len: usize,
     ) -> Self {
+        Self::try_new(gpu, n_layers, n_kv_heads, head_dim, max_seq_len)
+            .expect("gpu_kv_cache heap construction failed")
+    }
+
+    /// Fallible allocation (adversarial review 2026-09-02, #6): a
+    /// `BudgetExceeded` / `OutOfMemory` from vram-heap is returned instead
+    /// of panicking, so a request-level caller can answer 503 and the
+    /// process keeps serving.
+    pub fn try_new(
+        gpu: Arc<GpuDevice>,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> Result<Self, ::vram_heap::Error> {
         assert!(n_layers > 0 && n_kv_heads > 0 && head_dim > 0 && max_seq_len > 0);
         let kv_dim = n_kv_heads * head_dim;
         // Phase A: pack 2 f16 per u32 → 2 bytes per element instead of 4.
@@ -87,20 +104,20 @@ impl GpuKvCache {
             ::vram_heap::MemoryTier::DeviceLocal,
             heap_size,
             "gpu_kv.heap",
-        ).expect("gpu_kv_cache heap construction failed");
+        )?;
 
         let mut k_buffers = Vec::with_capacity(n_layers);
         let mut v_buffers = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
             k_buffers.push(kv_heap.allocate(
                 bytes_per_buffer, align, &format!("gpu_kv_cache.k.layer{i}"),
-            ).expect("gpu_kv_cache heap capacity for K"));
+            )?);
             v_buffers.push(kv_heap.allocate(
                 bytes_per_buffer, align, &format!("gpu_kv_cache.v.layer{i}"),
-            ).expect("gpu_kv_cache heap capacity for V"));
+            )?);
         }
 
-        Self {
+        Ok(Self {
             gpu,
             kv_heap,
             k_buffers,
@@ -110,7 +127,7 @@ impl GpuKvCache {
             head_dim,
             max_seq_len,
             len: 0,
-        }
+        })
     }
 
     /// Borrow the K buffer for a specific layer.

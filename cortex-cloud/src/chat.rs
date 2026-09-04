@@ -122,6 +122,149 @@ pub(crate) fn clamp_max_tokens(
     Ok(requested.min(room - prompt_len))
 }
 
+// ---------------------------------------------------------------------------
+// HTTP-boundary validation helpers (adversarial review 2026-09-02, root
+// cause #1: request data must never reach an assert/expect). Pure where
+// possible so they are unit-testable without a GPU; shared with cache.rs /
+// main.rs / shims.rs via `crate::chat::`.
+// ---------------------------------------------------------------------------
+
+/// Review #3: floor for a non-greedy temperature. Below this, sampling is
+/// indistinguishable from argmax; above it `logit / temperature` cannot
+/// overflow f32 (30 / 0.01 = 3000).
+pub(crate) const MIN_TEMPERATURE: f32 = 1e-2;
+
+/// Review #3: validate a client-supplied temperature. `Err` = reject (400);
+/// `Ok(None)` = greedy; `Ok(Some(t))` = sample at the floored `t`.
+pub(crate) fn sanitize_temperature(t: f32) -> Result<Option<f32>, ()> {
+    if !t.is_finite() || t < 0.0 {
+        return Err(());
+    }
+    if t <= 0.0 {
+        return Ok(None);
+    }
+    Ok(Some(t.max(MIN_TEMPERATURE)))
+}
+
+/// Build the request's `SamplerConfig`, or the 400 for a bad temperature.
+pub(crate) fn sampler_config_for(
+    temperature: f32,
+) -> Result<SamplerConfig, (StatusCode, Json<serde_json::Value>)> {
+    match sanitize_temperature(temperature) {
+        Err(()) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "invalid_temperature",
+                    "message": "temperature must be a finite number >= 0",
+                    "temperature": temperature.to_string(),
+                }
+            })),
+        )),
+        Ok(None) => Ok(SamplerConfig::greedy()),
+        Ok(Some(t)) => Ok(SamplerConfig {
+            temperature: t,
+            top_k: 40,
+            top_p: 0.95,
+            ..Default::default()
+        }),
+    }
+}
+
+/// Review #5: a prompt that cannot fit the context window at all is a 400,
+/// not an `assert!("cache overflow")` inside the prefill.
+pub(crate) fn check_prompt_len(
+    n: usize,
+    max_seq_len: usize,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if n > max_seq_len {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "context_length_exceeded",
+                    "message": format!(
+                        "prompt is {n} tokens; the context window is {max_seq_len} (--max-seq-len)"
+                    ),
+                    "prompt_tokens": n,
+                    "max_seq_len": max_seq_len,
+                }
+            })),
+        ));
+    }
+    Ok(())
+}
+
+/// Review #11: every client-supplied token id must be < vocab, or the
+/// engine asserts (a panic inside block_in_place, after a full-size cache
+/// was reserved).
+pub(crate) fn check_token_ids(
+    tokens: &[u32],
+    vocab_size: usize,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if let Some((i, &t)) = tokens
+        .iter()
+        .enumerate()
+        .find(|(_, &t)| t as usize >= vocab_size)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "invalid_token_id",
+                    "message": format!(
+                        "token id {t} at index {i} is out of range (vocab_size {vocab_size})"
+                    ),
+                    "index": i,
+                    "token": t,
+                    "vocab_size": vocab_size,
+                }
+            })),
+        ));
+    }
+    Ok(())
+}
+
+/// Review #6: a KV-cache allocation the VRAM budget refuses is a 503, not
+/// a panic (which, in streaming, was swallowed as a bare `[DONE]`).
+pub(crate) fn vram_exhausted_err(
+    e: impl std::fmt::Display,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": {
+                "type": "vram_exhausted",
+                "message": format!(
+                    "could not allocate a KV cache: {e}. Free shards (DELETE /v1/cache/{{id}}) \
+                     or lower --max-cache-shards / --max-seq-len."
+                ),
+            }
+        })),
+    )
+}
+
+/// Review #6: the resident-shard cap (--max-cache-shards) is full.
+pub(crate) fn cache_pool_full_err(
+    pool_len: usize,
+    cap: usize,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INSUFFICIENT_STORAGE,
+        Json(serde_json::json!({
+            "error": {
+                "type": "cache_pool_full",
+                "message": format!(
+                    "cache pool holds {pool_len} shards (cap {cap}, --max-cache-shards); \
+                     DELETE a shard or replace an existing id"
+                ),
+                "pool_size": pool_len,
+                "max_cache_shards": cap,
+            }
+        })),
+    )
+}
+
 /// Try to parse tool calls from generated text.
 ///
 /// Looks for `{"tool_call": {"name": "...", "arguments": {...}}}` patterns.
@@ -189,21 +332,36 @@ pub(crate) fn generate_with_cache(
     let mut sampler = Sampler::new(sampler_config.clone(), seed);
     let greedy_gpu = lm_head_greedy_eligible(&sampler_config);
 
+    // Review #5: chunked prompt prefill. Advance the cache over all but
+    // the last prompt token through the chunker (no readback; bounded by
+    // the lane + dispatch limits), then run the ordinary 1-token prefill
+    // on the last token to get its logits. wgpu executes in submission
+    // order, so the 1-token forward observes the advanced K/V — the same
+    // guarantee cache_load -> chat already relies on.
+    let n = prompt_tokens.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if n > 1 {
+        forward_chunked_into_cache(engine, &prompt_tokens[..n - 1], cache, |_, _, _, _| {});
+    }
+    let last = &prompt_tokens[n - 1..];
+
     let mut next_token = if greedy_gpu {
         if let Some(tok) = engine.forward_full_gpu_with_cache_inject_argmax_greedy(
-            prompt_tokens, cache, &[],
+            last, cache, &[],
         ) {
             tok
         } else {
-            let prefill_logits = engine.forward_full_gpu_with_cache(prompt_tokens, cache);
+            let prefill_logits = engine.forward_full_gpu_with_cache(last, cache);
             let vocab = engine.vocab_size();
-            let last_logits_start = (prompt_tokens.len() - 1) * vocab;
+            let last_logits_start = (last.len() - 1) * vocab;
             sampler.sample(&prefill_logits[last_logits_start..last_logits_start + vocab])
         }
     } else {
-        let prefill_logits = engine.forward_full_gpu_with_cache(prompt_tokens, cache);
+        let prefill_logits = engine.forward_full_gpu_with_cache(last, cache);
         let vocab = engine.vocab_size();
-        let last_logits_start = (prompt_tokens.len() - 1) * vocab;
+        let last_logits_start = (last.len() - 1) * vocab;
         sampler.sample(&prefill_logits[last_logits_start..last_logits_start + vocab])
     };
 
@@ -318,8 +476,10 @@ pub(crate) fn generate_stateless_gpu(
     max_seq_len: usize,
     steers: &[Arc<RegisteredShim>],
     inject_deltas: &[Option<wgpu::Buffer>],
-) -> Vec<u32> {
-    let mut cache = engine.create_gpu_kv_cache(max_seq_len);
+) -> Result<Vec<u32>, ::cortex::vram_heap::Error> {
+    // Review #6: a refused VRAM budget is returned, not panicked, so the
+    // handler can answer 503.
+    let mut cache = engine.try_create_gpu_kv_cache(max_seq_len)?;
     let mut sampler = Sampler::new(sampler_config.clone(), seed);
     let embed_dim = engine.embed_dim();
     let has_steers = !steers.is_empty();
@@ -371,7 +531,7 @@ pub(crate) fn generate_stateless_gpu(
 
     let mut out: Vec<u32> = Vec::new();
     if next_token == eos {
-        return out;
+        return Ok(out);
     }
     out.push(next_token);
 
@@ -408,7 +568,7 @@ pub(crate) fn generate_stateless_gpu(
         }
         out.push(next_token);
     }
-    out
+    Ok(out)
 }
 
 pub(crate) async fn chat_completions(
@@ -426,6 +586,9 @@ pub(crate) async fn chat_completions(
         req.tools.as_deref(),
         &state.tokenizer,
     );
+    // Review #5: one check here covers stateless, streaming (dispatched
+    // below with these tokens), gate/inject and the cached paths.
+    check_prompt_len(prompt_tokens.len(), state.max_seq_len)?;
     state.metrics.record_tokens(prompt_tokens.len() as u64, 0);
 
     // Gate-phase dispatch (#6a). Per `project_cortex_v1_shim_api.md`, the
@@ -680,16 +843,9 @@ pub(crate) async fn chat_completions(
 
     let prompt_len = prompt_tokens.len() as u32;
 
-    let sampler_config = if req.temperature <= 0.0 {
-        SamplerConfig::greedy()
-    } else {
-        SamplerConfig {
-            temperature: req.temperature,
-            top_k: 40,
-            top_p: 0.95,
-            ..Default::default()
-        }
-    };
+    // Review #3: reject NaN/inf/negative (400) and floor tiny values so
+    // `logit / temperature` can never overflow into a NaN sampler panic.
+    let sampler_config = sampler_config_for(req.temperature)?;
 
     let eos = state.tokenizer.eos_token_id();
     let seed = rand_seed();
@@ -887,6 +1043,26 @@ pub(crate) async fn chat_completions(
                 .map(|(s, v, _)| (s.clone(), *v))
                 .collect();
             let total_tokens_len: usize = snapshot.iter().map(|(_, _, t)| t.len()).sum();
+            // Review #5: a composition that cannot fit the window (shard
+            // tokens + this request's prompt) is a 400, not an assert
+            // inside the prefill.
+            if total_tokens_len + prompt_tokens.len() > state.max_seq_len {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": {
+                            "type": "context_length_exceeded",
+                            "message": format!(
+                                "composing {} shards ({} tokens) plus a {}-token prompt exceeds the {} context window",
+                                snapshot.len(), total_tokens_len, prompt_tokens.len(), state.max_seq_len,
+                            ),
+                            "shard_tokens": total_tokens_len,
+                            "prompt_tokens": prompt_tokens.len(),
+                            "max_seq_len": state.max_seq_len,
+                        }
+                    })),
+                ));
+            }
 
             let mut composition = state.composition.lock().await;
             let reused = composition.as_ref().map(|e| e.key == key).unwrap_or(false);
@@ -900,15 +1076,19 @@ pub(crate) async fn chat_completions(
                         c.clear();
                         c
                     }
-                    _ => state.engine.create_gpu_kv_cache(state.max_seq_len),
+                    _ => state
+                        .engine
+                        .try_create_gpu_kv_cache(state.max_seq_len)
+                        .map_err(vram_exhausted_err)?,
                 };
                 let all_tokens: Vec<u32> = snapshot.iter()
                     .flat_map(|(_, _, t)| t.iter().copied())
                     .collect();
                 tokio::task::block_in_place(|| {
-                    if !all_tokens.is_empty() {
-                        let _ = state.engine.forward_full_gpu_with_cache(&all_tokens, &mut cache_buf);
-                    }
+                    // Review #5: chunked prefill (the logits were discarded
+                    // anyway) — bounded by the lane/dispatch limits, and no
+                    // wasted finalize_logits over every shard token.
+                    forward_chunked_into_cache(&state.engine, &all_tokens, &mut cache_buf, |_, _, _, _| {});
                 });
                 *composition = Some(ComposedEntry {
                     key,
@@ -1314,11 +1494,32 @@ pub(crate) async fn chat_completions(
                 all_tokens.extend_from_slice(&entry.tokens);
             }
 
-            let mut composed_cache = state.engine.create_gpu_kv_cache(state.max_seq_len);
+            // Review #5: shard tokens + prompt must fit the window (400, not
+            // an assert), and the composition prefill is chunked.
+            if all_tokens.len() + prompt_tokens.len() > state.max_seq_len {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": {
+                            "type": "context_length_exceeded",
+                            "message": format!(
+                                "composing {} shards ({} tokens) plus a {}-token prompt exceeds the {} context window",
+                                shards.len(), all_tokens.len(), prompt_tokens.len(), state.max_seq_len,
+                            ),
+                            "shard_tokens": all_tokens.len(),
+                            "prompt_tokens": prompt_tokens.len(),
+                            "max_seq_len": state.max_seq_len,
+                        }
+                    })),
+                ));
+            }
+            // Review #6: a refused VRAM budget is a 503, not a panic.
+            let mut composed_cache = state
+                .engine
+                .try_create_gpu_kv_cache(state.max_seq_len)
+                .map_err(vram_exhausted_err)?;
             tokio::task::block_in_place(|| {
-                if !all_tokens.is_empty() {
-                    let _ = state.engine.forward_full_gpu_with_cache(&all_tokens, &mut composed_cache);
-                }
+                forward_chunked_into_cache(&state.engine, &all_tokens, &mut composed_cache, |_, _, _, _| {});
             });
 
             // Now generate with the composed cache
@@ -1362,7 +1563,8 @@ pub(crate) async fn chat_completions(
                 &state.engine, &prompt_tokens, sampler_config, seed, eos,
                 max_tokens, state.max_seq_len, &active_steers, &inject_deltas,
             )
-        });
+        })
+        .map_err(vram_exhausted_err)?;
         let len = generated.len() as u32;
         (generated, len)
     } else {
@@ -1379,7 +1581,8 @@ pub(crate) async fn chat_completions(
                 &state.engine, &prompt_tokens, sampler_config, seed, eos,
                 max_tokens, state.max_seq_len, &[], &[],
             )
-        });
+        })
+        .map_err(vram_exhausted_err)?;
         let len = generated.len() as u32;
         (generated, len)
     };
@@ -1463,16 +1666,9 @@ pub(crate) async fn chat_completions_stream(
     active_steers: Vec<Arc<RegisteredShim>>,
     inject_deltas: Vec<Option<wgpu::Buffer>>,
 ) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
-    let sampler_config = if req.temperature <= 0.0 {
-        SamplerConfig::greedy()
-    } else {
-        SamplerConfig {
-            temperature: req.temperature,
-            top_k: 40,
-            top_p: 0.95,
-            ..Default::default()
-        }
-    };
+    // Review #3: reject NaN/inf/negative (400) and floor tiny values so
+    // `logit / temperature` can never overflow into a NaN sampler panic.
+    let sampler_config = sampler_config_for(req.temperature)?;
     let eos = state.tokenizer.eos_token_id();
     let seed = rand_seed();
     let max_tokens = req.max_tokens as usize;
@@ -1503,8 +1699,14 @@ pub(crate) async fn chat_completions_stream(
     let state_for_gen = state.clone();
     let steers_for_gen = active_steers;
     let inject_for_gen = inject_deltas;
+    // Review #6: allocate the per-request cache here, in async context, so
+    // a refused VRAM budget is a clean 503 instead of a panic swallowed
+    // inside spawn_blocking (which the client saw as a bare [DONE]).
+    let mut cache = state
+        .engine
+        .try_create_gpu_kv_cache(state.max_seq_len)
+        .map_err(vram_exhausted_err)?;
     tokio::task::spawn_blocking(move || {
-        let mut cache = state_for_gen.engine.create_gpu_kv_cache(state_for_gen.max_seq_len);
         let mut sampler = Sampler::new(sampler_config.clone(), seed);
         let embed_dim = state_for_gen.engine.embed_dim();
         let has_steers = !steers_for_gen.is_empty();
@@ -1922,6 +2124,33 @@ mod tests {
         assert_eq!(clamp_max_tokens(100, 0, 0), Ok(0));
         // the review's scenario: a huge max_tokens against a nearly-full shard
         assert_eq!(clamp_max_tokens(4_000_000_000, 20, 4096 - 4000), Ok(76));
+    }
+
+    /// #3: temperature validation at the boundary.
+    #[test]
+    fn sanitize_temperature_cases() {
+        assert_eq!(sanitize_temperature(f32::NAN), Err(()));
+        assert_eq!(sanitize_temperature(f32::INFINITY), Err(()));
+        assert_eq!(sanitize_temperature(-1.0), Err(()));
+        assert_eq!(sanitize_temperature(0.0), Ok(None));
+        // the review's panic input is floored, not rejected
+        assert_eq!(sanitize_temperature(1e-40), Ok(Some(MIN_TEMPERATURE)));
+        assert_eq!(sanitize_temperature(0.7), Ok(Some(0.7)));
+        assert!(sampler_config_for(f32::NAN).is_err());
+        assert!(sampler_config_for(0.7).is_ok());
+    }
+
+    /// #5 / #11: length and token-id checks.
+    #[test]
+    fn prompt_len_and_token_id_checks() {
+        assert!(check_prompt_len(4096, 4096).is_ok());
+        assert_eq!(check_prompt_len(4097, 4096).unwrap_err().0, StatusCode::BAD_REQUEST);
+        assert!(check_token_ids(&[0, 1, 151_935], 151_936).is_ok());
+        let e = check_token_ids(&[5, u32::MAX], 151_936).unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_REQUEST);
+        assert_eq!((e.1).0["error"]["index"], 1);
+        assert_eq!(cache_pool_full_err(3, 3).0, StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(vram_exhausted_err("budget exceeded").0, StatusCode::SERVICE_UNAVAILABLE);
     }
 }
 

@@ -649,10 +649,22 @@ impl GpuEngine {
         self.cpu.create_kv_cache(max_seq_len)
     }
 
-    /// Allocate a GPU-resident KV cache sized for this model.
+    /// Allocate a GPU-resident KV cache sized for this model. Panics if the
+    /// VRAM budget refuses it; see [`Self::try_create_gpu_kv_cache`].
     pub fn create_gpu_kv_cache(&self, max_seq_len: usize) -> crate::layers::gpu_kv_cache::GpuKvCache {
+        self.try_create_gpu_kv_cache(max_seq_len)
+            .expect("gpu_kv_cache heap construction failed")
+    }
+
+    /// Fallible variant (adversarial review 2026-09-02, #6): returns the
+    /// vram-heap error instead of panicking, so a serving layer can answer
+    /// 503 and keep running.
+    pub fn try_create_gpu_kv_cache(
+        &self,
+        max_seq_len: usize,
+    ) -> Result<crate::layers::gpu_kv_cache::GpuKvCache, ::vram_heap::Error> {
         let attn0 = self.cpu.blocks()[0].attention();
-        crate::layers::gpu_kv_cache::GpuKvCache::new(
+        crate::layers::gpu_kv_cache::GpuKvCache::try_new(
             self.gpu.clone(),
             self.cpu.n_layers(),
             attn0.n_kv_heads(),

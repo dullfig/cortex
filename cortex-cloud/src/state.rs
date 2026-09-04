@@ -101,6 +101,8 @@ pub(crate) struct ServerState {
     pub(crate) model_name: String,
     pub(crate) start_time: Instant,
     pub(crate) max_seq_len: usize,
+    /// Review #6: cap on resident cache shards (see --max-cache-shards).
+    pub(crate) max_cache_shards: usize,
     /// Whether cache endpoints and cache_shards are enabled.
     pub(crate) cache_enabled: bool,
     /// Whether retrieval mode is enabled.

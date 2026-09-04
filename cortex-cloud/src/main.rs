@@ -60,6 +60,12 @@ struct Cli {
     #[arg(long, default_value = "4096")]
     max_seq_len: usize,
 
+    /// Maximum number of resident cache shards. A cache/load beyond this
+    /// returns 507 unless it replaces an existing id. Bounds the VRAM the
+    /// cache pool can consume (each shard reserves a full max-seq-len cache).
+    #[arg(long, default_value = "32")]
+    max_cache_shards: usize,
+
     /// Enable cache endpoints (/v1/cache/*) and cache_shards support on
     /// /v1/chat/completions. Use this for the librarian deployment.
     /// When disabled (default), the server is a stateless generation
@@ -228,9 +234,11 @@ async fn tokenize(
 async fn detokenize(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<DetokenizeRequest>,
-) -> Json<DetokenizeResponse> {
+) -> Result<Json<DetokenizeResponse>, (axum::http::StatusCode, Json<serde_json::Value>)> {
+    // Review #11: an out-of-range id indexed the tokenizer tables directly.
+    crate::chat::check_token_ids(&req.tokens, state.engine.vocab_size())?;
     let text = state.tokenizer.decode(&req.tokens);
-    Json(DetokenizeResponse { text })
+    Ok(Json(DetokenizeResponse { text }))
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +366,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         model_name: model_name.clone(),
         start_time: Instant::now(),
         max_seq_len: cli.max_seq_len,
+        max_cache_shards: cli.max_cache_shards,
         cache_enabled,
         retrieve_enabled,
         polar_cache_enabled,

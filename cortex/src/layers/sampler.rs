@@ -118,8 +118,11 @@ impl Sampler {
         };
         let logits = &logits;
 
-        // Temperature 0 or top_k=1: pure greedy
-        if self.config.temperature <= 0.0 || self.config.top_k == 1 {
+        // Temperature 0 (or non-finite / vanishingly small) or top_k=1:
+        // pure greedy. Review #3: a tiny temperature makes `logit/temp`
+        // overflow f32 -> inf -> NaN softmax; below 1e-3 sampling is
+        // indistinguishable from argmax anyway, so short-circuit.
+        if greedy_temperature(self.config.temperature) || self.config.top_k == 1 {
             let token = argmax(logits) as u32;
             self.record_token(token);
             return token;
@@ -128,12 +131,21 @@ impl Sampler {
         // 1. Apply temperature
         let mut scaled: Vec<f32> = logits.iter().map(|&l| l / self.config.temperature).collect();
 
+        // Review #3: non-finite logits (NaN/inf from bad weights or an
+        // upstream overflow) must never reach softmax/sort. Degrade to
+        // argmax, which is NaN-safe.
+        if scaled.iter().any(|v| !v.is_finite()) {
+            let token = argmax(logits) as u32;
+            self.record_token(token);
+            return token;
+        }
+
         // 2. Convert to probabilities via softmax
         softmax_inplace(&mut scaled);
 
         // 3. Build sorted index (descending probability)
         let mut indices: Vec<usize> = (0..scaled.len()).collect();
-        indices.sort_unstable_by(|&a, &b| scaled[b].partial_cmp(&scaled[a]).unwrap());
+        indices.sort_unstable_by(|&a, &b| scaled[b].total_cmp(&scaled[a]));
 
         // 4. Apply top-k filter
         let mut candidates = indices.len();
@@ -188,7 +200,7 @@ impl Sampler {
     pub fn sample_with_prob(&mut self, logits: &[f32]) -> (u32, f32) {
         assert!(!logits.is_empty());
 
-        if self.config.temperature <= 0.0 || self.config.top_k == 1 {
+        if greedy_temperature(self.config.temperature) || self.config.top_k == 1 {
             let idx = argmax(logits);
             let mut probs = logits.to_vec();
             softmax_inplace(&mut probs);
@@ -196,6 +208,13 @@ impl Sampler {
         }
 
         let mut scaled: Vec<f32> = logits.iter().map(|&l| l / self.config.temperature).collect();
+        // Review #3: see `sample` — non-finite values degrade to argmax.
+        if scaled.iter().any(|v| !v.is_finite()) {
+            let idx = argmax(logits);
+            let mut probs = logits.to_vec();
+            softmax_inplace(&mut probs);
+            return (idx as u32, probs[idx]);
+        }
         softmax_inplace(&mut scaled);
 
         let token = self.sample_from_probs(&scaled);
@@ -205,7 +224,7 @@ impl Sampler {
     /// Internal: sample from a probability distribution (already softmaxed).
     fn sample_from_probs(&mut self, probs: &[f32]) -> u32 {
         let mut indices: Vec<usize> = (0..probs.len()).collect();
-        indices.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+        indices.sort_unstable_by(|&a, &b| probs[b].total_cmp(&probs[a]));
 
         let mut candidates = indices.len();
         if self.config.top_k > 0 && self.config.top_k < candidates {
@@ -260,17 +279,28 @@ impl std::fmt::Debug for Sampler {
     }
 }
 
-/// Argmax: index of the largest value.
+/// Review #3: a temperature that is zero, non-finite, or so small that
+/// `logit / temperature` could overflow f32 is treated as greedy. Below
+/// 1e-3 sampling is indistinguishable from argmax in practice.
+fn greedy_temperature(t: f32) -> bool {
+    !(t.is_finite() && t >= 1e-3)
+}
+
+/// Argmax: index of the largest value. NaN-safe (Review #3): NaN is
+/// ordered as `-inf` so it can never win; `+inf` legitimately wins.
 fn argmax(values: &[f32]) -> usize {
+    let key = |v: f32| if v.is_nan() { f32::NEG_INFINITY } else { v };
     values
         .iter()
         .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .max_by(|(_, a), (_, b)| key(**a).total_cmp(&key(**b)))
         .map(|(i, _)| i)
         .unwrap_or(0)
 }
 
-/// In-place softmax with numerical stability.
+/// In-place softmax with numerical stability. Review #3: a degenerate
+/// input (non-finite max, or a zero / non-finite exp-sum) yields a uniform
+/// distribution instead of NaN.
 fn softmax_inplace(values: &mut [f32]) {
     if values.is_empty() {
         return;
@@ -281,10 +311,20 @@ fn softmax_inplace(values: &mut [f32]) {
     }
 
     let max_val = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if !max_val.is_finite() {
+        let u = 1.0 / values.len() as f32;
+        values.iter_mut().for_each(|v| *v = u);
+        return;
+    }
     let mut sum = 0.0f32;
     for v in values.iter_mut() {
         *v = (*v - max_val).exp();
         sum += *v;
+    }
+    if !(sum.is_finite() && sum > 0.0) {
+        let u = 1.0 / values.len() as f32;
+        values.iter_mut().for_each(|v| *v = u);
+        return;
     }
     let inv_sum = 1.0 / sum;
     for v in values.iter_mut() {
@@ -295,6 +335,48 @@ fn softmax_inplace(values: &mut [f32]) {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Adversarial-review #3 (2026-09-02): the sampler must never panic on a
+/// tiny/non-finite temperature or on non-finite logits.
+#[cfg(test)]
+mod review3_tests {
+    use super::*;
+
+    fn cfg(temperature: f32) -> SamplerConfig {
+        SamplerConfig { temperature, top_k: 40, top_p: 0.95, ..Default::default() }
+    }
+
+    #[test]
+    fn tiny_temperature_is_greedy_not_nan() {
+        // 1e-40 made logit/temp overflow to inf -> NaN softmax -> unwrap panic.
+        let logits = [1.0f32, 30.0, -5.0];
+        let mut s = Sampler::new(cfg(1e-40), 1);
+        assert_eq!(s.sample(&logits), 1);
+        let mut s = Sampler::new(cfg(f32::NAN), 1);
+        assert_eq!(s.sample(&logits), 1);
+    }
+
+    #[test]
+    fn non_finite_logits_do_not_panic() {
+        let mut s = Sampler::new(cfg(0.7), 1);
+        assert_eq!(s.sample(&[f32::NAN, 2.0, 1.0]), 1); // NaN can never win
+        assert_eq!(s.sample(&[0.0, f32::INFINITY, 1.0]), 1); // +inf legitimately wins
+        let t = s.sample(&[f32::NEG_INFINITY; 4]); // all -inf -> some valid index
+        assert!((t as usize) < 4);
+        let (t2, p) = s.sample_with_prob(&[f32::NAN, 1.0]);
+        assert!((t2 as usize) < 2 && p.is_finite());
+    }
+
+    #[test]
+    fn softmax_degenerate_rows_are_uniform() {
+        let mut v = [f32::NEG_INFINITY; 4];
+        softmax_inplace(&mut v);
+        assert!(v.iter().all(|&x| (x - 0.25).abs() < 1e-6));
+        let mut v = [f32::NAN, 1.0, 2.0];
+        softmax_inplace(&mut v);
+        assert!(v.iter().all(|x| x.is_finite()));
+    }
+}
 
 #[cfg(test)]
 mod tests {

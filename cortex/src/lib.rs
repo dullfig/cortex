@@ -67,3 +67,7 @@ pub use layers::engram_memory::EngramMemory;
 // it is by default).
 #[cfg(feature = "gpu")]
 pub use wgpu;
+/// Re-exported so serving layers can name vram-heap types (e.g. the
+/// `Error` returned by fallible cache allocation) without a direct dep.
+#[cfg(feature = "gpu")]
+pub use vram_heap;
