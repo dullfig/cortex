@@ -34,6 +34,54 @@ pub struct ChunkLimits {
     pub binding_max: u64,
 }
 
+/// wgpu's hard cap on any single `dispatch_workgroups` dimension
+/// (`maxComputeWorkgroupsPerDimension`). Vulkan itself allows 2^31 on x,
+/// but wgpu-hal takes the min over the three dimensions, so 65535 is the
+/// effective limit even with `required_limits: adapter.limits()`.
+pub const WGPU_MAX_WORKGROUPS_PER_DIM: usize = 65_535;
+
+/// Largest per-token workgroup count over every dispatch whose x-dimension
+/// scales with `n_tokens` (adversarial review 2026-09-02, #4). A prefill
+/// chunk of `n` tokens must satisfy `n · max_workgroups_per_token ≤ 65535`
+/// or wgpu rejects the dispatch — that was the memex-reported one-shot
+/// `cache/load` crash: softmax dispatches `n_tokens · n_heads` in ONE
+/// dimension, and a 4178-token chunk × 16 heads = 66848.
+///
+/// Mirrors the group formulas at the dispatch sites — keep in sync. Sites
+/// that are already 2-D (`matmul*`, `silu_mul`, `kv_write`: `dx.min(65535)`
+/// + `dy`) need nothing. The attention-score x-dims scale with the
+/// attention WIDTH (`n_heads·(start+n)/256`), not the chunk, and only
+/// approach the cap beyond ~1M tokens of context. The y-dim sites
+/// (`attn_score`, fused attention) are 1 group/token and are covered by
+/// the `max ≥ 1` floor.
+pub fn max_workgroups_per_token(n_heads: usize, head_dim: usize, embed: usize) -> usize {
+    let ceil = |a: usize, b: usize| (a + b - 1) / b;
+    let n_proj = crate::ops::qjl::DEFAULT_V_N_PROJECTIONS;
+    [
+        // softmax_batch (f32 dispatch.rs + polar forward_polar.rs): n·n_heads
+        n_heads,
+        // qjl_value_weights (gpu_polar.rs): n·n_heads·n_proj / 256
+        ceil(n_heads * n_proj, 256),
+        // rope_batch f32 (dispatch.rs, legacy path): n·n_heads·half_dim / 64
+        ceil(n_heads * (head_dim / 2), 64),
+        // attn_value (+polar, +qjl), rotate_q_packed, kv_compress: n·n_heads·head_dim / 256
+        ceil(n_heads * head_dim, 256),
+        // rope_batch_packed: n·n_heads·(half_dim/2) / 64
+        ceil(n_heads * (head_dim / 4), 64),
+        // derotate_packed: n·n_heads·(head_dim/2) / 256
+        ceil(n_heads * head_dim / 2, 256),
+        // add_batch f32: n·embed / 256
+        ceil(embed, 256),
+        // bias_add_packed, add_packed, add_broadcast: n·(embed/2) / 256
+        ceil(embed / 2, 256),
+        // rmsnorm / final_norm x-dim; attn_score / fused-attn y-dim
+        1,
+    ]
+    .into_iter()
+    .max()
+    .unwrap()
+}
+
 /// Largest `n` satisfying `A·n² + (A·start + lin_coeff)·n ≤ budget`,
 /// where `A = n_heads·4` is the scores quadratic coefficient (scores =
 /// n · n_heads · (start + n) · 4 bytes). With `lin_coeff = 0` this
@@ -77,7 +125,15 @@ fn prefill_chunk_size(start_pos: usize, lim: &ChunkLimits) -> usize {
         + lim.n_kv_heads * lim.head_dim * 4
         + lim.embed * 2) as u64;
     let n_c = (lim.lane_c / cc).max(1) as usize;
-    n_b.min(n_bind).min(n_a).min(n_c).max(1)
+    // Dispatch limit (review #4): wgpu caps each dispatch_workgroups
+    // dimension at 65535, and several batch shaders dispatch
+    // (n_tokens × per-token groups) in ONE dimension. Bytes alone would
+    // allow a 4178-token chunk on a 12 GB card; 16 heads × 4178 = 66848
+    // groups → wgpu validation error → panic. Qwen 3B: n ≤ 4095.
+    let n_dispatch = (WGPU_MAX_WORKGROUPS_PER_DIM
+        / max_workgroups_per_token(lim.n_heads, lim.head_dim, lim.embed))
+    .max(1);
+    n_b.min(n_bind).min(n_a).min(n_c).min(n_dispatch).max(1)
 }
 
 /// Per-block scratch buffers reused across all dispatches inside a single
@@ -265,7 +321,9 @@ impl BlockScratch {
 /// device (unlike the gated parity tests below).
 #[cfg(test)]
 mod chunk_size_tests {
-    use super::{prefill_chunk_size, ChunkLimits};
+    use super::{
+        max_workgroups_per_token, prefill_chunk_size, ChunkLimits, WGPU_MAX_WORKGROUPS_PER_DIM,
+    };
 
     /// Qwen 2.5 3B dims with all lanes at the Phase L 128 MB default and
     /// a typical ~2 GB storage-binding cap.
@@ -305,12 +363,20 @@ mod chunk_size_tests {
         (n * lim.n_heads * (start + n) * 4) as u64
     }
 
-    /// True iff a chunk of `n` tokens at `start` violates no constraint.
+    /// Per-token workgroup factor for the fixture's dims (review #4).
+    fn wg_per_token(lim: &ChunkLimits) -> usize {
+        max_workgroups_per_token(lim.n_heads, lim.head_dim, lim.embed)
+    }
+
+    /// True iff a chunk of `n` tokens at `start` violates no constraint —
+    /// the three lanes, the single-binding cap, and (review #4) wgpu's
+    /// 65535-per-dimension dispatch limit.
     fn fits_all(n: usize, start: usize, lim: &ChunkLimits) -> bool {
         lane_a_bytes(n, lim) <= lim.lane_a
             && lane_b_bytes(n, start, lim) <= lim.lane_b
             && lane_c_bytes(n, lim) <= lim.lane_c
             && scores_bytes(n, start, lim) <= lim.binding_max
+            && n * wg_per_token(lim) <= WGPU_MAX_WORKGROUPS_PER_DIM
     }
 
     #[test]
@@ -358,6 +424,12 @@ mod chunk_size_tests {
         // Phase M scenario: device-derived Lane B larger than the ~2 GB
         // single-binding limit. The scores binding must still fit it.
         let mut lim = qwen_limits();
+        // Review #4: with Qwen's 16 heads the dispatch limit (n ≤ 4095) is
+        // tighter than a ~2 GB binding cap (~5.8k tokens at start 0) — at
+        // this geometry the dispatch bound always wins. Use a smaller
+        // illustrative cap (256 MiB → 2048 tokens at start 0) so this test
+        // keeps exercising the binding constraint specifically.
+        lim.binding_max = 256 * 1024 * 1024;
         lim.lane_b = 16 * 1024 * 1024 * 1024; // 16 GB lane
         lim.lane_a = u64::MAX;
         lim.lane_c = u64::MAX;
@@ -390,6 +462,42 @@ mod chunk_size_tests {
             lane_a_bytes(n + 1, &lim) > lim.lane_a,
             "n={n} not maximal against Lane A",
         );
+    }
+
+    // --- Review #4: the wgpu 65535 dispatch-dimension limit ---------------
+
+    #[test]
+    fn workgroups_per_token_pins_the_dispatch_formulas() {
+        // Qwen 2.5 3B: softmax's n·n_heads is the worst site → 16/token.
+        assert_eq!(max_workgroups_per_token(16, 128, 2048), 16);
+        // A wide, few-headed model is embed-bound: add_batch n·embed/256 → 64.
+        assert_eq!(max_workgroups_per_token(8, 128, 16384), 64);
+        // Never zero (the chunker divides by it).
+        assert!(max_workgroups_per_token(1, 2, 2) >= 1);
+    }
+
+    #[test]
+    fn dispatch_limit_clamps_when_lanes_are_huge() {
+        // The memex scenario: a 12 GB card's derived Lane B allowed a
+        // 4178-token chunk; 16 × 4178 = 66848 > 65535 → wgpu panic. With
+        // every byte budget effectively unlimited, the dispatch limit must
+        // be what binds: 65535 / 16 = 4095.
+        let mut lim = qwen_limits();
+        lim.lane_a = 16 * 1024 * 1024 * 1024;
+        lim.lane_b = 16 * 1024 * 1024 * 1024;
+        lim.lane_c = 16 * 1024 * 1024 * 1024;
+        lim.binding_max = 16 * 1024 * 1024 * 1024;
+        for &start in &[0usize, 1000] {
+            let n = prefill_chunk_size(start, &lim);
+            assert_eq!(n, 4095, "start={start}: dispatch limit should bind at 4095, got {n}");
+            assert!(n * 16 <= WGPU_MAX_WORKGROUPS_PER_DIM);
+            assert!((n + 1) * 16 > WGPU_MAX_WORKGROUPS_PER_DIM);
+            assert!(fits_all(n, start, &lim) && !fits_all(n + 1, start, &lim));
+        }
+        // And the embed-bound model gets the tighter bound: 65535 / 64 = 1023.
+        lim.n_heads = 8;
+        lim.embed = 16384;
+        assert_eq!(prefill_chunk_size(0, &lim), 1023);
     }
 }
 
@@ -431,4 +539,16 @@ impl GpuEngine {
         prefill_chunk_size(start_pos, &lim)
     }
 
+    /// Largest token count a SINGLE unchunked forward may carry before
+    /// some batch shader's dispatch exceeds wgpu's 65535-per-dimension cap
+    /// (review #4). Chunked prefills get this bound automatically via
+    /// [`Self::safe_prefill_chunk_size`]; callers that run one forward
+    /// (hidden-capture shims, the polar traced retrieve query, the polar
+    /// chat prompt) must bound their input by this. Qwen 2.5 3B: 4095.
+    pub fn max_single_dispatch_tokens(&self) -> usize {
+        let attn0 = self.cpu.blocks()[0].attention();
+        (WGPU_MAX_WORKGROUPS_PER_DIM
+            / max_workgroups_per_token(attn0.n_heads(), attn0.head_dim(), self.embed_dim()))
+        .max(1)
+    }
 }

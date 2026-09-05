@@ -417,6 +417,12 @@ pub(crate) fn generate_with_polar_cache(
     if !lm_head_greedy_eligible(&sampler_config) {
         return None;
     }
+    // Review #4: the polar prompt prefill is a single unchunked forward.
+    // Beyond the wgpu dispatch limit, decline (`None`) so the caller falls
+    // back to the f32 path, whose prefill IS chunked.
+    if prompt_tokens.len() > engine.max_single_dispatch_tokens() {
+        return None;
+    }
     let mut next_token = engine.forward_full_gpu_polar_with_cache_inject_argmax_greedy(
         prompt_tokens, polar_cache, &[],
     )?;
@@ -487,6 +493,29 @@ pub(crate) fn generate_stateless_gpu(
     // mutate hidden BEFORE the projection, so we still need the full
     // hidden readback for them).
     let greedy_gpu = !has_steers && lm_head_greedy_eligible(&sampler_config);
+
+    // Review #4/#5: this prefill was unchunked — a 4300-token stateless
+    // prompt blew Lane B (and, past 4095 tokens, wgpu's dispatch limit).
+    // Advance all but the last prompt token in chunker-sized pieces with
+    // the inject-aware forward (discarding the hidden so inject deltas
+    // still apply to every prefix token), then run the existing 1-token
+    // prefill below on the last token — steer/greedy/projection code is
+    // unchanged.
+    let n = prompt_tokens.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    if n > 1 {
+        let mut rest = &prompt_tokens[..n - 1];
+        while !rest.is_empty() {
+            let chunk = engine.safe_prefill_chunk_size(cache.seq_len()).min(rest.len());
+            let _ = engine.forward_full_gpu_with_cache_inject_returning_hidden(
+                &rest[..chunk], &mut cache, inject_deltas,
+            );
+            rest = &rest[chunk..];
+        }
+    }
+    let prompt_tokens = &prompt_tokens[n - 1..];
 
     // Prefill: get [n_prompt * embed_dim] hidden (with inject), take
     // last token's slice, apply steers (if any), project, sample.
@@ -689,6 +718,14 @@ pub(crate) async fn chat_completions(
     // post-norm hidden. Skip the prefill entirely when neither set
     // has shims (preserves the existing fast path for plain chat).
     let need_hc = !resolved_gate_shims.is_empty() || !resolved_inject_shims.is_empty();
+    // Review #4: the hidden-capture prefill is a single unchunked forward,
+    // so it must respect wgpu's 65535 dispatch-dimension limit too.
+    if need_hc {
+        check_prompt_len(
+            prompt_tokens.len(),
+            state.max_seq_len.min(state.engine.max_single_dispatch_tokens()),
+        )?;
+    }
     let (hc, gate_prefill_ms) = if need_hc {
         let prefill_start = Instant::now();
         let hc = tokio::task::block_in_place(|| {
@@ -881,6 +918,15 @@ pub(crate) async fn chat_completions(
     // tokens + prompt tokens. Returns early with a RetrievalResponse.
     // ---------------------------------------------------------------
     let is_retrieve = req.mode.as_deref() == Some("retrieve");
+
+    // Review #4: the traced retrieve forward is unchunked; bound the query
+    // by the wgpu dispatch limit here (400) — the engine asserts as backstop.
+    if is_retrieve {
+        check_prompt_len(
+            prompt_tokens.len(),
+            state.max_seq_len.min(state.engine.max_single_dispatch_tokens()),
+        )?;
+    }
 
     if is_retrieve && !state.retrieve_enabled {
         return Err((
@@ -1714,6 +1760,26 @@ pub(crate) async fn chat_completions_stream(
         // (which mutate hidden BEFORE the projection — they still need
         // the full hidden readback).
         let greedy_gpu = !has_steers && lm_head_greedy_eligible(&sampler_config);
+
+        // Review #4/#5: chunked, inject-aware prompt prefill (see
+        // generate_stateless_gpu) — advance all but the last token in
+        // chunker-sized pieces, then the 1-token prefill below runs on
+        // the last token unchanged.
+        let n = prompt_tokens.len();
+        if n > 1 {
+            let mut rest = &prompt_tokens[..n - 1];
+            while !rest.is_empty() {
+                let chunk = state_for_gen
+                    .engine
+                    .safe_prefill_chunk_size(cache.seq_len())
+                    .min(rest.len());
+                let _ = state_for_gen.engine.forward_full_gpu_with_cache_inject_returning_hidden(
+                    &rest[..chunk], &mut cache, &inject_for_gen,
+                );
+                rest = &rest[chunk..];
+            }
+        }
+        let prompt_tokens = &prompt_tokens[n.saturating_sub(1)..];
 
         // Prefill + first token. Four modes:
         //  - steers (with or without inject): forward returns hidden,

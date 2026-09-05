@@ -1018,7 +1018,12 @@ pub(crate) async fn shim_infer(
 
     let tokens = state.tokenizer.encode(&req.context, /*add_bos*/ true);
     // Review #5: bound the (unchunked) hidden-capture forward to the window.
-    crate::chat::check_prompt_len(tokens.len(), state.max_seq_len)?;
+    // Review #4: this forward is unchunked, so it must also respect wgpu's
+    // 65535 dispatch-dimension limit (Qwen 3B: 4095 tokens).
+    crate::chat::check_prompt_len(
+        tokens.len(),
+        state.max_seq_len.min(state.engine.max_single_dispatch_tokens()),
+    )?;
     if tokens.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1145,7 +1150,12 @@ pub(crate) async fn shim_embed(
     }
     let tokens = state.tokenizer.encode(&req.text, /*add_bos*/ true);
     // Review #5: bound the (unchunked) hidden-capture forward to the window.
-    crate::chat::check_prompt_len(tokens.len(), state.max_seq_len)?;
+    // Review #4: this forward is unchunked, so it must also respect wgpu's
+    // 65535 dispatch-dimension limit (Qwen 3B: 4095 tokens).
+    crate::chat::check_prompt_len(
+        tokens.len(),
+        state.max_seq_len.min(state.engine.max_single_dispatch_tokens()),
+    )?;
     if tokens.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,

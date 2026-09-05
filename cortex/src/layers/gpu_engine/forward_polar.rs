@@ -123,6 +123,19 @@ impl GpuEngine {
              {binding_max} B) for {n_tokens} query tokens against a {start_pos}-token \
              shard. Shorten the query or raise CORTEX_VRAM_HEAP_B_MB.",
         );
+        // Review #4: this traced forward is unchunked, and softmax dispatches
+        // n_tokens·n_heads in one dimension against wgpu's 65535 cap. The
+        // handler bounds the query first; this is the engine-level backstop
+        // with a clear message instead of a driver validation error.
+        let wg_per_token =
+            super::scratch::max_workgroups_per_token(n_heads, head_dim, self.embed_dim);
+        let max_q = super::scratch::WGPU_MAX_WORKGROUPS_PER_DIM / wg_per_token;
+        assert!(
+            n_tokens <= max_q,
+            "polar retrieve query too long: {n_tokens} tokens > {max_q} \
+             (wgpu 65535 dispatch limit / {wg_per_token} workgroups per token). \
+             Shorten the query.",
+        );
         let scratch = PolarBlockScratch::allocate(
             &self.gpu, n_tokens, self.embed_dim,
             n_heads, attn0.n_kv_heads(), head_dim,
