@@ -162,6 +162,11 @@ pub(crate) async fn cache_load(
         }
     }
 
+    // Review #7: one GPU region at a time. Held through allocation, prefill,
+    // polar populate, the deferred-destroy flushes and the insert below
+    // (gate -> pool lock order).
+    let _gpu = state.gpu_gate.admit().await;
+
     // Review #6: a refused VRAM budget is a 503, not a panic.
     let mut cache = state
         .engine
@@ -426,6 +431,11 @@ pub(crate) async fn cache_append(
         // roughly constant regardless of token count). Correctness is
         // preserved because wgpu's queue is in-order: subsequent
         // forwards see the K/V writes via cache buffer storage.
+        // Review #7: one GPU region at a time. Acquired BEFORE the per-chunk
+        // pool lock (gate -> pool) and held across all chunks; the pool lock
+        // is still released between chunks so /health and the metrics
+        // sampler can land.
+        let _gpu = state.gpu_gate.admit().await;
         let mut current_start = start_seq;
         let mut tokens_remaining = &req.tokens[..];
         while !tokens_remaining.is_empty() {

@@ -1033,6 +1033,8 @@ pub(crate) async fn shim_infer(
         ));
     }
 
+    // Review #7: one GPU region at a time.
+    let _gpu = state.gpu_gate.admit().await;
     let infer_start = Instant::now();
     let hc = tokio::task::block_in_place(|| {
         state.engine.forward_full_gpu_with_hidden_capture(&tokens, &[])
@@ -1172,6 +1174,8 @@ pub(crate) async fn shim_embed(
         EmbedLayer::EntranceN(idx) => vec![idx],
     };
 
+    // Review #7: one GPU region at a time.
+    let _gpu = state.gpu_gate.admit().await;
     let infer_start = Instant::now();
     let hc = tokio::task::block_in_place(|| {
         state.engine.forward_full_gpu_with_hidden_capture(&tokens, &capture_layers)

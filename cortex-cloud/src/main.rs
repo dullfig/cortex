@@ -363,6 +363,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: loaded.config,
         cache_pool: Mutex::new(HashMap::new()),
         next_cache_version: std::sync::atomic::AtomicU64::new(0),
+        gpu_gate: GpuGate::new(),
         composition: Mutex::new(None),
         model_name: model_name.clone(),
         start_time: Instant::now(),
@@ -418,6 +419,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (size, tokens)
             };
             sampler_state.metrics.record_cache_pool(pool_size, pool_tokens);
+            sampler_state.metrics.record_gpu_gate_waiting(sampler_state.gpu_gate.waiting());
 
             // vram-heap usage across all 5 heaps.
             let gpu = sampler_state.engine.gpu();

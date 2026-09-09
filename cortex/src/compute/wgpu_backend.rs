@@ -386,11 +386,13 @@ pub const PARAMS_POOL_SLOT_BYTES: u64 = 256;
 /// reuse a slot while the previous occupant is still bound in flight.
 ///
 /// Single-forward demand at Qwen-3B polar retrieve: ~360 slots
-/// (36 layers × ~10 dispatches per layer). cortex-cloud's tokio
-/// handlers can run multiple forwards concurrently (`Arc<GpuEngine>`
-/// with `&self` forward methods), so the operating envelope is
-/// (concurrent forwards) × (in-flight slots per forward between
-/// chunked submits, ~135 with the default 9-layer chunking).
+/// (36 layers × ~10 dispatches per layer). The engine does not stop
+/// callers from running forwards concurrently (`&self` methods on a
+/// shared `GpuEngine`); cortex-cloud admits one GPU region at a time
+/// (`ServerState::gpu_gate`, review #7), so its envelope is 1 ×
+/// (in-flight slots per forward between chunked submits, ~135 with the
+/// default 9-layer chunking). The headroom below is for callers that
+/// bypass that gate.
 ///
 /// Phase J (2026-06-09) bumped this from 2048 to 16384 to close a
 /// latent wrap-around race: at 2048 slots, ~15 concurrent forwards
@@ -890,12 +892,14 @@ impl GpuDevice {
     /// whole standalone wgpu Buffer — we just never let them get
     /// dropped.
     ///
-    /// Ring size (2048) is comfortably larger than any single
-    /// synchronously-issued forward pass needs (polar retrieve =
-    /// ~36 layers × ~10 dispatches per layer = ~360 slots). Caller
-    /// returns are single-threaded per-device (cortex-cloud
-    /// serializes via the cache-pool mutex), so the ring's natural
-    /// wrap-around is safe after each function's terminal poll.
+    /// Ring size (`PARAMS_POOL_SLOT_COUNT` = 16384) is comfortably larger
+    /// than any single forward pass needs (polar retrieve = ~36 layers ×
+    /// ~10 dispatches per layer = ~360 slots). The engine itself does NOT
+    /// serialize callers; the wrap-around is safe because cortex-cloud
+    /// admits one GPU region at a time (`ServerState::gpu_gate`, review
+    /// #7) — a second forward cannot interleave slot acquisitions with a
+    /// still-in-flight one. (An earlier version of this comment claimed
+    /// the cache-pool mutex provided that serialization; it never did.)
     pub fn create_params_buffer<T: bytemuck::Pod>(&self, params: &T) -> wgpu::Buffer {
         let size = std::mem::size_of::<T>() as u64;
         assert!(

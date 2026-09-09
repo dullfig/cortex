@@ -199,6 +199,8 @@ pub struct Metrics {
     // duplicate the signal with worse semantics (can't distinguish
     // per-endpoint busy time).
     concurrent_requests: AtomicU64,
+    /// Review #7: requests parked at the GPU gate (queue depth), sampled.
+    gpu_gate_waiting: AtomicU64,
     cache_pool_size: AtomicU64,
     cache_pool_tokens_total: AtomicU64,
     vram_heap_bytes: [AtomicU64; 5],
@@ -231,6 +233,7 @@ impl Metrics {
             cache_append_duration: Histogram::new(),
             ttft: Histogram::new(),
             concurrent_requests: AtomicU64::new(0),
+            gpu_gate_waiting: AtomicU64::new(0),
             cache_pool_size: AtomicU64::new(0),
             cache_pool_tokens_total: AtomicU64::new(0),
             vram_heap_bytes: [
@@ -253,6 +256,11 @@ impl Metrics {
     /// Decrement the in-flight requests gauge. Wired by `RequestTimer::Drop`.
     pub fn record_concurrent_dec(&self) {
         self.concurrent_requests.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Update the GPU-gate queue-depth gauge. Called by the sampler task.
+    pub fn record_gpu_gate_waiting(&self, waiting: u64) {
+        self.gpu_gate_waiting.store(waiting, Ordering::Relaxed);
     }
 
     /// Update the cache pool gauges. Called by the sampler task.
@@ -364,6 +372,9 @@ impl Metrics {
 
         // ---- Phase K: substrate/concurrency tripwire gauges ----
 
+        let _ = writeln!(out, "# HELP cortex_gpu_gate_waiting Requests queued at the single-permit GPU gate (review #7); sustained > 0 is the Stage-2 batching trigger.");
+        let _ = writeln!(out, "# TYPE cortex_gpu_gate_waiting gauge");
+        let _ = writeln!(out, "cortex_gpu_gate_waiting {}", self.gpu_gate_waiting.load(Ordering::Relaxed));
         let _ = writeln!(out, "# HELP cortex_concurrent_requests In-flight HTTP requests, push-updated by RequestTimer.");
         let _ = writeln!(out, "# TYPE cortex_concurrent_requests gauge");
         let _ = writeln!(out, "cortex_concurrent_requests {}",

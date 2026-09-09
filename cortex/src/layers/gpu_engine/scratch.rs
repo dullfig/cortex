@@ -522,18 +522,22 @@ impl GpuEngine {
             .downcast_ref::<crate::layers::swiglu::SwiGLU>()
             .map(|f| f.intermediate_size())
             .unwrap_or(embed * 4);
-        // ~3% slack against alignment padding / fragmentation. The lanes
-        // are freshly empty each prefill forward (RAII drops the prior
-        // scratch), so nearly the full capacity is available.
+        // ~3% slack against alignment padding / fragmentation. With one
+        // forward at a time (cortex-cloud's gpu_gate, review #7) the lanes
+        // are freshly empty here (RAII dropped the prior scratch) and
+        // `available()` equals `capacity()`. Sizing from what is actually
+        // free rather than the nominal capacity means a caller that runs
+        // outside the gate at least gets chunks that fit next to whatever
+        // is resident, instead of an `.expect` panic in BlockScratch.
         let lim = ChunkLimits {
             n_heads: attn0.n_heads(),
             n_kv_heads: attn0.n_kv_heads(),
             head_dim: attn0.head_dim(),
             embed,
             intermediate,
-            lane_a: self.gpu.transient_heap_a.capacity() * 97 / 100,
-            lane_b: self.gpu.transient_heap_b.capacity() * 97 / 100,
-            lane_c: self.gpu.transient_heap_c.capacity() * 97 / 100,
+            lane_a: self.gpu.transient_heap_a.available() * 97 / 100,
+            lane_b: self.gpu.transient_heap_b.available() * 97 / 100,
+            lane_c: self.gpu.transient_heap_c.available() * 97 / 100,
             binding_max: self.gpu.device.limits().max_storage_buffer_binding_size as u64,
         };
         prefill_chunk_size(start_pos, &lim)

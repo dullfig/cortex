@@ -119,6 +119,42 @@ pub(crate) struct LockstepError {
 
 pub(crate) type CachePool = HashMap<String, CacheEntry>;
 
+/// Review #7 — admission control for the GPU. The engine shares three
+/// transient lanes, the params ring and its timers between all callers and
+/// was written for one forward at a time; nothing in the server enforced
+/// that (9 of 20 GPU regions ran with no lock at all, the rest happened to
+/// hold the pool mutex). `admit()` hands out the single permit in FIFO
+/// order; a handler holds it across its whole `block_in_place` /
+/// `spawn_blocking` region — cache allocation, prefill, polar populate,
+/// `poll_wait` included. Lock order, enforced by placement: **gpu_gate →
+/// cache_pool → composition** (never wait for the gate while holding a
+/// pool lock). `waiting` is the queue depth, exported as
+/// `cortex_gpu_gate_waiting` — the Stage-2 (batching) trigger signal.
+pub(crate) struct GpuGate {
+    sem: Arc<tokio::sync::Semaphore>,
+    waiting: AtomicU64,
+}
+
+impl GpuGate {
+    pub(crate) fn new() -> Self {
+        Self { sem: Arc::new(tokio::sync::Semaphore::new(1)), waiting: AtomicU64::new(0) }
+    }
+
+    /// Wait for the GPU. The returned permit is owned so it can be moved
+    /// into a `spawn_blocking` closure; it is released on drop.
+    pub(crate) async fn admit(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.waiting.fetch_add(1, Ordering::Relaxed);
+        let permit = self.sem.clone().acquire_owned().await
+            .expect("gpu_gate semaphore is never closed");
+        self.waiting.fetch_sub(1, Ordering::Relaxed);
+        permit
+    }
+
+    pub(crate) fn waiting(&self) -> u64 {
+        self.waiting.load(Ordering::Relaxed)
+    }
+}
+
 /// Re-find `id` after a lock gap and check it is still the entry the caller
 /// snapshotted. 404 `cache_not_found` if it is gone, 409 `cache_changed` if
 /// it was replaced or mutated in the meantime.
@@ -177,6 +213,8 @@ pub(crate) struct ServerState {
     /// counter, so no two entries (or two states of one entry) ever share a
     /// version. See `EntryWitness`.
     pub(crate) next_cache_version: AtomicU64,
+    /// Review #7: one GPU region at a time. See `GpuGate`.
+    pub(crate) gpu_gate: GpuGate,
     /// Single-slot composition cache for multi-shard retrieve. Holds at most
     /// one composed `GpuKvCache`; reused when the next request's
     /// `(shard, version)` key matches; rebuilt in place (clear + re-prefill,
@@ -282,6 +320,33 @@ mod witness_tests {
         pool.insert("a".into(), entry(7, 11));
         let e = relookup_mut(&mut pool, "a", w).err().unwrap();
         assert_eq!(err_type(&e), (StatusCode::CONFLICT, "cache_changed".into()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gpu_gate_admits_one_at_a_time_and_counts_waiters() {
+        let gate = Arc::new(GpuGate::new());
+        let first = gate.admit().await;
+        assert_eq!(gate.waiting(), 0);
+
+        let g2 = gate.clone();
+        let second = tokio::spawn(async move {
+            let _p = g2.admit().await;
+            g2.waiting()
+        });
+        // Give the second task time to park on the semaphore.
+        for _ in 0..50 {
+            if gate.waiting() == 1 { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(gate.waiting(), 1, "second admit should be queued");
+        assert!(!second.is_finished(), "second admit ran while the first permit was held");
+
+        drop(first);
+        let waiting_seen_inside = tokio::time::timeout(
+            std::time::Duration::from_secs(2), second,
+        ).await.expect("second admit never completed").unwrap();
+        assert_eq!(waiting_seen_inside, 0);
+        assert_eq!(gate.waiting(), 0);
     }
 
     #[test]

@@ -880,6 +880,12 @@ pub(crate) async fn chat_completions(
             state.max_seq_len.min(state.engine.max_single_dispatch_tokens()),
         )?;
     }
+    // Review #7: one GPU region at a time. Everything below that touches the
+    // engine — the shim prefill, retrieve trace forwards, cached / composed
+    // / stateless generation — runs under this permit; every pool lock in
+    // this handler is taken after it (gate -> pool -> composition). The
+    // streaming path moves it into its spawn_blocking task.
+    let gpu_permit = state.gpu_gate.admit().await;
     let (hc, gate_prefill_ms) = if need_hc {
         let prefill_start = Instant::now();
         let hc = tokio::task::block_in_place(|| {
@@ -1029,7 +1035,7 @@ pub(crate) async fn chat_completions(
             ));
         }
         _telemetry.mark_success();
-        return chat_completions_stream(state, req, prompt_tokens, gate_metadata, active_steers, inject_deltas).await;
+        return chat_completions_stream(state, req, prompt_tokens, gate_metadata, active_steers, inject_deltas, gpu_permit).await;
     }
 
     let prompt_len = prompt_tokens.len() as u32;
@@ -1904,6 +1910,10 @@ pub(crate) async fn chat_completions_stream(
     gate_metadata: Option<serde_json::Value>,
     active_steers: Vec<Arc<RegisteredShim>>,
     inject_deltas: Vec<Option<wgpu::Buffer>>,
+    // Review #7: the caller's GPU permit; moved into the generation task
+    // below and released when the stream ends (a stream holds the GPU for
+    // its lifetime — per-step fairness is Stage-2 batching work).
+    gpu_permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
     // Review #3: reject NaN/inf/negative (400) and floor tiny values so
     // `logit / temperature` can never overflow into a NaN sampler panic.
@@ -1946,6 +1956,7 @@ pub(crate) async fn chat_completions_stream(
         .try_create_gpu_kv_cache(state.max_seq_len)
         .map_err(vram_exhausted_err)?;
     tokio::task::spawn_blocking(move || {
+        let _gpu_permit = gpu_permit; // held until this task returns or unwinds
         let mut sampler = Sampler::new(sampler_config.clone(), seed);
         let embed_dim = state_for_gen.engine.embed_dim();
         let has_steers = !steers_for_gen.is_empty();
