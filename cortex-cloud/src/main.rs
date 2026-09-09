@@ -362,6 +362,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokenizer: loaded.tokenizer,
         config: loaded.config,
         cache_pool: Mutex::new(HashMap::new()),
+        next_cache_version: std::sync::atomic::AtomicU64::new(0),
         composition: Mutex::new(None),
         model_name: model_name.clone(),
         start_time: Instant::now(),

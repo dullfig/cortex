@@ -255,11 +255,12 @@ pub(crate) async fn cache_load(
         drop(pool);
         return Err(crate::chat::cache_pool_full_err(n, state.max_cache_shards));
     }
-    // If overwriting an existing shard, bump from its current version so the
-    // composition cache's staleness check sees the change. New shards start
-    // at version 0; any subsequent insert / append bumps it monotonically.
-    let next_version = pool.get(&req.cache_id).map(|e| e.version + 1).unwrap_or(0);
-    pool.insert(
+    // Process-unique version (review #9): a replaced shard never shares a
+    // version with the entry it replaces, even across DELETE + reload, so
+    // the composition cache's staleness check and every in-flight
+    // `EntryWitness` see the change.
+    let next_version = state.next_cache_version();
+    let replaced = pool.insert(
         req.cache_id.clone(),
         CacheEntry {
             cache: cache_opt,
@@ -273,6 +274,19 @@ pub(crate) async fn cache_load(
     );
     let pool_size = pool.len();
     drop(pool);
+    if let Some(old) = replaced {
+        // Review #30: a same-id reload drops the previous shard's caches
+        // here, but wgpu only destroys their buffers after any queued GPU
+        // work on them completes and the deferred-destroy queue is flushed.
+        // The VRAM budget released its reservation at the drop, so without
+        // a flush a burst of reloads (or a reload racing an append on the
+        // old entry) lets the budget admit a cache the driver cannot back:
+        // `wgpu error: Out of Memory`, fatal, on a worker thread. Same
+        // mitigation as cache_delete and the polar_only path above; the
+        // pool lock is already released so other handlers are not blocked.
+        drop(old);
+        tokio::task::block_in_place(|| state.engine.poll_wait());
+    }
     // Drop any stale composition that referenced the old (or absent) version
     // of this shard. Cheap: a single buffer-array drop on the GPU.
     *state.composition.lock().await = None;
@@ -310,25 +324,15 @@ pub(crate) async fn cache_append(
     // Review #11: reject out-of-range token ids before any GPU work.
     crate::chat::check_token_ids(&req.tokens, state.engine.vocab_size())?;
 
-    // Verify the cache exists before kicking off any GPU work. Snapshot
-    // metadata (current seq_len for chunk sizing, max_seq_len for the
-    // overflow error message), then drop the lock so /health stays
-    // responsive while the forward runs.
-    {
+    // Verify the cache exists before kicking off any GPU work and take its
+    // witness (review #9): every later re-acquisition of the pool lock goes
+    // through `relookup` against it, so a DELETE or same-id reload landing
+    // in a gap is a 404/409, not an unwrap panic or a silent split of the
+    // appended chunks across two entries.
+    let mut witness = {
         let pool = state.cache_pool.lock().await;
         match pool.get(&req.cache_id) {
-            None => {
-                return Err((
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({
-                        "error": {
-                            "type": "cache_not_found",
-                            "message": format!("cache_id '{}' not found", req.cache_id),
-                            "cache_id": req.cache_id,
-                        }
-                    })),
-                ));
-            }
+            None => return Err(crate::chat::cache_not_found_err(&req.cache_id)),
             // Retrieval-only shards (polar_only=true AND polar_chat=false)
             // still 409. Everything with polar_chat=true now supports
             // append via the polar advance path (Phase 4b).
@@ -347,9 +351,9 @@ pub(crate) async fn cache_append(
                     })),
                 ));
             }
-            Some(_) => {}
+            Some(e) => e.witness(),
         }
-    }
+    };
 
     let final_seq_len = if req.tokens.is_empty() {
         // Re-acquire briefly to read current seq_len for the response.
@@ -368,7 +372,7 @@ pub(crate) async fn cache_append(
         // Uses f32 cache when present, else polar.
         let (start_seq, max_seq) = {
             let pool = state.cache_pool.lock().await;
-            let e = pool.get(&req.cache_id).unwrap();
+            let e = relookup(&pool, &req.cache_id, witness)?;
             match (e.cache.as_ref(), e.polar.as_ref()) {
                 (Some(c), _) => (c.seq_len(), c.max_seq_len()),
                 (None, Some(p)) => (p.seq_len(), p.max_seq_len()),
@@ -420,15 +424,10 @@ pub(crate) async fn cache_append(
             // Hold the pool lock only across the GPU work for THIS chunk.
             // Between chunks the lock is released so /health can land.
             let mut pool = state.cache_pool.lock().await;
-            let entry = pool.get_mut(&req.cache_id).ok_or_else(|| (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": {
-                        "type": "cache_not_found",
-                        "message": format!("cache_id '{}' evicted mid-append", req.cache_id),
-                    }
-                })),
-            ))?;
+            // Review #9: evicted mid-append → 404; replaced by a same-id
+            // load mid-append → 409 (previously the remaining chunks were
+            // silently appended into the new entry).
+            let entry = relookup_mut(&mut pool, &req.cache_id, witness)?;
             let chunk_t0 = Instant::now();
             // Three modes:
             //  (cache=Some, polar_chat=false): legacy f32-only path.
@@ -450,7 +449,10 @@ pub(crate) async fn cache_append(
                 }
             });
             entry.tokens.extend_from_slice(chunk);
-            entry.version += 1;
+            entry.version = state.next_cache_version();
+            // Our own mutation: refresh the witness so the next chunk's
+            // relookup accepts it.
+            witness = entry.witness();
             // Invalidate polar only when this shard isn't polar-chat-tracked
             // (the existing path that nukes polar on every append). For
             // polar_chat shards, polar IS being kept in sync above.
@@ -507,18 +509,7 @@ pub(crate) async fn cache_get(
     Path(cache_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let pool = state.cache_pool.lock().await;
-    let entry = pool.get(&cache_id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": {
-                    "type": "cache_not_found",
-                    "message": format!("cache_id '{}' not found", cache_id),
-                    "cache_id": cache_id,
-                }
-            })),
-        )
-    })?;
+    let entry = pool.get(&cache_id).ok_or_else(|| crate::chat::cache_not_found_err(&cache_id))?;
 
     // seq_len from whichever storage the shard has. Polar-only shards
     // dropped the f32 cache but retain the polar one with the same seq_len.
@@ -554,16 +545,7 @@ pub(crate) async fn cache_delete(
         info!(cache_id = %cache_id, pool_size = pool_size, "cache evicted");
         Ok(StatusCode::NO_CONTENT)
     } else {
-        Err((
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": {
-                    "type": "cache_not_found",
-                    "message": format!("cache_id '{}' not found", cache_id),
-                    "cache_id": cache_id,
-                }
-            })),
-        ))
+        Err(crate::chat::cache_not_found_err(&cache_id))
     }
 }
 

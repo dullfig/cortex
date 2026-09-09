@@ -171,6 +171,47 @@ pub(crate) fn sampler_config_for(
     }
 }
 
+/// 404 for a shard id that is not (or no longer) in the pool.
+pub(crate) fn cache_not_found_err(id: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": {
+                "type": "cache_not_found",
+                "message": format!("cache_id '{id}' not found"),
+                "cache_id": id,
+            }
+        })),
+    )
+}
+
+/// Review #9: the shard was replaced (same-id `cache/load`) or mutated
+/// (`cache/append`, chat write-back) while this request was between two
+/// holds of the pool lock. The request cannot be completed against the
+/// entry it snapshotted; the client retries against the new state.
+pub(crate) fn cache_changed_err(
+    id: &str,
+    expected: crate::state::EntryWitness,
+    actual: crate::state::EntryWitness,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": {
+                "type": "cache_changed",
+                "message": format!(
+                    "shard '{id}' was replaced or mutated while the request was in flight \
+                     (version {} -> {}, tokens {} -> {}); retry",
+                    expected.version, actual.version, expected.tokens_len, actual.tokens_len,
+                ),
+                "cache_id": id,
+                "expected_version": expected.version,
+                "actual_version": actual.version,
+            }
+        })),
+    )
+}
+
 /// Review #5: a prompt that cannot fit the context window at all is a 400,
 /// not an `assert!("cache overflow")` inside the prefill.
 pub(crate) fn check_prompt_len(
@@ -957,28 +998,19 @@ pub(crate) async fn chat_completions(
         // snapshot the bits we need (name, version, tokens, length), and
         // build `shard_map`. After this block we drop the pool lock so the
         // long forward(s) below don't block other handlers.
-        let snapshot: Vec<(String, u64, Vec<u32>)>;
+        let snapshot: Vec<(String, crate::state::EntryWitness, Vec<u32>)>;
         let mut shard_map = ShardMap::new();
         let mut corpus_len = 0usize;
         {
             let pool = state.cache_pool.lock().await;
             for shard_name in &shards {
                 if !pool.contains_key(shard_name) {
-                    return Err((
-                        StatusCode::NOT_FOUND,
-                        Json(serde_json::json!({
-                            "error": {
-                                "type": "cache_not_found",
-                                "message": format!("shard '{}' not found", shard_name),
-                                "cache_id": shard_name,
-                            }
-                        })),
-                    ));
+                    return Err(cache_not_found_err(shard_name));
                 }
             }
             snapshot = shards.iter().map(|s| {
                 let e = pool.get(s).unwrap();
-                (s.clone(), e.version, e.tokens.clone())
+                (s.clone(), e.witness(), e.tokens.clone())
             }).collect();
             for (name, _, tokens) in &snapshot {
                 let start = corpus_len;
@@ -1016,7 +1048,10 @@ pub(crate) async fn chat_completions(
             // is fine here — trace forwards are ~250ms and other handlers
             // can wait. Composition is not touched on this path.
             let pool = state.cache_pool.lock().await;
-            let entry = pool.get(&shards[0]).unwrap();
+            // Review #9: the shard may have been deleted or replaced since
+            // the phase-1 snapshot (tokio's mutex is FIFO, so a queued
+            // DELETE lands exactly here) — 404/409, never unwrap.
+            let entry = crate::state::relookup(&pool, &shards[0], snapshot[0].1)?;
             // Polar fast path: when the entry has a polar cache populated
             // (server started with --enable-polar-cache), use the polar
             // trace forward; ~7x less KV VRAM read per token.
@@ -1086,7 +1121,7 @@ pub(crate) async fn chat_completions(
             // shards=[A,B] and shards=[B,A] are different keys (RoPE
             // positions depend on order).
             let key: Vec<(String, u64)> = snapshot.iter()
-                .map(|(s, v, _)| (s.clone(), *v))
+                .map(|(s, w, _)| (s.clone(), w.version))
                 .collect();
             let total_tokens_len: usize = snapshot.iter().map(|(_, _, t)| t.len()).sum();
             // Review #5: a composition that cannot fit the window (shard
@@ -1518,7 +1553,7 @@ pub(crate) async fn chat_completions(
             };
             entry.tokens.extend_from_slice(&prompt_tokens);
             entry.tokens.extend_from_slice(&generated);
-            entry.version += 1;
+            entry.version = state.next_cache_version();
             // Chat extends the f32 cache with prompt + generated K/V
             // (the f32 path) OR the polar cache (the polar_chat path).
             // For non-polar-chat shards, any polar snapshot is now
@@ -1588,7 +1623,7 @@ pub(crate) async fn chat_completions(
                 if let Some(entry) = pool.get_mut(last_shard) {
                     entry.tokens.extend_from_slice(&prompt_tokens);
                     entry.tokens.extend_from_slice(&generated);
-                    entry.version += 1;
+                    entry.version = state.next_cache_version();
                     // The polar snapshot of this shard is stale after the
                     // chat append (multi-shard path).
                     entry.polar = None;

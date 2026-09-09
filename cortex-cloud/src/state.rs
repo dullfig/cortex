@@ -2,6 +2,7 @@
 #![allow(unused_imports)]
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use axum::extract::{Path, State};
@@ -57,13 +58,63 @@ pub(crate) struct CacheEntry {
     /// Token history that built this cache. Stored so shards can be composed
     /// by replaying tokens in sequence (which gives correct RoPE positions).
     pub(crate) tokens: Vec<u32>,
-    /// Bumps any time the shard's K/V content changes (load replaces, append
-    /// extends). Used as the staleness witness for the multi-shard
-    /// retrieval `composition` cache below.
+    /// Changes any time the shard's K/V content changes (load replaces, append
+    /// extends, chat writes back). Drawn from `ServerState::next_cache_version`
+    /// so it is unique across the whole process lifetime — a DELETE followed
+    /// by a same-id load can never reproduce an earlier value. Used as the
+    /// staleness witness for the multi-shard `composition` cache and, via
+    /// `EntryWitness`, for every lock re-acquisition (review #9).
     pub(crate) version: u64,
     #[allow(dead_code)]
     pub(crate) created_at: Instant,
     pub(crate) last_used: Instant,
+}
+
+/// What a handler remembers about an entry across a gap in holding the
+/// pool lock. Review #9: after the lock is dropped and re-taken, the entry
+/// may be gone (`DELETE`), replaced (same-id `cache/load`) or mutated
+/// (`cache/append`, chat write-back); the witness lets `relookup` tell the
+/// difference instead of `unwrap()`ing a stale assumption.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EntryWitness {
+    pub(crate) version: u64,
+    pub(crate) tokens_len: usize,
+}
+
+impl CacheEntry {
+    pub(crate) fn witness(&self) -> EntryWitness {
+        EntryWitness { version: self.version, tokens_len: self.tokens.len() }
+    }
+}
+
+pub(crate) type CachePool = HashMap<String, CacheEntry>;
+
+/// Re-find `id` after a lock gap and check it is still the entry the caller
+/// snapshotted. 404 `cache_not_found` if it is gone, 409 `cache_changed` if
+/// it was replaced or mutated in the meantime.
+pub(crate) fn relookup<'a>(
+    pool: &'a CachePool,
+    id: &str,
+    expected: EntryWitness,
+) -> Result<&'a CacheEntry, (StatusCode, Json<serde_json::Value>)> {
+    match pool.get(id) {
+        None => Err(cache_not_found_err(id)),
+        Some(e) if e.witness() != expected => Err(cache_changed_err(id, expected, e.witness())),
+        Some(e) => Ok(e),
+    }
+}
+
+/// Mutable twin of [`relookup`].
+pub(crate) fn relookup_mut<'a>(
+    pool: &'a mut CachePool,
+    id: &str,
+    expected: EntryWitness,
+) -> Result<&'a mut CacheEntry, (StatusCode, Json<serde_json::Value>)> {
+    match pool.get_mut(id) {
+        None => Err(cache_not_found_err(id)),
+        Some(e) if e.witness() != expected => Err(cache_changed_err(id, expected, e.witness())),
+        Some(e) => Ok(e),
+    }
 }
 
 /// One composed-cache slot, reused across multi-shard retrieve requests so
@@ -92,6 +143,10 @@ pub(crate) struct ServerState {
     /// (librarian deployment). When false (32B Bob deployment), the pool
     /// is empty and cache_shards on requests are ignored.
     pub(crate) cache_pool: Mutex<HashMap<String, CacheEntry>>,
+    /// Source of `CacheEntry::version` values: a process-wide monotonic
+    /// counter, so no two entries (or two states of one entry) ever share a
+    /// version. See `EntryWitness`.
+    pub(crate) next_cache_version: AtomicU64,
     /// Single-slot composition cache for multi-shard retrieve. Holds at most
     /// one composed `GpuKvCache`; reused when the next request's
     /// `(shard, version)` key matches; rebuilt in place (clear + re-prefill,
@@ -133,5 +188,84 @@ pub(crate) struct ServerState {
     /// Prometheus telemetry. Recorded by chat_completions / cache_load /
     /// cache_append handlers; rendered via `GET /metrics`.
     pub(crate) metrics: Arc<crate::metrics::Metrics>,
+}
+
+impl ServerState {
+    /// Next unique `CacheEntry::version`. Starts at 1 so 0 never appears.
+    pub(crate) fn next_cache_version(&self) -> u64 {
+        self.next_cache_version.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
+
+#[cfg(test)]
+mod witness_tests {
+    use super::*;
+
+    fn entry(version: u64, n_tokens: usize) -> CacheEntry {
+        let now = Instant::now();
+        CacheEntry {
+            cache: None,
+            polar: None,
+            polar_chat: false,
+            tokens: vec![0; n_tokens],
+            version,
+            created_at: now,
+            last_used: now,
+        }
+    }
+
+    fn err_type(e: &(StatusCode, Json<serde_json::Value>)) -> (StatusCode, String) {
+        (e.0, e.1["error"]["type"].as_str().unwrap_or("").to_string())
+    }
+
+    #[test]
+    fn relookup_accepts_an_unchanged_entry() {
+        let mut pool = CachePool::new();
+        pool.insert("a".into(), entry(7, 10));
+        let w = pool["a"].witness();
+        assert!(relookup(&pool, "a", w).is_ok());
+        assert!(relookup_mut(&mut pool, "a", w).is_ok());
+    }
+
+    #[test]
+    fn relookup_404s_when_the_entry_was_deleted() {
+        let mut pool = CachePool::new();
+        pool.insert("a".into(), entry(7, 10));
+        let w = pool["a"].witness();
+        pool.remove("a");
+        let e = relookup(&pool, "a", w).err().unwrap();
+        assert_eq!(err_type(&e), (StatusCode::NOT_FOUND, "cache_not_found".into()));
+        let e = relookup_mut(&mut pool, "a", w).err().unwrap();
+        assert_eq!(err_type(&e), (StatusCode::NOT_FOUND, "cache_not_found".into()));
+    }
+
+    #[test]
+    fn relookup_409s_when_the_entry_was_replaced_or_mutated() {
+        let mut pool = CachePool::new();
+        pool.insert("a".into(), entry(7, 10));
+        let w = pool["a"].witness();
+        // Same-id reload: different version, same length.
+        pool.insert("a".into(), entry(8, 10));
+        let e = relookup(&pool, "a", w).err().unwrap();
+        assert_eq!(err_type(&e), (StatusCode::CONFLICT, "cache_changed".into()));
+        // Append that forgot to bump the version: same version, longer.
+        pool.insert("a".into(), entry(7, 11));
+        let e = relookup_mut(&mut pool, "a", w).err().unwrap();
+        assert_eq!(err_type(&e), (StatusCode::CONFLICT, "cache_changed".into()));
+    }
+
+    #[test]
+    fn a_refreshed_witness_tracks_the_callers_own_mutation() {
+        let mut pool = CachePool::new();
+        pool.insert("a".into(), entry(1, 10));
+        let mut w = pool["a"].witness();
+        {
+            let e = relookup_mut(&mut pool, "a", w).unwrap();
+            e.tokens.push(0);
+            e.version = 2;
+            w = e.witness();
+        }
+        assert!(relookup(&pool, "a", w).is_ok());
+    }
 }
 
