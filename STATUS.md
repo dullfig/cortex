@@ -18,7 +18,12 @@
 > the CPU-vs-GPU parity suite, which on its first run caught **#27 — every
 > `/v1/shims/embed` / gate-shim vector since 2026-05-29 was garbage**, #28
 > f32 traced forward on garbage, #29 untied-head models panic at init; all
-> three fixed. **Shim vectors produced before 2026-09-08 are invalid.**)
+> three fixed. **Shim vectors produced before 2026-09-08 are invalid.**
+> 2026-09-09: the P1 concurrency / cache-integrity cluster closed — #9
+> lock re-acquisition witnesses, #8/#20 `tokens`-vs-KV lockstep invariant,
+> #7 `gpu_gate` one-GPU-region-at-a-time admission (+ `cortex_gpu_gate_waiting`
+> gauge, the Stage-2 trigger), #12 traced-query bound, #30 reload flush.
+> 16 of 30 closed; open: GGUF hardening #13–#17, #18, #19, #21, #10, #23–#26.)
 > cortex is currently **PARKED as a stable inference substrate** — per the
 > integration pin `state_of_project_2026-07-24`, "cortex is the next *code*
 > phase, not the next *project* phase"; the project foreground is the
