@@ -400,6 +400,17 @@ impl GpuEngine {
             "cache overflow: {} + {} > {}",
             start_pos, n_tokens, cache.max_seq_len(),
         );
+        // Review #12: one unchunked traced forward — its BlockScratch must
+        // fit the lanes, the binding cap and the dispatch cap at this
+        // corpus length. The HTTP layer bounds the query with the same
+        // function (400); this is the engine backstop with a clear message.
+        let max_q = self.max_traced_query_tokens(start_pos, capture_layers.len(), false);
+        assert!(
+            n_tokens <= max_q,
+            "traced retrieve query too long: {n_tokens} tokens > {max_q} for a \
+             {start_pos}-token shard (lane B / storage binding / dispatch bound). \
+             Shorten the query or raise CORTEX_VRAM_HEAP_B_MB.",
+        );
 
         // ---- Embedding lookup (CPU) ----
         let embed_data = self.cpu.embedding_data();

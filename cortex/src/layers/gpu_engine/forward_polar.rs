@@ -101,40 +101,26 @@ impl GpuEngine {
         let n_heads = attn0.n_heads();
         let head_dim = attn0.head_dim();
         // The polar retrieve path is unchunked (unlike cache_load's f32
-        // prefill, which chunks via `safe_prefill_chunk_size`). Retrieve
-        // queries are normally short, so `scores`
-        // (n_tokens · n_heads · attn_max_seq · 4) stays small — but a long
-        // query against a large shard can exceed Lane B. Fail with a clear,
-        // actionable message instead of the opaque `OutOfMemory` the
-        // `PolarBlockScratch::allocate` `.expect` would otherwise emit.
-        let scores_bytes =
-            (n_tokens * n_heads * attn_max_seq * std::mem::size_of::<f32>()) as u64;
-        // Two independent ceilings: the Lane B heap, and the device's
-        // single-storage-binding limit (~2 GB) — scores is bound as ONE
-        // storage buffer, so it must fit the binding cap even when Lane B
-        // is sized larger (Phase M device-derived lanes can exceed 2 GB).
-        let lane_b = self.gpu.transient_heap_b.capacity();
-        let binding_max = self.gpu.device.limits().max_storage_buffer_binding_size as u64;
-        let ceiling = lane_b.min(binding_max);
-        assert!(
-            scores_bytes <= ceiling,
-            "polar retrieve scratch too large: scores need {scores_bytes} B but the \
-             ceiling is {ceiling} B (Lane B capacity {lane_b} B, max storage binding \
-             {binding_max} B) for {n_tokens} query tokens against a {start_pos}-token \
-             shard. Shorten the query or raise CORTEX_VRAM_HEAP_B_MB.",
-        );
-        // Review #4: this traced forward is unchunked, and softmax dispatches
-        // n_tokens·n_heads in one dimension against wgpu's 65535 cap. The
-        // handler bounds the query first; this is the engine-level backstop
-        // with a clear message instead of a driver validation error.
-        let wg_per_token =
-            super::scratch::max_workgroups_per_token(n_heads, head_dim, self.embed_dim);
-        let max_q = super::scratch::WGPU_MAX_WORKGROUPS_PER_DIM / wg_per_token;
+        // prefill, which chunks via `safe_prefill_chunk_size`), so the whole
+        // query must fit at once: the polar scratch on lanes A/B/C (scores
+        // grow as n_tokens · n_heads · attn_max_seq · 4 on Lane B and are
+        // bound as ONE storage buffer, so the binding cap applies too),
+        // wgpu's 65535 dispatch cap (review #4), and — review #12 — one
+        // `host_readback_heap` staging of `scores` bytes PER captured layer.
+        // Before #12 only a single layer was checked against Lane B and the
+        // stagings for four layers exhausted the readback heap (~245 query
+        // tokens against a 4096-token shard) with an opaque `.expect`
+        // panic. `max_traced_query_tokens` is the one formula both the HTTP
+        // layer (400) and this backstop use.
+        let max_q = self.max_traced_query_tokens(start_pos, capture_layers.len(), true);
         assert!(
             n_tokens <= max_q,
-            "polar retrieve query too long: {n_tokens} tokens > {max_q} \
-             (wgpu 65535 dispatch limit / {wg_per_token} workgroups per token). \
-             Shorten the query.",
+            "polar retrieve query too long: {n_tokens} tokens > {max_q} for a \
+             {start_pos}-token shard with {} captured layers (lane A/B/C, storage \
+             binding, wgpu dispatch and host readback heap bounds). Shorten the \
+             query, split the shard, or raise CORTEX_VRAM_HEAP_B_MB / \
+             CORTEX_VRAM_HEAP_READBACK_MB.",
+            capture_layers.len(),
         );
         let scratch = PolarBlockScratch::allocate(
             &self.gpu, n_tokens, self.embed_dim,

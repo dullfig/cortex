@@ -266,15 +266,21 @@ pub(crate) fn sync_lagging_caches(engine: &GpuEngine, entry: &mut crate::state::
     }
 }
 
-/// Review #8/#12: a retrieve query is a traced forward appended to the
-/// resident shard; `cache_seq + n_query` must fit that cache's window or
-/// the engine asserts ("cache overflow") mid-forward. The composition
-/// branch already had this bound; the single-shard branches did not.
+/// Review #8/#12: a retrieve query is ONE unchunked traced forward appended
+/// to the resident shard. Two bounds, both 400 `context_length_exceeded`:
+/// `cache_seq + n_query` must fit the cache's window (or the engine asserts
+/// "cache overflow"), and `n_query` must not exceed the engine's
+/// traced-forward bound for that corpus length — lane B (scores grow as
+/// n_query · (corpus + n_query)), the storage-binding cap, the dispatch
+/// cap and, for polar, `host_readback_heap` summed over the captured
+/// layers (`GpuEngine::max_traced_query_tokens`). Before #12 only one
+/// layer was bounded and long queries panicked the worker.
 pub(crate) fn check_retrieve_fits(
     shard: &str,
     cache_seq: usize,
     n_query: usize,
     cache_max_seq: usize,
+    traced_max: usize,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     if cache_seq + n_query > cache_max_seq {
         return Err((
@@ -290,6 +296,27 @@ pub(crate) fn check_retrieve_fits(
                     "shard_tokens": cache_seq,
                     "query_tokens": n_query,
                     "max_seq_len": cache_max_seq,
+                }
+            })),
+        ));
+    }
+    if n_query > traced_max {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "context_length_exceeded",
+                    "message": format!(
+                        "retrieve query of {n_query} tokens against shard '{shard}' ({cache_seq} tokens) \
+                         exceeds the traced-forward bound of {traced_max} tokens for a shard that size \
+                         (attention scores per captured layer must fit lane B, the storage-binding cap \
+                         and the host readback heap). Shorten the query, split the shard, or raise \
+                         CORTEX_VRAM_HEAP_B_MB / CORTEX_VRAM_HEAP_READBACK_MB."
+                    ),
+                    "cache_id": shard,
+                    "shard_tokens": cache_seq,
+                    "query_tokens": n_query,
+                    "max_query_tokens": traced_max,
                 }
             })),
         ));
@@ -1183,7 +1210,10 @@ pub(crate) async fn chat_completions(
             // trace forward; ~7x less KV VRAM read per token.
             if let Some(polar_ref) = entry.polar.as_ref() {
                 let cache_seq = polar_ref.seq_len();
-                check_retrieve_fits(&shards[0], cache_seq, n_query, polar_ref.max_seq_len())?;
+                check_retrieve_fits(
+                    &shards[0], cache_seq, n_query, polar_ref.max_seq_len(),
+                    state.engine.max_traced_query_tokens(cache_seq, capture_layers.len(), true),
+                )?;
                 info!(
                     shard = %shards[0],
                     corpus_tokens = corpus_len,
@@ -1225,7 +1255,10 @@ pub(crate) async fn chat_completions(
                 let cache_ref = entry.cache.as_ref()
                     .expect("shard with no polar must have f32 cache");
                 let cache_seq = cache_ref.seq_len();
-                check_retrieve_fits(&shards[0], cache_seq, n_query, cache_ref.max_seq_len())?;
+                check_retrieve_fits(
+                    &shards[0], cache_seq, n_query, cache_ref.max_seq_len(),
+                    state.engine.max_traced_query_tokens(cache_seq, capture_layers.len(), false),
+                )?;
                 info!(
                     shard = %shards[0],
                     corpus_tokens = corpus_len,
@@ -1307,6 +1340,12 @@ pub(crate) async fn chat_completions(
             let entry_ref = composition.as_ref().unwrap();
             let cache_ref = &entry_ref.cache;
             let cache_seq = cache_ref.seq_len();
+            // Review #12: the composed cache is an f32 traced forward too
+            // (the window bound above covers cache_seq + n_query).
+            check_retrieve_fits(
+                "composition", cache_seq, n_query, cache_ref.max_seq_len(),
+                state.engine.max_traced_query_tokens(cache_seq, capture_layers.len(), false),
+            )?;
             info!(
                 shards = ?shards,
                 composed_tokens = cache_seq,

@@ -322,7 +322,8 @@ impl BlockScratch {
 #[cfg(test)]
 mod chunk_size_tests {
     use super::{
-        max_workgroups_per_token, prefill_chunk_size, ChunkLimits, WGPU_MAX_WORKGROUPS_PER_DIM,
+        max_workgroups_per_token, polar_traced_query_max, prefill_chunk_size, ChunkLimits,
+        PolarTraceLimits, WGPU_MAX_WORKGROUPS_PER_DIM,
     };
 
     /// Qwen 2.5 3B dims with all lanes at the Phase L 128 MB default and
@@ -371,6 +372,73 @@ mod chunk_size_tests {
     /// True iff a chunk of `n` tokens at `start` violates no constraint —
     /// the three lanes, the single-binding cap, and (review #4) wgpu's
     /// 65535-per-dimension dispatch limit.
+    /// Qwen 2.5 3B dims with 12 GB-card lanes (A 512 MiB, B 1.2 GiB,
+    /// C 256 MiB), a 2 GiB binding cap and the default 256 MiB readback
+    /// heap, all already at the engine's 97 % slack.
+    fn qwen_polar_limits(n_capture_layers: usize) -> PolarTraceLimits {
+        PolarTraceLimits {
+            n_heads: 16,
+            n_kv_heads: 2,
+            head_dim: 128,
+            embed: 2048,
+            intermediate: 11008,
+            lane_a: (512u64 << 20) * 97 / 100,
+            lane_b: (1200u64 << 20) * 97 / 100,
+            lane_c: (256u64 << 20) * 97 / 100,
+            binding_max: 2u64 << 30,
+            readback: (256u64 << 20) * 97 / 100,
+            n_capture_layers,
+        }
+    }
+
+    /// Recompute every polar traced-forward constraint from first principles.
+    fn polar_fits(n: usize, start: usize, lim: &PolarTraceLimits) -> bool {
+        let hh = lim.n_heads * lim.head_dim;
+        let scores = (n * lim.n_heads * (start + n) * 4) as u64;
+        let a = (n * (lim.intermediate * 4 + lim.embed * 2 + hh * 4)) as u64;
+        let b = scores + (n * (lim.embed * 2 + lim.intermediate * 2 + hh * 2)) as u64;
+        let c = (n * (hh * 2 + lim.n_kv_heads * lim.head_dim * 4 + lim.embed * 2)) as u64;
+        let wg = max_workgroups_per_token(lim.n_heads, lim.head_dim, lim.embed);
+        a <= lim.lane_a
+            && b <= lim.lane_b
+            && scores <= lim.binding_max
+            && c <= lim.lane_c
+            && n * wg <= WGPU_MAX_WORKGROUPS_PER_DIM
+            && (lim.n_capture_layers as u64) * scores <= lim.readback
+    }
+
+    #[test]
+    fn polar_traced_bound_is_maximal_against_every_constraint() {
+        let lim = qwen_polar_limits(4);
+        for start in [0usize, 100, 1000, 4096, 8000, 30000] {
+            let n = polar_traced_query_max(start, &lim);
+            assert!(polar_fits(n, start, &lim), "start {start}: n={n} does not fit");
+            assert!(!polar_fits(n + 1, start, &lim), "start {start}: n={n} is not maximal");
+        }
+    }
+
+    #[test]
+    fn polar_traced_bound_is_readback_limited_at_the_memex_shape() {
+        // Review #12's arithmetic: 4 layers x n x 16 x (4096+n) x 4 B against
+        // 0.97 x 256 MiB -> n ~ 234 (the review said ~245 without slack).
+        let lim = qwen_polar_limits(4);
+        let n = polar_traced_query_max(4096, &lim);
+        assert!((220..=250).contains(&n), "n={n}");
+        // The readback term is the binding one: with the heap 4x larger the
+        // bound grows, with one captured layer it grows too.
+        let mut roomy = lim;
+        roomy.readback *= 4;
+        assert!(polar_traced_query_max(4096, &roomy) > n);
+        assert!(polar_traced_query_max(4096, &qwen_polar_limits(1)) > n);
+        // Monotone non-increasing in corpus length, never zero.
+        let mut prev = usize::MAX;
+        for start in (0..32768).step_by(1024) {
+            let cur = polar_traced_query_max(start, &lim);
+            assert!(cur >= 1 && cur <= prev, "start {start}: {cur} > {prev}");
+            prev = cur;
+        }
+    }
+
     fn fits_all(n: usize, start: usize, lim: &ChunkLimits) -> bool {
         lane_a_bytes(n, lim) <= lim.lane_a
             && lane_b_bytes(n, start, lim) <= lim.lane_b
@@ -555,4 +623,106 @@ impl GpuEngine {
             / max_workgroups_per_token(attn0.n_heads(), attn0.head_dim(), self.embed_dim()))
         .max(1)
     }
+
+    /// Review #12: largest retrieve query (in tokens) that ONE unchunked
+    /// traced forward can run against a `corpus_len`-token shard while
+    /// capturing `n_capture_layers` layers of pre-softmax scores.
+    ///
+    /// * `polar = false` (`forward_full_gpu_with_cache_traced`): the forward
+    ///   allocates one f32 `BlockScratch` at `start_pos = corpus_len` and
+    ///   raw staging buffers, so the bound is exactly a prefill chunk's —
+    ///   [`Self::safe_prefill_chunk_size`].
+    /// * `polar = true` (`forward_full_gpu_polar_traced`): the polar
+    ///   scratch layout plus one `host_readback_heap` staging of
+    ///   `n·n_heads·(corpus+n)·4` bytes PER captured layer —
+    ///   [`polar_traced_query_max`]. Before #12 the engine bounded a single
+    ///   layer's scores against lane B only; the stagings for four layers
+    ///   exhausted the 256 MiB readback heap at ~245 query tokens against a
+    ///   4096-token shard and panicked the worker.
+    ///
+    /// The HTTP layer converts this to `400 context_length_exceeded`; the
+    /// traced forwards assert against the same number as a backstop. The
+    /// polar bound is computed from lane *capacity* (pure geometry) because
+    /// the engine's assert runs after `hidden_buf` is already resident on
+    /// Lane A — both sides must agree on one number.
+    pub fn max_traced_query_tokens(
+        &self,
+        corpus_len: usize,
+        n_capture_layers: usize,
+        polar: bool,
+    ) -> usize {
+        if !polar {
+            return self.safe_prefill_chunk_size(corpus_len);
+        }
+        let attn0 = self.cpu.blocks()[0].attention();
+        let embed = self.embed_dim();
+        let intermediate = self.cpu.blocks()[0]
+            .ffn()
+            .as_any()
+            .downcast_ref::<crate::layers::swiglu::SwiGLU>()
+            .map(|f| f.intermediate_size())
+            .unwrap_or(embed * 4);
+        let lim = PolarTraceLimits {
+            n_heads: attn0.n_heads(),
+            n_kv_heads: attn0.n_kv_heads(),
+            head_dim: attn0.head_dim(),
+            embed,
+            intermediate,
+            lane_a: self.gpu.transient_heap_a.capacity() * 97 / 100,
+            lane_b: self.gpu.transient_heap_b.capacity() * 97 / 100,
+            lane_c: self.gpu.transient_heap_c.capacity() * 97 / 100,
+            binding_max: self.gpu.device.limits().max_storage_buffer_binding_size as u64,
+            readback: self.gpu.host_readback_heap.capacity() * 97 / 100,
+            n_capture_layers,
+        };
+        polar_traced_query_max(corpus_len, &lim)
+    }
+}
+
+/// Review #12: lane / heap geometry of one unchunked polar traced forward
+/// (`forward_full_gpu_polar_traced`). Mirrors `PolarBlockScratch::allocate`
+/// plus that function's own per-call buffers (packed hidden and `rotated`
+/// on Lane A; one readback staging per captured layer). Keep in sync.
+#[derive(Clone, Copy, Debug)]
+pub struct PolarTraceLimits {
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub embed: usize,
+    pub intermediate: usize,
+    pub lane_a: u64,
+    pub lane_b: u64,
+    pub lane_c: u64,
+    pub binding_max: u64,
+    /// `host_readback_heap` bytes available to the score stagings.
+    pub readback: u64,
+    pub n_capture_layers: usize,
+}
+
+/// Largest query length `n` whose polar traced forward fits every
+/// constraint at corpus length `start_pos` (scores = `n·n_heads·(start+n)·4`):
+/// - Lane A, linear: gate + up (`inter·2` each), packed hidden (`embed·2`),
+///   rotated (`n_heads·head_dim·4`);
+/// - Lane B: normed (`embed·2`) + activated (`inter·2`) + attn_out
+///   (`n_heads·head_dim·2`) linear, plus scores;
+/// - storage-binding cap: scores alone (bound as one buffer);
+/// - Lane C, linear: q + k + v + projected (same as the f32 layout);
+/// - dispatch: `n ≤ 65535 / max_workgroups_per_token`;
+/// - readback: `n_capture_layers · scores ≤ readback`.
+pub fn polar_traced_query_max(start_pos: usize, lim: &PolarTraceLimits) -> usize {
+    let hh = lim.n_heads * lim.head_dim;
+    let n_b = scores_quad_max_n(
+        start_pos, lim.n_heads, lim.embed * 2 + lim.intermediate * 2 + hh * 2, lim.lane_b,
+    );
+    let n_bind = scores_quad_max_n(start_pos, lim.n_heads, 0, lim.binding_max);
+    let ca = (lim.intermediate * 4 + lim.embed * 2 + hh * 4) as u64;
+    let n_a = (lim.lane_a / ca).max(1) as usize;
+    let cc = (hh * 2 + lim.n_kv_heads * lim.head_dim * 4 + lim.embed * 2) as u64;
+    let n_c = (lim.lane_c / cc).max(1) as usize;
+    let n_dispatch = (WGPU_MAX_WORKGROUPS_PER_DIM
+        / max_workgroups_per_token(lim.n_heads, lim.head_dim, lim.embed))
+    .max(1);
+    let per_layer = lim.readback / lim.n_capture_layers.max(1) as u64;
+    let n_rb = scores_quad_max_n(start_pos, lim.n_heads, 0, per_layer);
+    n_b.min(n_bind).min(n_a).min(n_c).min(n_dispatch).min(n_rb).max(1)
 }
