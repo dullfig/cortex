@@ -1,6 +1,6 @@
 # Cortex Roadmap — Stages
 
-**Date:** 2026-08-09
+**Date:** 2026-08-09 (defect line updated 2026-09-08)
 **Status:** Living document. Replaces the 2026-05-18 CubeCL-oriented roadmap
 (archived in git history) — the CubeCL migration it planned was **never
 taken**; the engine substrate was rebuilt with `vram-heap` + `device-probe`
@@ -89,9 +89,12 @@ dead end for recall.
 - **Memex foundation experiment** — synopsis/grep step-1 bake-off on the
   52-query holdout + no-answer adversarial queries; validate generation-as-
   index on Qwen-2.5-3B-Instruct before building machinery.
-- **DEFECT to fix here:** large one-shot `cache/load` (~6K tokens) panics on
-  wgpu's 65535 workgroup-dim limit (memex report, STATUS §4). Chunk the
-  prefill dispatch + structured error + verify heap-free-on-failure.
+- ~~**DEFECT to fix here:** large one-shot `cache/load` (~6K tokens) panics on
+  wgpu's 65535 workgroup-dim limit~~ **FIXED 2026-09-07, commit 5744f51**
+  (dispatch-dimension constraint in the prefill chunker; unchunked forwards
+  bounded → 400; heap-free-on-failure verified). See STATUS §4 and
+  `docs/adversarial-review-2026-09-02.md` (#4, plus #1/#2/#3/#5/#6/#11
+  closed in the same pass; #22 parity suite and #7/#8 concurrency next).
 - Move retrieval (bidirectional attention) + HierarchicalCache +
   consolidation from engram; `project_qk()` on TransformerModel.
 

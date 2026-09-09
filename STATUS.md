@@ -1,6 +1,6 @@
 # cortex — Status Board
 
-**Last updated:** 2026-08-09
+**Last updated:** 2026-09-08
 
 > **Milestone banner (read first).** cortex is now a **float-only,
 > Qwen-class GPU transformer inference substrate** (Q4_K_M / F16 / BF16 /
@@ -10,18 +10,21 @@
 > that older docs describe are **gone from this repo.**
 >
 > **GPU-substrate milestone reached 2026-06-13** (secure deploy path,
-> Phase Q); most recent code landing is **device-probe consumption
-> 2026-06-25**. cortex is currently **PARKED as a stable inference
-> substrate** — per the integration pin `state_of_project_2026-07-24`,
-> "cortex is the next *code* phase, not the next *project* phase"; the
-> project foreground is the mission/corpus track, which needs zero cortex.
-> Nothing here is broken-and-blocking except the one defect called out in
-> §4 (large one-shot `cache/load`).
+> Phase Q); most recent code landing is the **adversarial-review hardening
+> pass 2026-09-04..07** (`docs/adversarial-review-2026-09-02.md`: 26
+> findings; all five P0s + two P1s closed in commits b2dfeb2, ed7790c,
+> 5744f51 — request data is validated at the HTTP boundary, the prefill
+> chunker knows wgpu's 65535 dispatch cap, cache allocation is fallible).
+> cortex is currently **PARKED as a stable inference substrate** — per the
+> integration pin `state_of_project_2026-07-24`, "cortex is the next *code*
+> phase, not the next *project* phase"; the project foreground is the
+> mission/corpus track, which needs zero cortex. Nothing here is
+> broken-and-blocking; the memex one-shot `cache/load` defect (§4) is fixed.
 
 ## Branch & working-tree state
 
 - **Active branch: `wgpu-29`** — carries the entire post-BitNet GPU
-  substrate. **128 commits ahead of `origin/main`, 0 behind** — *not yet
+  substrate. **136 commits ahead of `origin/main`, 0 behind** — *not yet
   merged to main.* Treat `wgpu-29` as the de-facto trunk for cortex code.
 - **Working tree: clean** (keep/discard resolved 2026-08-09). The 4-day-old
   dirty tree was cleared:
@@ -158,15 +161,27 @@ not what design docs claim. The `[?]` rows are the antidote rows.
   not attention-readout — don't build assuming high retrieve recall. See
   memory pins `project_retrieval_method_bottleneck`, `_retrieval_heads_overfit`,
   `_memex_architecture_direction`.
-- [ ] **DEFECT — large one-shot `cache/load` panics wgpu** (memex-claude
-  report, `MESSAGE-FROM-MEMEX.md` Addendum 2026-07-15). A single load of
-  ~6K tokens dispatches a workgroup grid dim > wgpu's 65535 limit (~11
-  groups/token × 5988 → 66848) → `Validation Error`, panics a tokio worker.
-  Incremental `cache/append` never hits it. Memex shipped a workaround
-  (replay via append in 1K batches). **cortex fix owed:** internally chunk
-  the prefill dispatch over the 65535 limit + return a structured error
-  instead of panicking; also verify the failed-load path frees `gpu_kv.heap`
-  (possible leak toward BudgetExceeded on repeated failures).
+- [x] **FIXED 2026-09-07 (commit 5744f51) — large one-shot `cache/load`
+  panicked wgpu** (memex-claude report, `MESSAGE-FROM-MEMEX.md` Addendum
+  2026-07-15; reply 2026-09-04). Root cause: the prefill chunker modelled
+  bytes only; softmax dispatches `n_tokens · n_heads` in one dimension
+  (16 × 4178 = 66848 > 65535). `prefill_chunk_size` now carries the
+  dispatch-dimension constraint (Qwen 3B chunks ≤ 4095), the few unchunked
+  forwards (shim hidden-capture, traced retrieve query, polar chat prompt)
+  are bounded and return `400 context_length_exceeded`, and the stateless /
+  streaming / composition prefills go through the chunker. Verified live:
+  6000 tokens in one `cache/load` → 201, `seq_len 6004`. Heap-leak concern
+  checked: RAII frees on unwind, nothing accumulates. Companion fixes from
+  the same review (b2dfeb2, ed7790c): `max_tokens` clamped to shard room,
+  control-token forgery blocked in the chat template, temperature floor +
+  NaN-safe sampler, fallible cache alloc (`503 vram_exhausted`), pool cap
+  (`--max-cache-shards`, `507 cache_pool_full`), token-id validation.
+- [ ] **Open from the review** (`docs/adversarial-review-2026-09-02.md`):
+  #22 dead parity test suite (`gpu_engine/tests.rs` under `#[cfg(any())]`),
+  #7 lane race / false "serialized by the pool mutex" invariant, #8
+  `entry.tokens` vs resident-cache drift, #9 TOCTOU unwraps, #12 readback
+  heap on long polar queries, #13–#17 GGUF hardening, #18 `rope.scaling.type`
+  read as u32, #10 O(n²) BPE.
 - [ ] `cortex_local::CortexLocal::complete()` over `GpuEngine` — still uses
   the slow CPU `model.generate()` path; needs the GPU-engine wrapping.
 - [?] Per-request sampling override beyond temperature (top-k/top-p/rep) —
