@@ -212,6 +212,91 @@ pub(crate) fn cache_changed_err(
     )
 }
 
+/// Review #8: a resident shard whose `tokens` and KV caches disagree cannot
+/// be scored or appended safely (out-of-bounds rows or silent mis-scoring).
+/// The client resolves it by DELETE + reload.
+pub(crate) fn cache_desynced_err(
+    id: &str,
+    l: crate::state::LockstepError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": {
+                "type": "cache_desynced",
+                "message": format!(
+                    "shard '{id}' tokens ({}) disagree with its resident KV (f32 {:?}, polar {:?}); \
+                     DELETE /v1/cache/{id} and reload it",
+                    l.tokens_len, l.f32_len, l.polar_len,
+                ),
+                "cache_id": id,
+                "tokens": l.tokens_len,
+                "f32_seq_len": l.f32_len,
+                "polar_seq_len": l.polar_len,
+            }
+        })),
+    )
+}
+
+/// Review #8: after a chat turn drove ONE resident cache (f32 or polar),
+/// advance whichever other cache the shard still holds over the same
+/// tokens, so `entry.tokens` describes every cache (`check_lockstep`).
+/// Uses the same advance-only forwards `cache_append` uses; chunked by
+/// the lane/dispatch limits. Both caches were sized with the same
+/// `--max-seq-len`, so a token range that fit the driving cache fits the
+/// lagging one.
+pub(crate) fn sync_lagging_caches(engine: &GpuEngine, entry: &mut crate::state::CacheEntry) {
+    let target = entry.tokens.len();
+    if let Some(c) = entry.cache.as_mut() {
+        let have = c.seq_len();
+        if have < target {
+            debug_assert!(target <= c.max_seq_len(), "f32 cache cannot absorb the chat turn");
+            forward_chunked_into_cache(engine, &entry.tokens[have..], c, |_, _, _, _| {});
+        }
+    }
+    if let Some(p) = entry.polar.as_mut() {
+        let mut have = p.seq_len();
+        debug_assert!(target <= p.max_seq_len(), "polar cache cannot absorb the chat turn");
+        while have < target {
+            let n = engine.safe_prefill_chunk_size(have).min(target - have).max(1);
+            engine.forward_full_gpu_polar_with_cache_advance_only(&entry.tokens[have..have + n], p);
+            have += n;
+        }
+        debug_assert_eq!(p.seq_len(), target);
+    }
+}
+
+/// Review #8/#12: a retrieve query is a traced forward appended to the
+/// resident shard; `cache_seq + n_query` must fit that cache's window or
+/// the engine asserts ("cache overflow") mid-forward. The composition
+/// branch already had this bound; the single-shard branches did not.
+pub(crate) fn check_retrieve_fits(
+    shard: &str,
+    cache_seq: usize,
+    n_query: usize,
+    cache_max_seq: usize,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if cache_seq + n_query > cache_max_seq {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "context_length_exceeded",
+                    "message": format!(
+                        "retrieve query of {n_query} tokens against shard '{shard}' ({cache_seq} tokens) \
+                         exceeds its {cache_max_seq}-token window (--max-seq-len)"
+                    ),
+                    "cache_id": shard,
+                    "shard_tokens": cache_seq,
+                    "query_tokens": n_query,
+                    "max_seq_len": cache_max_seq,
+                }
+            })),
+        ));
+    }
+    Ok(())
+}
+
 /// Review #5: a prompt that cannot fit the context window at all is a 400,
 /// not an `assert!("cache overflow")` inside the prefill.
 pub(crate) fn check_prompt_len(
@@ -412,6 +497,7 @@ pub(crate) fn generate_with_cache(
     }
     out.push(next_token);
 
+    let mut ended_by_eos = false;
     for _ in 1..max_tokens {
         // Review #1: never let decode reach the engine's cache-overflow
         // assert. When the cache is full, stop with finish="length"
@@ -434,10 +520,25 @@ pub(crate) fn generate_with_cache(
             sampler.sample(&logits)
         };
         if next_token == eos {
+            ended_by_eos = true;
             break;
         }
         out.push(next_token);
     }
+    // Review #8: a token is pushed when sampled but only enters the cache
+    // on the NEXT iteration's forward, so on a max_tokens / full-cache exit
+    // the last token of `out` was never forwarded (EOS exits are fine: the
+    // token that produced EOS was). Forward it if there is room, else drop
+    // it, so the post-condition `cache.seq_len() == n_prompt + out.len()`
+    // holds and callers can extend `entry.tokens` by exactly `out`.
+    if !ended_by_eos && !out.is_empty() {
+        if cache.seq_len() < cache.max_seq_len() {
+            engine.forward_full_gpu_with_cache_advance_only(&out[out.len() - 1..], cache);
+        } else {
+            out.pop();
+        }
+    }
+    debug_assert_eq!(cache.seq_len(), n + out.len(), "generate_with_cache post-condition");
     out
 }
 
@@ -468,12 +569,14 @@ pub(crate) fn generate_with_polar_cache(
         prompt_tokens, polar_cache, &[],
     )?;
 
+    let n_prompt = prompt_tokens.len();
     let mut out: Vec<u32> = Vec::new();
     if next_token == eos {
         return Some(out);
     }
     out.push(next_token);
 
+    let mut ended_by_eos = false;
     for _ in 1..max_tokens {
         // Review #1: same graceful length-stop as the f32 loop.
         if polar_cache.seq_len() >= polar_cache.max_seq_len() {
@@ -483,10 +586,20 @@ pub(crate) fn generate_with_polar_cache(
             &[next_token], polar_cache, &[],
         )?;
         if next_token == eos {
+            ended_by_eos = true;
             break;
         }
         out.push(next_token);
     }
+    // Review #8: same trailing-token rule as generate_with_cache — see there.
+    if !ended_by_eos && !out.is_empty() {
+        if polar_cache.seq_len() < polar_cache.max_seq_len() {
+            engine.forward_full_gpu_polar_with_cache_advance_only(&out[out.len() - 1..], polar_cache);
+        } else {
+            out.pop();
+        }
+    }
+    debug_assert_eq!(polar_cache.seq_len(), n_prompt + out.len(), "generate_with_polar_cache post-condition");
     Some(out)
 }
 
@@ -1008,10 +1121,17 @@ pub(crate) async fn chat_completions(
                     return Err(cache_not_found_err(shard_name));
                 }
             }
-            snapshot = shards.iter().map(|s| {
-                let e = pool.get(s).unwrap();
-                (s.clone(), e.witness(), e.tokens.clone())
-            }).collect();
+            let mut snap = Vec::with_capacity(shards.len());
+            for s in &shards {
+                let e = pool.get(s).unwrap(); // existence checked just above, same lock hold
+                // Review #8: a desynced shard cannot be scored (its score
+                // rows are sized by the cache, its corpus by `tokens`).
+                if let Err(l) = e.check_lockstep() {
+                    return Err(cache_desynced_err(s, l));
+                }
+                snap.push((s.clone(), e.witness(), e.tokens.clone()));
+            }
+            snapshot = snap;
             for (name, _, tokens) in &snapshot {
                 let start = corpus_len;
                 corpus_len += tokens.len();
@@ -1057,6 +1177,7 @@ pub(crate) async fn chat_completions(
             // trace forward; ~7x less KV VRAM read per token.
             if let Some(polar_ref) = entry.polar.as_ref() {
                 let cache_seq = polar_ref.seq_len();
+                check_retrieve_fits(&shards[0], cache_seq, n_query, polar_ref.max_seq_len())?;
                 info!(
                     shard = %shards[0],
                     corpus_tokens = corpus_len,
@@ -1098,6 +1219,7 @@ pub(crate) async fn chat_completions(
                 let cache_ref = entry.cache.as_ref()
                     .expect("shard with no polar must have f32 cache");
                 let cache_seq = cache_ref.seq_len();
+                check_retrieve_fits(&shards[0], cache_seq, n_query, cache_ref.max_seq_len())?;
                 info!(
                     shard = %shards[0],
                     corpus_tokens = corpus_len,
@@ -1198,6 +1320,18 @@ pub(crate) async fn chat_completions(
             });
             (q, b, cache_seq)
         };
+
+        // Review #8: every scoring loop below runs `k in 0..corpus_len`
+        // over rows of width `cache_seq + n_q`. The phase-1 lockstep check
+        // plus the phase-2 witness make `corpus_len == cache_seq` by
+        // construction (composition: by replay); this is the backstop that
+        // keeps a future drift a 409 rather than an out-of-bounds index.
+        if cache_seq != corpus_len {
+            return Err(cache_desynced_err(
+                &shards.join("+"),
+                crate::state::LockstepError { tokens_len: corpus_len, f32_len: Some(cache_seq), polar_len: None },
+            ));
+        }
 
         let attn_max_seq = cache_seq + n_query;
         let baseline_attn_max = cache_seq + baseline_tokens.len();
@@ -1562,6 +1696,12 @@ pub(crate) async fn chat_completions(
             if !entry.polar_chat {
                 entry.polar = None;
             }
+            // Review #8: the turn drove one cache; bring the other one the
+            // shard still holds (f32 after a polar turn, polar after the
+            // non-greedy f32 fallback) up to `tokens`, so the next turn,
+            // append or retrieve sees one consistent shard.
+            tokio::task::block_in_place(|| sync_lagging_caches(&state.engine, entry));
+            debug_assert!(entry.check_lockstep().is_ok(), "single-shard chat left {:?}", entry.check_lockstep());
             entry.last_used = Instant::now();
             let len = generated.len() as u32;
             (generated, len)
@@ -1619,15 +1759,33 @@ pub(crate) async fn chat_completions(
             // Update the LAST shard with the new tokens (the user's shard
             // is conventionally the last in the list). The shared shards
             // don't change.
+            //
+            // Review #8: the composed cache is throwaway, so the turn must
+            // also be advanced into the last shard's RESIDENT f32 cache —
+            // at that shard's own positions, i.e. the shard afterwards
+            // reads "last shard + prompt + reply", a self-consistent
+            // single-shard state — or `tokens` would describe K/V the
+            // shard does not hold and the next retrieve against it would
+            // index past its score rows. A polar-only last shard has no
+            // f32 cache to absorb the turn; it is left untouched.
             if let Some(last_shard) = shards.last() {
                 if let Some(entry) = pool.get_mut(last_shard) {
-                    entry.tokens.extend_from_slice(&prompt_tokens);
-                    entry.tokens.extend_from_slice(&generated);
-                    entry.version = state.next_cache_version();
-                    // The polar snapshot of this shard is stale after the
-                    // chat append (multi-shard path).
-                    entry.polar = None;
-                    entry.last_used = Instant::now();
+                    if entry.cache.is_some() {
+                        entry.tokens.extend_from_slice(&prompt_tokens);
+                        entry.tokens.extend_from_slice(&generated);
+                        entry.version = state.next_cache_version();
+                        // The polar snapshot of this shard is stale after the
+                        // chat append (multi-shard path).
+                        entry.polar = None;
+                        tokio::task::block_in_place(|| sync_lagging_caches(&state.engine, entry));
+                        debug_assert!(entry.check_lockstep().is_ok(), "multi-shard chat left {:?}", entry.check_lockstep());
+                        entry.last_used = Instant::now();
+                    } else {
+                        tracing::warn!(
+                            shard = %last_shard,
+                            "multi-shard chat: last shard is polar-only; the turn was not written back to it",
+                        );
+                    }
                 }
             }
 

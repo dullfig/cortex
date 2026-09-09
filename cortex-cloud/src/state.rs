@@ -85,6 +85,36 @@ impl CacheEntry {
     pub(crate) fn witness(&self) -> EntryWitness {
         EntryWitness { version: self.version, tokens_len: self.tokens.len() }
     }
+
+    /// Review #8 — THE invariant of a resident shard: `tokens` describes
+    /// exactly what every resident cache holds, i.e.
+    /// `tokens.len() == cache.seq_len() == polar.seq_len()` for whichever
+    /// caches are present (sink tokens are counted on both sides — they are
+    /// prepended into `tokens` at load and prefilled). Retrieve derives its
+    /// score-row width from the cache and its corpus width from `tokens`;
+    /// any drift is either silent mis-scoring or an out-of-bounds index.
+    /// Every mutation path must leave this true; `check_lockstep` is the
+    /// runtime backstop that turns a wedged entry into a 409 instead.
+    pub(crate) fn check_lockstep(&self) -> Result<(), LockstepError> {
+        let tokens_len = self.tokens.len();
+        let f32_len = self.cache.as_ref().map(|c| c.seq_len());
+        let polar_len = self.polar.as_ref().map(|p| p.seq_len());
+        let ok = f32_len.map_or(true, |l| l == tokens_len)
+            && polar_len.map_or(true, |l| l == tokens_len);
+        if ok {
+            Ok(())
+        } else {
+            Err(LockstepError { tokens_len, f32_len, polar_len })
+        }
+    }
+}
+
+/// What `CacheEntry::check_lockstep` found when the invariant is broken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LockstepError {
+    pub(crate) tokens_len: usize,
+    pub(crate) f32_len: Option<usize>,
+    pub(crate) polar_len: Option<usize>,
 }
 
 pub(crate) type CachePool = HashMap<String, CacheEntry>;
@@ -252,6 +282,14 @@ mod witness_tests {
         pool.insert("a".into(), entry(7, 11));
         let e = relookup_mut(&mut pool, "a", w).err().unwrap();
         assert_eq!(err_type(&e), (StatusCode::CONFLICT, "cache_changed".into()));
+    }
+
+    #[test]
+    fn lockstep_holds_vacuously_without_resident_caches() {
+        // cache: None, polar: None is the only shape constructible without a
+        // GPU; the invariant is vacuous there. The populated shapes are
+        // covered end-to-end (e2e_lockstep.py).
+        assert!(entry(1, 10).check_lockstep().is_ok());
     }
 
     #[test]

@@ -351,7 +351,14 @@ pub(crate) async fn cache_append(
                     })),
                 ));
             }
-            Some(e) => e.witness(),
+            Some(e) => {
+                // Review #8: refuse to extend a shard whose tokens and KV
+                // already disagree — appending would only deepen the drift.
+                if let Err(l) = e.check_lockstep() {
+                    return Err(crate::chat::cache_desynced_err(&req.cache_id, l));
+                }
+                e.witness()
+            }
         }
     };
 
@@ -373,7 +380,12 @@ pub(crate) async fn cache_append(
         let (start_seq, max_seq) = {
             let pool = state.cache_pool.lock().await;
             let e = relookup(&pool, &req.cache_id, witness)?;
+            // Review #20: when both caches are present the append advances
+            // BOTH, so the overflow bound is the tighter of the two —
+            // otherwise the polar advance could assert after the f32 cache
+            // had already moved, leaving the shard desynced.
             match (e.cache.as_ref(), e.polar.as_ref()) {
+                (Some(c), Some(p)) if e.polar_chat => (c.seq_len(), c.max_seq_len().min(p.max_seq_len())),
                 (Some(c), _) => (c.seq_len(), c.max_seq_len()),
                 (None, Some(p)) => (p.seq_len(), p.max_seq_len()),
                 (None, None) => unreachable!("entry validated to have at least one cache above"),
@@ -459,6 +471,7 @@ pub(crate) async fn cache_append(
             if !entry.polar_chat {
                 entry.polar = None;
             }
+            debug_assert!(entry.check_lockstep().is_ok(), "cache_append chunk left {:?}", entry.check_lockstep());
             entry.last_used = Instant::now();
             current_start = match (entry.cache.as_ref(), entry.polar.as_ref()) {
                 (Some(c), _) => c.seq_len(),
