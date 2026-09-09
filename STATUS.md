@@ -11,10 +11,14 @@
 >
 > **GPU-substrate milestone reached 2026-06-13** (secure deploy path,
 > Phase Q); most recent code landing is the **adversarial-review hardening
-> pass 2026-09-04..07** (`docs/adversarial-review-2026-09-02.md`: 26
-> findings; all five P0s + two P1s closed in commits b2dfeb2, ed7790c,
-> 5744f51 — request data is validated at the HTTP boundary, the prefill
-> chunker knows wgpu's 65535 dispatch cap, cache allocation is fallible).
+> pass 2026-09-04..08** (`docs/adversarial-review-2026-09-02.md`: 29
+> findings; all five P0s + P1 #6/#11 closed in b2dfeb2, ed7790c, 5744f51 —
+> request data is validated at the HTTP boundary, the prefill chunker knows
+> wgpu's 65535 dispatch cap, cache allocation is fallible; then #22 revived
+> the CPU-vs-GPU parity suite, which on its first run caught **#27 — every
+> `/v1/shims/embed` / gate-shim vector since 2026-05-29 was garbage**, #28
+> f32 traced forward on garbage, #29 untied-head models panic at init; all
+> three fixed. **Shim vectors produced before 2026-09-08 are invalid.**)
 > cortex is currently **PARKED as a stable inference substrate** — per the
 > integration pin `state_of_project_2026-07-24`, "cortex is the next *code*
 > phase, not the next *project* phase"; the project foreground is the

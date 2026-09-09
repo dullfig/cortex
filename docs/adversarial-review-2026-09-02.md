@@ -15,8 +15,9 @@ exact root site, and matched the reported number precisely:
 chunk; 16 × 4178 = 66848** — the value memex logged. It then found the bug
 is a *class* (13 sites) and two things the report did not cover.
 
-**Fix status (2026-09-08).** 7 of 26 closed, all five P0s among them.
-Rows below carry a `✅ CLOSED <commit>` marker.
+**Fix status (2026-09-08).** 11 of 29 closed (three findings were added
+by the revived parity suite, see below), all five P0s among them. Rows
+below carry a `✅ CLOSED <commit>` marker.
 
 | Commit | Closes | What landed |
 |---|---|---|
@@ -24,8 +25,24 @@ Rows below carry a `✅ CLOSED <commit>` marker.
 | `ed7790c` | #3, #5, #6, #11 | Temperature floor + NaN-safe sampler (`total_cmp`, argmax fallback); every prefill routed through the chunker (stateless, streaming, composition, inject); `GpuKvCache::try_new` → `503 vram_exhausted`; `--max-cache-shards` → `507 cache_pool_full`; token ids validated (`400 invalid_token_id`). |
 | `5744f51` | #4 | `WGPU_MAX_WORKGROUPS_PER_DIM` / `max_workgroups_per_token` in the chunker; `max_single_dispatch_tokens()` bounds the unchunked shim / retrieve / polar paths; engine-level assert as backstop. Live: 6000-token one-shot `cache/load` → 201. |
 
-Still open, in suggested order: #22 (dead parity suite), #7 + #8
-(concurrency / cache-drift pair), #9, #12, #13–#17 (GGUF), #18, #19, #10.
+| revive-parity (2026-09-08) | #22, **#27, #28, #29** | `gpu_engine/tests.rs` un-gated: 6 binding-signature fixes, 3 fixtures repacked to f16. First run surfaced three engine bugs (below), all fixed in the same commit. |
+
+Still open, in suggested order: #7 + #8 (concurrency / cache-drift pair),
+#9, #12, #13–#17 (GGUF), #18, #19, #10.
+
+### Found by the revived parity suite (2026-09-08)
+
+The review's root cause #5 predicted these. Root cause #2 for all three is
+the C3 packed residual stream (920e8be, 2026-05-29): every entry point that
+hand-builds `hidden_buf` must pack it, and two never did. Two sibling
+instances had been found by hand in June (f5b55a2 polar traced, 7d63396
+`advance_only`); the pattern was never audited across the file.
+
+| # | Finding | Site | Label |
+|---|---|---|---|
+| 27 | ✅ CLOSED revive-parity — **`/v1/shims/embed`, `/v1/shims/infer` and the gate shims returned garbage for 3 months.** `forward_full_gpu_with_hidden_capture` uploaded the embedding as raw f32 into a block that reads packed f16 (garbage in), sized captures/normed ×4 and read them back as f32 while the block wrote packed (garbage out: the last token's hidden came back **all zeros**, the rest was f16 pairs reinterpreted as f32). Written in the f32 era (f935895, 05-09), never updated when packing was restored. **Every shim vector produced between 2026-05-29 and this fix is invalid.** | `forward_f32.rs:234-246, 262-272, 290-297, 321-336`; callers `shims.rs:1038, 1177`, `chat.rs:732` | **VERIFIED** (test `hidden_capture_returns_finite_states`) |
+| 28 | ✅ CLOSED revive-parity — **f32 traced forward computed on garbage.** `forward_traced_inner` (`forward_full_gpu_traced` / `forward_traced_scores_only`) had the same raw-f32 upload + f32 final-norm/readback. Logit 0 on the toy: CPU −0.266, GPU −0.855; layer-0 scores off 2×. No production caller today (retrieve uses `_with_cache_traced`, packed since 00f3206 on 06-06 — so the Phase P f32-control result of 06-12 is **not** contaminated), but `state.rs:85` still documents it as the retrieve path. | `forward_f32.rs:80-91, 135-139, 170-177` | **VERIFIED** (tests `forward_full_gpu_traced_matches_cpu_traced`, `forward_traced_with_cache_matches_fresh_traced`) |
+| 29 | ✅ CLOSED revive-parity — **Every untied-output-head model panicked at engine init.** The Phase G LM-head materialisation `copy_buffer_to_buffer`s from the `GpuFloatLinear` weight allocation to a fresh `weights_heap` allocation — both are ranges of the **same** heap backing buffer, and wgpu rejects source == destination (`Validation Error: Source and destination cannot be the same buffer`). Qwen 0.5B–3B tie embeddings so were unaffected; 7B+ (`OutputProjection::Linear`) crash on load. Fix: `LmHeadWeights::Shared` binds the existing range (no copy, and ~1 GB less VRAM on 7B). | `gpu_engine/mod.rs:369-389` | **VERIFIED** (test `forward_full_gpu_qwen_shape_with_gpu_output_proj_no_crash`) |
 
 ---
 

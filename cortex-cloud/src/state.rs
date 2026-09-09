@@ -82,7 +82,8 @@ pub(crate) struct ComposedEntry {
 pub(crate) struct ServerState {
     /// GPU-resident inference engine. Owns the underlying TransformerModel
     /// and the GPU device. CPU-side calls go through `engine.cpu()`; the
-    /// GPU-native retrieve path goes through `engine.forward_full_gpu_traced()`.
+    /// GPU-native retrieve path goes through `engine.forward_full_gpu_with_cache_traced()`
+    /// (f32 shards) / `forward_full_gpu_polar_traced()` (polar shards).
     pub(crate) engine: cortex::layers::gpu_engine::GpuEngine,
     pub(crate) tokenizer: Tokenizer,
     #[allow(dead_code)]

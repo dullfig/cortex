@@ -58,20 +58,47 @@ use crate::layers::transformer::FfnInjector;
 /// Resident LM-head weights for the GPU greedy decode path.
 ///
 /// Materialized once at engine init from whichever `OutputProjection`
-/// variant the loader produced. All three paths (Linear, Float,
-/// TiedEmbedding) allocate fresh on `gpu.weights_heap` via
-/// `allocate_static` and upload the packed-f16 weights. The Linear
-/// case used to clone the existing wgpu::Buffer via Arc-counting;
-/// post-Phase G it `copy_buffer_to_buffer`s from the source allocation
-/// to the new one (~590 MB extra weights_heap for Linear-output
-/// models; Qwen uses TiedEmbedding so isn't affected). `None` if the
-/// projection isn't a shape the GPU shader can handle (odd
-/// in_features can't be packed, etc.) — the caller falls through to
-/// the CPU path.
+/// variant the loader produced. Float and TiedEmbedding heads are packed
+/// f32 → f16 and uploaded fresh on `gpu.weights_heap`. A Linear head
+/// wrapping a `GpuFloatLinear` already lives on `weights_heap` as packed
+/// f16, so the engine binds that allocation's sub-range directly (the
+/// engine owns the CPU model, which owns the layer, which owns the
+/// allocation — it outlives this handle). It must NOT be copied: both
+/// allocations are ranges of the one heap backing buffer and wgpu rejects
+/// `copy_buffer_to_buffer` with source == destination (that was review
+/// finding #27 — every untied-head model panicked at engine init).
+/// `None` if the projection isn't a shape the GPU shader can handle (odd
+/// in_features can't be packed, etc.) — the caller falls through to the
+/// CPU path.
 pub(crate) struct LmHead {
-    pub(crate) weight_buf: ::vram_heap::VramAllocation,
+    pub(crate) weight_buf: LmHeadWeights,
     pub(crate) vocab_size: usize,
     pub(crate) embed_dim: usize,
+}
+
+/// Where an `LmHead`'s packed-f16 weights live. See `LmHead`.
+pub(crate) enum LmHeadWeights {
+    /// Uploaded by the engine (Float / TiedEmbedding heads).
+    Owned(::vram_heap::VramAllocation),
+    /// A sub-range of the weights heap owned by the model's output
+    /// `GpuFloatLinear`. `buffer` is the heap's backing buffer (Arc-wrapped
+    /// handle, no GPU memory duplicated).
+    Shared { buffer: wgpu::Buffer, offset: u64, size: u64 },
+}
+
+impl LmHeadWeights {
+    pub(crate) fn binding(&self) -> wgpu::BindingResource<'_> {
+        match self {
+            Self::Owned(alloc) => alloc.binding(),
+            Self::Shared { buffer, offset, size } => {
+                wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer,
+                    offset: *offset,
+                    size: wgpu::BufferSize::new(*size),
+                })
+            }
+        }
+    }
 }
 
 /// Per-block GPU resources extracted at construction time. Holds resident
@@ -196,29 +223,18 @@ pub struct PassTimerState {
     pub labels: Vec<&'static str>,
 }
 
-/// Read back a buffer's contents to a `Vec<f32>`. The buffer must have
-/// `MAP_READ` usage (typically created via `create_staging_buffer`) and
-/// must already be the destination of a copy_buffer_to_buffer that was
-/// included in the most recent submit.
-///
-/// Only consumer today is the `#[cfg(any())]`-gated parity tests in
-/// `tests.rs` (its f16 sibling below has live callers). Kept for when
-/// those tests are individually revived.
-#[allow(dead_code)]
-fn read_back_buffer(gpu: &GpuDevice, staging: &wgpu::Buffer, bytes: usize) -> Vec<f32> {
-    let slice = staging.slice(..);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        tx.send(result).ok();
-    });
-    gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
-    rx.recv().expect("readback failed").expect("buffer map failed");
-    let data = slice.get_mapped_range();
-    let out: Vec<f32> = data[..bytes].chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-    drop(data);
-    staging.unmap();
+/// Unpack little-endian packed-f16 bytes (2 f16 per u32) to `Vec<f32>`.
+/// Output length is `data.len() / 2`. Shared by every readback of a
+/// packed buffer — the residual stream and the post-norm hidden are packed
+/// f16 since Phase B / C3, so reading them as f32 silently yields garbage
+/// (the bug class behind review findings #27–#29).
+pub(super) fn unpack_f16_bytes(data: &[u8]) -> Vec<f32> {
+    let mut out: Vec<f32> = Vec::with_capacity(data.len() / 2);
+    for chunk in data.chunks_exact(4) {
+        let packed = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        out.push(half::f16::from_bits((packed & 0xFFFF) as u16).to_f32());
+        out.push(half::f16::from_bits((packed >> 16) as u16).to_f32());
+    }
     out
 }
 
@@ -235,15 +251,7 @@ fn read_back_buffer_f16_unpack(gpu: &GpuDevice, staging: &wgpu::Buffer, packed_b
     gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
     rx.recv().expect("readback failed").expect("buffer map failed");
     let data = slice.get_mapped_range();
-    // Each u32 = 2 f16 = 4 bytes packed → 2 f32 unpacked.
-    let mut out: Vec<f32> = Vec::with_capacity(packed_bytes / 2);
-    for chunk in data[..packed_bytes].chunks_exact(4) {
-        let packed = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        let lo = half::f16::from_bits((packed & 0xFFFF) as u16).to_f32();
-        let hi = half::f16::from_bits((packed >> 16) as u16).to_f32();
-        out.push(lo);
-        out.push(hi);
-    }
+    let out = unpack_f16_bytes(&data[..packed_bytes]);
     drop(data);
     staging.unmap();
     out
@@ -255,14 +263,13 @@ impl std::fmt::Debug for GpuEngine {
     }
 }
 
-// gpu_engine tests partially reconstructed post-BitNet-excision: the
-// BitNet-specific helpers (`toy_ternary_block_pair`) and tests
-// (`forward_block_gpu_matches_cpu_bitnet_block`) were deleted. The rest
-// stays gated — several CPU-vs-GPU parity tests drifted during C2/C3
-// activation packing and aren't passing today (sign-flips on logits,
-// not just precision tolerance). Each needs individual investigation
-// against the current packed-scratch forward path.
-#[cfg(any())]
+// The CPU-vs-GPU parity suite. Gated `#[cfg(any())]` from the BitNet
+// excision (2026-05-29) until review #22 (2026-09-08); the "sign-flips on
+// logits" that kept it gated were three fixtures uploading f32 bytes into
+// the packed-f16 residual stream — and, once those were fixed, three real
+// engine bugs of the same class (review #27–#29) that the suite caught on
+// its first run. 31 tests run under `--test-threads=1`; 3 are `#[ignore]`
+// (Qwen-on-disk smoke, two matmul benches).
 #[cfg(test)]
 mod tests;
 
@@ -378,13 +385,14 @@ impl GpuEngine {
 
         // Materialize the LM-head as a single resident packed-f16 buffer
         // so the greedy decode path can dispatch matmul + argmax without
-        // a vocab-sized readback. For the common GPU-loader case (Linear
-        // wrapping a GpuFloatLinear), we clone the existing buffer
-        // (wgpu::Buffer is Arc-wrapped — no GPU memory duplicated). For
-        // TiedEmbedding / Float we pack f32 → f16 and upload a fresh
-        // buffer. Odd in_features can't be packed, in which case the
-        // fast path is unavailable and lm_head stays None — callers
-        // fall through to CPU finalize_logits.
+        // a vocab-sized readback. For the GPU-loader case (Linear wrapping
+        // a GpuFloatLinear) the weights are already resident and packed on
+        // weights_heap: bind that allocation's range directly — see
+        // `LmHead` for why it must not be copied. For TiedEmbedding /
+        // Float we pack f32 → f16 and upload a fresh buffer. Odd
+        // in_features can't be packed, in which case the fast path is
+        // unavailable and lm_head stays None — callers fall through to
+        // CPU finalize_logits.
         let vocab_size = cpu.vocab_size();
         let lm_head: Option<LmHead> = if embed_dim % 2 == 0 {
             match cpu.output_proj() {
@@ -393,27 +401,16 @@ impl GpuEngine {
                         .as_any()
                         .downcast_ref::<crate::layers::gpu_floatlinear::GpuFloatLinear>()
                         .map(|gpu_layer| {
-                            // Phase G: allocate fresh on weights_heap and copy
-                            // from the GpuFloatLinear's existing allocation.
-                            // The Arc-cloned wgpu::Buffer trick used pre-Phase-G
-                            // doesn't work with VramAllocation (not Clone).
                             let src = gpu_layer.weight_buffer();
-                            let alloc = gpu.weights_heap.allocate_static(
-                                src.size(),
-                                ::vram_heap::STORAGE_BUFFER_OFFSET_ALIGNMENT_NVIDIA,
-                                "gpu_engine.lm_head.linear",
-                            ).expect("weights_heap capacity for LM head (Linear)");
-                            // Copy src → alloc via a one-shot command buffer.
-                            let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                label: Some("gpu_engine.lm_head.copy"),
-                            });
-                            enc.copy_buffer_to_buffer(
-                                src.buffer(), src.offset(),
-                                alloc.buffer(), alloc.offset(),
-                                src.size(),
-                            );
-                            gpu.queue.submit(Some(enc.finish()));
-                            LmHead { weight_buf: alloc, vocab_size, embed_dim }
+                            LmHead {
+                                weight_buf: LmHeadWeights::Shared {
+                                    buffer: src.buffer().clone(),
+                                    offset: src.offset(),
+                                    size: src.size(),
+                                },
+                                vocab_size,
+                                embed_dim,
+                            }
                         })
                 }
                 crate::layers::model::OutputProjection::Float(tensor) => {
@@ -422,7 +419,7 @@ impl GpuEngine {
                         bytemuck::cast_slice(&packed),
                         "gpu_engine.lm_head.float",
                     );
-                    Some(LmHead { weight_buf: buf, vocab_size, embed_dim })
+                    Some(LmHead { weight_buf: LmHeadWeights::Owned(buf), vocab_size, embed_dim })
                 }
                 crate::layers::model::OutputProjection::TiedEmbedding => {
                     let packed = GpuDevice::pack_f16(cpu.embedding_data());
@@ -430,7 +427,7 @@ impl GpuEngine {
                         bytemuck::cast_slice(&packed),
                         "gpu_engine.lm_head.tied",
                     );
-                    Some(LmHead { weight_buf: buf, vocab_size, embed_dim })
+                    Some(LmHead { weight_buf: LmHeadWeights::Owned(buf), vocab_size, embed_dim })
                 }
             }
         } else {

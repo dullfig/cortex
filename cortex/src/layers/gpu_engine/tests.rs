@@ -168,7 +168,7 @@
             label: Some("rope_test.encoder"),
         });
         engine.dispatch_rope_into(
-            &mut encoder, &x_buf, &cos_buf, &sin_buf,
+            &mut encoder, &x_buf, cos_buf.binding(), sin_buf.binding(),
             n_heads, head_dim, start_pos, n_tokens,
         );
         encoder.copy_buffer_to_buffer(&x_buf, 0, &staging, 0, total_bytes);
@@ -237,7 +237,7 @@
             label: Some("rope_test2.encoder"),
         });
         engine.dispatch_rope_into(
-            &mut encoder, &x_buf, &cos_buf, &sin_buf,
+            &mut encoder, &x_buf, cos_buf.binding(), sin_buf.binding(),
             n_heads, head_dim, start_pos, n_tokens,
         );
         encoder.copy_buffer_to_buffer(&x_buf, 0, &staging, 0, total_bytes);
@@ -428,16 +428,21 @@
 
         let cpu_out = cpu_attention_reference(&q, &k, &v, n_heads, n_kv_heads, head_dim, n_tokens);
 
+        // Same I/O contract as `dispatch_attention_matches_cpu_gqa`: Q, K,
+        // V and the output are all packed f16 (Phase A + C3). Scores stay f32.
+        let q_packed = GpuDevice::pack_f16(&q);
+        let k_packed = GpuDevice::pack_f16(&k);
+        let v_packed = GpuDevice::pack_f16(&v);
         let q_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("attn_test1.q"), contents: bytemuck::cast_slice(&q),
+            label: Some("attn_test1.q"), contents: bytemuck::cast_slice(&q_packed),
             usage: wgpu::BufferUsages::STORAGE,
         });
         let k_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("attn_test1.k"), contents: bytemuck::cast_slice(&k),
+            label: Some("attn_test1.k"), contents: bytemuck::cast_slice(&k_packed),
             usage: wgpu::BufferUsages::STORAGE,
         });
         let v_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("attn_test1.v"), contents: bytemuck::cast_slice(&v),
+            label: Some("attn_test1.v"), contents: bytemuck::cast_slice(&v_packed),
             usage: wgpu::BufferUsages::STORAGE,
         });
         let scores_bytes = (n_tokens * n_heads * max_seq * 4) as u64;
@@ -446,7 +451,7 @@
             ::vram_heap::STORAGE_BUFFER_OFFSET_ALIGNMENT_NVIDIA,
             "attn_test1.scores",
         ).expect("transient_heap_b capacity for attn_test1.scores");
-        let out_bytes = (n_tokens * q_dim * 4) as u64;
+        let out_bytes = (n_tokens * q_dim * 2) as u64; // packed f16
         let out_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("attn_test1.out"), size: out_bytes,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
@@ -471,12 +476,21 @@
         gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
         rx.recv().unwrap().unwrap();
         let data = slice.get_mapped_range();
-        let gpu_out: Vec<f32> = data.chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let mut gpu_out: Vec<f32> = Vec::with_capacity(data.len() / 2);
+        for chunk in data.chunks_exact(4) {
+            let bits = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            gpu_out.push(half::f16::from_bits((bits & 0xFFFF) as u16).to_f32());
+            gpu_out.push(half::f16::from_bits(((bits >> 16) & 0xFFFF) as u16).to_f32());
+        }
         drop(data); staging.unmap();
 
+        assert_eq!(cpu_out.len(), gpu_out.len());
+        // With a single key the softmax is exactly 1.0, so the output is V
+        // round-tripped through f16 twice (upload + packed output): ~1e-3
+        // relative on values of O(0.3). 1e-2 is generous but still catches
+        // a wrong element or a shuffled head.
         for (i, (c, g)) in cpu_out.iter().zip(&gpu_out).enumerate() {
-            assert!((c - g).abs() < 1e-4, "elem {i}: cpu={c} gpu={g}");
+            assert!((c - g).abs() < 1e-2, "elem {i}: cpu={c} gpu={g}");
         }
     }
 
@@ -486,7 +500,6 @@
     fn toy_float_model_for_gpu(gpu: Arc<GpuDevice>) -> TransformerModel {
         use crate::layers::attention::MultiHeadAttention;
         use crate::layers::ffn::FeedForward;
-        use crate::layers::floatlinear::FloatLinear;
         use crate::layers::gpu_floatlinear::GpuFloatLinear;
         use crate::layers::model::OutputProjection;
         use crate::layers::rmsnorm::RmsNorm;
@@ -1441,7 +1454,8 @@
         // Loads the actual Qwen 2.5-3B Q4_K_M from disk (same path the bench
         // uses). If this crashes inside the test framework, we have a
         // standalone reproducer of the bench failure.
-        let path = "C:\\Users\\danu\\AppData\\Roaming\\memory-rlm\\models\\model-qwen2.5-3b-q4km.gguf";
+        // Repo-relative so any checkout with the model present can run it.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen2.5-3B-Q4_K_M.gguf");
         if !std::path::Path::new(path).exists() { return; }
 
         let loaded = crate::load_model(path).expect("load_model");
@@ -1610,11 +1624,17 @@
         let gpu_model = toy_float_model_for_gpu(gpu.clone());
         let engine = GpuEngine::with_max_seq(gpu_model, gpu.clone(), 16);
 
-        // Upload the same hidden-state input. Option E: hidden_buf is f32.
-        let bytes = (n_tokens * embed_dim * std::mem::size_of::<f32>()) as u64;
+        // Upload the same hidden-state input. The residual stream is packed
+        // f16 (Phase B, restored after the Option E revert in 920e8be):
+        // `forward_block_gpu` reads `hidden_buf` via rmsnorm_packed_to_packed
+        // and writes the post-block state back packed. Feeding f32 bytes
+        // here is what produced the "sign-flips on logits" that kept this
+        // suite gated — garbage in, not a GPU bug.
+        let hidden_packed = GpuDevice::pack_f16(&hidden_cpu);
+        let bytes = (n_tokens * embed_dim * 2) as u64;
         let hidden_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("test.hidden"),
-            contents: bytemuck::cast_slice(&hidden_cpu),
+            contents: bytemuck::cast_slice(&hidden_packed),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
         let staging = gpu.create_staging_buffer(bytes);
@@ -1640,11 +1660,12 @@
         encoder.copy_buffer_to_buffer(&hidden_buf, 0, &staging, 0, bytes);
         gpu.queue.submit(Some(encoder.finish()));
 
-        // Option E: hidden_buf f32; read back directly.
-        let gpu_out = read_back_buffer(&gpu, &staging, bytes as usize);
+        // Post-block hidden state comes back packed f16; unpack on readback.
+        let gpu_out = read_back_buffer_f16_unpack(&gpu, &staging, bytes as usize);
 
         assert_eq!(cpu_out.len(), gpu_out.len(), "shape mismatch");
-        // Tolerance covers f16 quantization on weights and packed scratch.
+        // Tolerance covers f16 quantization on weights, packed scratch and
+        // the packed residual stream (input and output).
         for (i, (c, g)) in cpu_out.iter().zip(&gpu_out).enumerate() {
             assert!(
                 (c - g).abs() < 0.05,
@@ -1682,7 +1703,6 @@
         );
 
         // Upload input (f32; matmul shaders unchanged in Phase B scope).
-        let in_bytes = (n_tokens * cols * 4) as u64;
         let in_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("test.matmul.in"),
             contents: bytemuck::cast_slice(&input_data),
@@ -1715,7 +1735,7 @@
                 label: Some("test.matmul.legacy.pass"),
                 timestamp_writes: None,
             });
-            engine.dispatch_matmul_legacy_inner_in_pass(&mut pass, &layer, &in_buf, &out_legacy, n_tokens);
+            engine.dispatch_matmul_legacy_inner_in_pass(&mut pass, &layer, in_buf.as_entire_binding(), out_legacy.as_entire_binding(), n_tokens);
         }
         encoder.copy_buffer_to_buffer(&out_legacy, 0, &staging_legacy, 0, out_bytes);
 
@@ -1725,7 +1745,7 @@
                 label: Some("test.matmul.shared.pass"),
                 timestamp_writes: None,
             });
-            engine.dispatch_matmul_shared_inner_in_pass(&mut pass, &layer, &in_buf, &out_shared, n_tokens);
+            engine.dispatch_matmul_shared_inner_in_pass(&mut pass, &layer, in_buf.as_entire_binding(), out_shared.as_entire_binding(), n_tokens);
         }
         encoder.copy_buffer_to_buffer(&out_shared, 0, &staging_shared, 0, out_bytes);
 
@@ -1788,7 +1808,6 @@
             gpu.clone(), weight_tensor,
         );
 
-        let in_bytes = (n_tokens * cols * 4) as u64;
         let in_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("bench.in"),
             contents: bytemuck::cast_slice(&input_data),
@@ -1817,9 +1836,9 @@
                         timestamp_writes: None,
                     });
                     if use_shared {
-                        engine.dispatch_matmul_shared_inner_in_pass(&mut pass, &layer, &in_buf, &out_buf, n_tokens);
+                        engine.dispatch_matmul_shared_inner_in_pass(&mut pass, &layer, in_buf.as_entire_binding(), out_buf.as_entire_binding(), n_tokens);
                     } else {
-                        engine.dispatch_matmul_legacy_inner_in_pass(&mut pass, &layer, &in_buf, &out_buf, n_tokens);
+                        engine.dispatch_matmul_legacy_inner_in_pass(&mut pass, &layer, in_buf.as_entire_binding(), out_buf.as_entire_binding(), n_tokens);
                     }
                 }
                 gpu.queue.submit(Some(encoder.finish()));
@@ -1837,9 +1856,9 @@
                         timestamp_writes: None,
                     });
                     if use_shared {
-                        engine.dispatch_matmul_shared_inner_in_pass(&mut pass, &layer, &in_buf, &out_buf, n_tokens);
+                        engine.dispatch_matmul_shared_inner_in_pass(&mut pass, &layer, in_buf.as_entire_binding(), out_buf.as_entire_binding(), n_tokens);
                     } else {
-                        engine.dispatch_matmul_legacy_inner_in_pass(&mut pass, &layer, &in_buf, &out_buf, n_tokens);
+                        engine.dispatch_matmul_legacy_inner_in_pass(&mut pass, &layer, in_buf.as_entire_binding(), out_buf.as_entire_binding(), n_tokens);
                     }
                 }
                 gpu.queue.submit(Some(encoder.finish()));
@@ -1892,12 +1911,6 @@
             crate::tensor::FloatTensor::new(up_w, vec![rows, cols]),
         );
 
-        let in_bytes = (n_tokens * cols * 4) as u64;
-        let in_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("test.fused.in"),
-            contents: bytemuck::cast_slice(&input),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
         // C1: fused gate+up shader takes packed-f16 input.
         let input_packed = GpuDevice::pack_f16(&input);
         let in_packed_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1946,14 +1959,14 @@
                 label: Some("test.fused.ref_gate"),
                 timestamp_writes: None,
             });
-            engine.dispatch_matmul_shared_pin_fout_inner_in_pass(&mut pass, &gate_layer, &in_packed_buf, &gate_ref, n_tokens);
+            engine.dispatch_matmul_shared_pin_fout_inner_in_pass(&mut pass, &gate_layer, in_packed_buf.as_entire_binding(), gate_ref.as_entire_binding(), n_tokens);
         }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("test.fused.ref_up"),
                 timestamp_writes: None,
             });
-            engine.dispatch_matmul_shared_pin_fout_inner_in_pass(&mut pass, &up_layer, &in_packed_buf, &up_ref, n_tokens);
+            engine.dispatch_matmul_shared_pin_fout_inner_in_pass(&mut pass, &up_layer, in_packed_buf.as_entire_binding(), up_ref.as_entire_binding(), n_tokens);
         }
         encoder.copy_buffer_to_buffer(&gate_ref, 0, &stg_gr, 0, out_bytes);
         encoder.copy_buffer_to_buffer(&up_ref, 0, &stg_ur, 0, out_bytes);
@@ -1965,7 +1978,7 @@
                 timestamp_writes: None,
             });
             let ok = engine.dispatch_gate_up_fused_in_pass(
-                &mut pass, &gate_layer, &up_layer, &in_packed_buf, &gate_fused, &up_fused, n_tokens,
+                &mut pass, &gate_layer, &up_layer, in_packed_buf.as_entire_binding(), gate_fused.as_entire_binding(), up_fused.as_entire_binding(), n_tokens,
             );
             assert!(ok, "fused dispatch should succeed on matching GpuFloatLinear pair");
         }
@@ -2056,7 +2069,6 @@
             gpu.clone(), weight_tensor,
         );
 
-        let in_bytes = (n_tokens * cols * 4) as u64;
         let in_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("bench.ffn.in"),
             contents: bytemuck::cast_slice(&input_data),
@@ -2084,9 +2096,9 @@
                         timestamp_writes: None,
                     });
                     if use_shared {
-                        engine.dispatch_matmul_shared_inner_in_pass(&mut pass, &layer, &in_buf, &out_buf, n_tokens);
+                        engine.dispatch_matmul_shared_inner_in_pass(&mut pass, &layer, in_buf.as_entire_binding(), out_buf.as_entire_binding(), n_tokens);
                     } else {
-                        engine.dispatch_matmul_legacy_inner_in_pass(&mut pass, &layer, &in_buf, &out_buf, n_tokens);
+                        engine.dispatch_matmul_legacy_inner_in_pass(&mut pass, &layer, in_buf.as_entire_binding(), out_buf.as_entire_binding(), n_tokens);
                     }
                 }
                 gpu.queue.submit(Some(encoder.finish()));
@@ -2104,9 +2116,9 @@
                         timestamp_writes: None,
                     });
                     if use_shared {
-                        engine.dispatch_matmul_shared_inner_in_pass(&mut pass, &layer, &in_buf, &out_buf, n_tokens);
+                        engine.dispatch_matmul_shared_inner_in_pass(&mut pass, &layer, in_buf.as_entire_binding(), out_buf.as_entire_binding(), n_tokens);
                     } else {
-                        engine.dispatch_matmul_legacy_inner_in_pass(&mut pass, &layer, &in_buf, &out_buf, n_tokens);
+                        engine.dispatch_matmul_legacy_inner_in_pass(&mut pass, &layer, in_buf.as_entire_binding(), out_buf.as_entire_binding(), n_tokens);
                     }
                 }
                 gpu.queue.submit(Some(encoder.finish()));
@@ -2172,7 +2184,7 @@
         let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("silu.encoder"),
         });
-        engine.dispatch_silu_mul_into(&mut encoder, &g_buf, &u_buf, &o_buf, n, n_tokens);
+        engine.dispatch_silu_mul_into(&mut encoder, g_buf.as_entire_binding(), u_buf.as_entire_binding(), o_buf.as_entire_binding(), n, n_tokens);
         encoder.copy_buffer_to_buffer(&o_buf, 0, &staging, 0, bytes);
         gpu.queue.submit(Some(encoder.finish()));
 
@@ -2200,13 +2212,17 @@
         let n_tokens = 4;
         let total = n * n_tokens;
 
-        let mut a: Vec<f32> = (0..total).map(|i| i as f32 * 0.1).collect();
-        let b: Vec<f32>     = (0..total).map(|i| (total - i) as f32 * -0.05).collect();
+        let a: Vec<f32> = (0..total).map(|i| i as f32 * 0.1).collect();
+        let b: Vec<f32> = (0..total).map(|i| (total - i) as f32 * -0.05).collect();
         let cpu_a: Vec<f32> = a.iter().zip(&b).map(|(&x, &y)| x + y).collect();
 
-        let bytes = (total * 4) as u64;
+        // `add_inplace_batch` is the residual add: `a` (the hidden stream)
+        // is packed f16 and updated in place, `b` (the block output) is f32.
+        // The dispatcher runs one thread per u32 pair (n·n_tokens/2).
+        let a_packed = GpuDevice::pack_f16(&a);
+        let bytes = (total * 2) as u64; // packed f16
         let a_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("add.a"), contents: bytemuck::cast_slice(&a),
+            label: Some("add.a"), contents: bytemuck::cast_slice(&a_packed),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
         let b_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -2229,13 +2245,20 @@
         gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
         rx.recv().unwrap().unwrap();
         let data = slice.get_mapped_range();
-        let gpu_a: Vec<f32> = data.chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let mut gpu_a: Vec<f32> = Vec::with_capacity(data.len() / 2);
+        for chunk in data.chunks_exact(4) {
+            let bits = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            gpu_a.push(half::f16::from_bits((bits & 0xFFFF) as u16).to_f32());
+            gpu_a.push(half::f16::from_bits(((bits >> 16) & 0xFFFF) as u16).to_f32());
+        }
         drop(data); staging.unmap();
 
-        let _ = a; // silence unused-mut warning in case of future refactor
+        assert_eq!(cpu_a.len(), gpu_a.len());
+        // `a` is f16-rounded on upload and the sum is f16-rounded on store;
+        // values here are O(1), so ~2 ulp of f16 ≈ 2e-3. 5e-3 leaves margin
+        // while still failing on a skipped or doubled element.
         for (i, (c, g)) in cpu_a.iter().zip(&gpu_a).enumerate() {
-            assert!((c - g).abs() < 1e-6, "elem {i}: cpu={c} gpu={g}");
+            assert!((c - g).abs() < 5e-3, "elem {i}: cpu={c} gpu={g}");
         }
     }
 

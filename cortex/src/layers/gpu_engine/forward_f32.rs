@@ -76,20 +76,25 @@ impl GpuEngine {
             hidden_init.extend_from_slice(&embed_data[off..off + self.embed_dim]);
         }
 
-        // ---- Allocate buffers ----
-        let bytes = (hidden_init.len() * std::mem::size_of::<f32>()) as u64;
+        // ---- Allocate buffers: hidden + normed are packed f16 (C3) ----
+        // `forward_block_gpu_inner` reads the residual stream as packed f16
+        // (rmsnorm_packed_to_packed). Uploading raw f32 here is the bug
+        // that was fixed in the polar traced forward (f5b55a2) and in
+        // advance_only (7d63396) but never in this path — review #28.
+        let packed_bytes = (hidden_init.len() * 2) as u64;
+        let hidden_packed = GpuDevice::pack_f16(&hidden_init);
         let hidden_buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("forward_full_traced.hidden"),
-            contents: bytemuck::cast_slice(&hidden_init),
+            contents: bytemuck::cast_slice(&hidden_packed),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
         let normed_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("forward_full_traced.normed"),
-            size: bytes,
+            size: packed_bytes,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let normed_staging = self.gpu.create_staging_buffer(bytes);
+        let normed_staging = self.gpu.create_staging_buffer(packed_bytes);
 
         let attn0 = self.cpu.blocks()[0].attention();
         let intermediate = self.cpu.blocks()[0].ffn().as_any()
@@ -132,11 +137,12 @@ impl GpuEngine {
             let capture = capture_lookup.get(&i).copied();
             self.forward_block_gpu_inner(&mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch, capture, None, None, None);
         }
-        self.dispatch_rmsnorm_into(
+        // Final norm: hidden packed → normed packed.
+        self.dispatch_rmsnorm_packed_to_packed_into(
             &mut encoder, hidden_buf.as_entire_binding(), self.final_norm_weight_buf.binding(), normed_buf.as_entire_binding(),
             self.embed_dim, n_tokens, self.final_norm_eps,
         );
-        encoder.copy_buffer_to_buffer(&normed_buf, 0, &normed_staging, 0, bytes);
+        encoder.copy_buffer_to_buffer(&normed_buf, 0, &normed_staging, 0, packed_bytes);
         for (cap_buf, stg_buf) in capture_bufs.iter().zip(capture_stagings.iter()) {
             encoder.copy_buffer_to_buffer(cap_buf, 0, stg_buf, 0, scores_bytes);
         }
@@ -166,11 +172,10 @@ impl GpuEngine {
             rx.recv().expect("readback channel closed").expect("buffer map failed");
         }
 
-        // ---- Decode the readbacks ----
+        // ---- Decode the readbacks (normed is packed f16) ----
         let normed: Vec<f32> = {
             let data = normed_slice.get_mapped_range();
-            let v: Vec<f32> = data[..bytes as usize].chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let v = super::unpack_f16_bytes(&data[..packed_bytes as usize]);
             drop(data);
             normed_staging.unmap();
             v
@@ -231,19 +236,28 @@ impl GpuEngine {
             hidden_init.extend_from_slice(&embed_data[off..off + self.embed_dim]);
         }
 
-        let hidden_bytes = (hidden_init.len() * std::mem::size_of::<f32>()) as u64;
+        // The residual stream, the per-block captures and the post-norm
+        // hidden are all packed f16 (C3): `forward_block_gpu_inner` reads
+        // hidden as packed and `post_block_hidden_capture` copies
+        // `n_tokens * embed_dim * 2` bytes. This path was written in the
+        // f32 era (f935895) and never updated when packing was restored
+        // (920e8be): it uploaded f32, sized everything ×4 and read back as
+        // f32 — every /v1/shims/embed and gate-shim vector was garbage
+        // (review #27).
+        let packed_bytes = (hidden_init.len() * 2) as u64;
+        let hidden_packed = GpuDevice::pack_f16(&hidden_init);
         let hidden_buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("forward_hidden_capture.hidden"),
-            contents: bytemuck::cast_slice(&hidden_init),
+            contents: bytemuck::cast_slice(&hidden_packed),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
         let normed_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("forward_hidden_capture.normed"),
-            size: hidden_bytes,
+            size: packed_bytes,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let normed_staging = self.gpu.create_staging_buffer(hidden_bytes);
+        let normed_staging = self.gpu.create_staging_buffer(packed_bytes);
 
         let attn0 = self.cpu.blocks()[0].attention();
         let intermediate = self.cpu.blocks()[0].ffn().as_any()
@@ -258,17 +272,17 @@ impl GpuEngine {
         );
 
         // Per-captured-layer hidden buffers (post-FFN-residual). Same shape
-        // as hidden_buf: [n_tokens, embed_dim] f32 flat.
+        // as hidden_buf: [n_tokens, embed_dim] packed f16.
         let capture_bufs: Vec<wgpu::Buffer> = capture_layers.iter().map(|&l| {
             self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(&format!("forward_hidden_capture.layer{l}")),
-                size: hidden_bytes,
+                size: packed_bytes,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             })
         }).collect();
         let capture_stagings: Vec<wgpu::Buffer> = (0..capture_layers.len())
-            .map(|_| self.gpu.create_staging_buffer(hidden_bytes))
+            .map(|_| self.gpu.create_staging_buffer(packed_bytes))
             .collect();
         let capture_lookup: std::collections::HashMap<usize, &wgpu::Buffer> =
             capture_layers.iter().zip(capture_bufs.iter())
@@ -286,14 +300,14 @@ impl GpuEngine {
                 /*pre_block_hidden_inject*/ None,
             );
         }
-        // Final RMSNorm — gives the final post-norm hidden state shims read.
-        self.dispatch_rmsnorm_into(
+        // Final RMSNorm (packed → packed) — the post-norm hidden shims read.
+        self.dispatch_rmsnorm_packed_to_packed_into(
             &mut encoder, hidden_buf.as_entire_binding(), self.final_norm_weight_buf.binding(), normed_buf.as_entire_binding(),
             self.embed_dim, n_tokens, self.final_norm_eps,
         );
-        encoder.copy_buffer_to_buffer(&normed_buf, 0, &normed_staging, 0, hidden_bytes);
+        encoder.copy_buffer_to_buffer(&normed_buf, 0, &normed_staging, 0, packed_bytes);
         for (cap_buf, stg_buf) in capture_bufs.iter().zip(capture_stagings.iter()) {
-            encoder.copy_buffer_to_buffer(cap_buf, 0, stg_buf, 0, hidden_bytes);
+            encoder.copy_buffer_to_buffer(cap_buf, 0, stg_buf, 0, packed_bytes);
         }
         self.gpu.queue.submit(Some(encoder.finish()));
 
@@ -318,18 +332,17 @@ impl GpuEngine {
             rx.recv().expect("readback channel closed").expect("buffer map failed");
         }
 
+        // Both readbacks are packed f16; unpack to the f32 the API returns.
         let final_post_norm_hidden: Vec<f32> = {
             let data = normed_slice.get_mapped_range();
-            let v: Vec<f32> = data[..hidden_bytes as usize].chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let v = super::unpack_f16_bytes(&data[..packed_bytes as usize]);
             drop(data);
             normed_staging.unmap();
             v
         };
         let per_layer_hidden: Vec<Vec<f32>> = capture_slices.iter().zip(capture_stagings.iter()).map(|(slice, stg)| {
             let data = slice.get_mapped_range();
-            let v: Vec<f32> = data[..hidden_bytes as usize].chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let v = super::unpack_f16_bytes(&data[..packed_bytes as usize]);
             drop(data);
             stg.unmap();
             v
