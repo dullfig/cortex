@@ -54,7 +54,8 @@ pub const WGPU_MAX_WORKGROUPS_PER_DIM: usize = 65_535;
 ///
 /// Mirrors the group formulas at the dispatch sites — keep in sync. Sites
 /// that are already 2-D (`matmul*`, `silu_mul`, `kv_write`: `dx.min(65535)`
-/// + `dy`) need nothing. The attention-score x-dims scale with the
+/// + `dy`, the shader folding `gid.y` back in — `kv_write` only since
+/// review #26) need nothing. The attention-score x-dims scale with the
 /// attention WIDTH (`n_heads·(start+n)/256`), not the chunk, and only
 /// approach the cap beyond ~1M tokens of context. The y-dim sites
 /// (`attn_score`, fused attention) are 1 group/token and are covered by

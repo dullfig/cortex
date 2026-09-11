@@ -4,7 +4,10 @@
 // k_cache/v_cache: [max_seq, kv_dim/2] u32 (packed f16, Phase A)
 // One thread copies one u32 slot per (tok, dim_pair).
 
-struct Params { kv_dim: u32, start_pos: u32, n_tokens: u32, _pad: u32 }
+// x_stride: invocations per row of the 2-D dispatch (65535 groups x 128);
+// review #26: the dispatcher already folds > 65535 groups into gid.y, and
+// this shader used to read gid.x only.
+struct Params { kv_dim: u32, start_pos: u32, n_tokens: u32, x_stride: u32 }
 
 @group(0) @binding(0) var<storage, read> k_src: array<u32>;
 @group(0) @binding(1) var<storage, read> v_src: array<u32>;
@@ -15,7 +18,7 @@ struct Params { kv_dim: u32, start_pos: u32, n_tokens: u32, _pad: u32 }
 @compute @workgroup_size(128)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let kv_dim_half = params.kv_dim / 2u;
-    let flat_u32 = gid.x;
+    let flat_u32 = gid.x + gid.y * params.x_stride;
     let total_u32 = kv_dim_half * params.n_tokens;
     if (flat_u32 >= total_u32) { return; }
 

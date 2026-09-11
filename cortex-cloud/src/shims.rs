@@ -619,13 +619,34 @@ pub(crate) fn apply_steers_inplace(
             vec![1_i64, embed_dim as i64],
             input_snapshot.as_slice(),
         )).expect("steer input tensor construction");
-        let outputs = session.run(ort::inputs![input_name.as_str() => tensor])
-            .expect("steer ort run failed");
-        let first_out = outputs.iter().next().expect("steer produced no outputs").1;
-        let (_shape, out_data) = first_out.try_extract_tensor::<f32>()
-            .expect("steer output extraction failed");
-        assert_eq!(out_data.len(), embed_dim,
-            "steer output length {} != embed_dim {}", out_data.len(), embed_dim);
+        // Review #25: the graph was validated against the manifest at
+        // registration, so these are runtime failures of the shim itself —
+        // skip this steer for this step instead of panicking the decode.
+        let outputs = match session.run(ort::inputs![input_name.as_str() => tensor]) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!(shim = %shim.manifest.id, error = %e, "steer shim run failed; skipped this step");
+                continue;
+            }
+        };
+        let Some((_, first_out)) = outputs.iter().next() else {
+            tracing::warn!(shim = %shim.manifest.id, "steer shim produced no outputs; skipped this step");
+            continue;
+        };
+        let out_data = match first_out.try_extract_tensor::<f32>() {
+            Ok((_shape, data)) => data,
+            Err(e) => {
+                tracing::warn!(shim = %shim.manifest.id, error = %e, "steer output extraction failed; skipped this step");
+                continue;
+            }
+        };
+        if out_data.len() != embed_dim {
+            tracing::warn!(
+                shim = %shim.manifest.id, len = out_data.len(), embed_dim,
+                "steer output length != embed_dim; skipped this step",
+            );
+            continue;
+        }
         for (h, &d) in hidden.iter_mut().zip(out_data.iter()) {
             *h += d;
         }
@@ -713,6 +734,31 @@ pub(crate) async fn shim_put(
             })),
         ))?;
 
+    // Review #25: the graph must match the manifest and the model NOW, at
+    // registration — not as three `expect`s in the decode loop after a
+    // full prefill. Nothing is registered on a mismatch.
+    let describe = |o: &ort::value::Outlet| {
+        let (ty, dims) = match o.dtype() {
+            ort::value::ValueType::Tensor { ty, shape, .. } => (Some(*ty), shape.iter().copied().collect()),
+            _ => (None, Vec::new()),
+        };
+        (o.name().to_string(), ty, dims)
+    };
+    let inputs: Vec<ShimIo> = session.inputs().iter().map(describe).collect();
+    let outputs: Vec<ShimIo> = session.outputs().iter().map(describe).collect();
+    validate_shim_io(&inputs, &outputs, &req.manifest, state.engine.embed_dim()).map_err(|message| (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": {
+                "type": "shape_mismatch",
+                "message": format!("shim '{id}': {message}"),
+                "shim_id": id,
+                "graph_inputs": inputs.iter().map(|(n, _, d)| serde_json::json!({"name": n, "dims": d})).collect::<Vec<_>>(),
+                "graph_outputs": outputs.iter().map(|(n, _, d)| serde_json::json!({"name": n, "dims": d})).collect::<Vec<_>>(),
+            }
+        })),
+    ))?;
+
     let registered = Arc::new(RegisteredShim {
         manifest: req.manifest.clone(),
         session: Mutex::new(session),
@@ -736,6 +782,85 @@ pub(crate) async fn shim_put(
         if existed { StatusCode::OK } else { StatusCode::CREATED },
         Json(ShimRegistryEntry { manifest: req.manifest }),
     ))
+}
+
+/// One graph input or output: `(name, element type if a tensor, dims)`;
+/// a dynamic dimension is `-1` (ort's convention).
+pub(crate) type ShimIo = (String, Option<ort::value::TensorElementType>, Vec<i64>);
+
+/// Review #25: check an ONNX graph's declared I/O against its manifest and
+/// the model. Pure over `(name, type, dims)` triples so it is unit-tested
+/// without an ort session. Rules (a `-1` dim is dynamic and accepted):
+/// - exactly one input, f32, rank 2 `[batch, embed_dim]` with `batch` 1 or
+///   dynamic — every phase feeds one `[1, embed_dim]` hidden vector;
+/// - `input_shape.hidden_dim` must equal the model's `embed_dim`;
+/// - at least one output, the first f32 (it is the one consumed), shaped
+///   per `output_shape.kind`: `hidden_delta` → `[.., embed_dim]`,
+///   `scalar` → one element, `category:N` → `[.., N]`.
+pub(crate) fn validate_shim_io(
+    inputs: &[ShimIo],
+    outputs: &[ShimIo],
+    manifest: &ShimManifest,
+    embed_dim: usize,
+) -> Result<(), String> {
+    use ort::value::TensorElementType::Float32;
+    let hidden_dim = manifest
+        .input_shape
+        .get("hidden_dim")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "manifest input_shape.hidden_dim missing".to_string())? as usize;
+    if hidden_dim != embed_dim {
+        return Err(format!("manifest input_shape.hidden_dim={hidden_dim} != model embed_dim={embed_dim}"));
+    }
+    let [(in_name, in_ty, in_dims)] = inputs else {
+        return Err(format!("graph must have exactly one input, has {}", inputs.len()));
+    };
+    if *in_ty != Some(Float32) {
+        return Err(format!("graph input '{in_name}' must be a float32 tensor, is {in_ty:?}"));
+    }
+    let dim_ok = |d: i64, want: usize| d < 0 || d as usize == want;
+    match in_dims.as_slice() {
+        [batch, feat] if dim_ok(*batch, 1) && dim_ok(*feat, embed_dim) => {}
+        other => {
+            return Err(format!(
+                "graph input '{in_name}' is {other:?}; expected [batch (1 or dynamic), {embed_dim}]"
+            ))
+        }
+    }
+    let Some((out_name, out_ty, out_dims)) = outputs.first() else {
+        return Err("graph has no outputs".to_string());
+    };
+    if *out_ty != Some(Float32) {
+        return Err(format!("graph output '{out_name}' must be a float32 tensor, is {out_ty:?}"));
+    }
+    // Drop a leading batch dimension of 1 / dynamic; what remains is the
+    // per-vector output.
+    let feat: &[i64] = match out_dims.as_slice() {
+        [batch, rest @ ..] if !rest.is_empty() && dim_ok(*batch, 1) => rest,
+        all => all,
+    };
+    let kind = manifest.output_shape.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    let want: Option<usize> = if kind == "hidden_delta" {
+        Some(embed_dim)
+    } else if kind == "scalar" {
+        Some(1)
+    } else if let Some(n) = kind.strip_prefix("category:") {
+        Some(n.parse::<usize>().map_err(|_| format!("output_shape.kind '{kind}' is not category:N"))?)
+    } else {
+        return Err(format!("output_shape.kind '{kind}' is not supported (scalar | category:N | hidden_delta)"));
+    };
+    let want = want.expect("every supported kind sets a width");
+    let width_ok = match feat {
+        [] => want == 1, // a rank-0 / [1] scalar
+        [w] => dim_ok(*w, want),
+        [.., w] => feat[..feat.len() - 1].iter().all(|d| dim_ok(*d, 1)) && dim_ok(*w, want),
+    };
+    if !width_ok {
+        return Err(format!(
+            "graph output '{out_name}' is {out_dims:?}; output_shape.kind '{kind}' needs [.., {want}]"
+        ));
+    }
+    Ok(())
 }
 
 /// GET /v1/shims/{id} — return one shim's manifest.
@@ -1254,3 +1379,77 @@ pub(crate) async fn shim_delete(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ort::value::TensorElementType::{Float32, Int64};
+
+    fn manifest(phase: &str, kind: &str, hidden_dim: u64) -> ShimManifest {
+        ShimManifest {
+            id: "s".into(),
+            version: "1".into(),
+            phase: phase.into(),
+            attachment: ShimAttachment { layer: "final".into(), pooling: "last_token".into() },
+            input_shape: serde_json::json!({"hidden_dim": hidden_dim}),
+            output_shape: serde_json::json!({"kind": kind}),
+            description: String::new(),
+        }
+    }
+
+    fn io(name: &str, ty: Option<ort::value::TensorElementType>, dims: &[i64]) -> ShimIo {
+        (name.into(), ty, dims.to_vec())
+    }
+
+    // --- Review #25 -----------------------------------------------------------
+
+    #[test]
+    fn steer_graph_matching_the_model_is_accepted() {
+        let m = manifest("steer", "hidden_delta", 2048);
+        let ins = [io("x", Some(Float32), &[-1, 2048])];
+        assert_eq!(validate_shim_io(&ins, &[io("y", Some(Float32), &[-1, 2048])], &m, 2048), Ok(()));
+        // batch 1 explicit, rank-1 output, fully dynamic dims: all accepted
+        let ins1 = [io("x", Some(Float32), &[1, 2048])];
+        assert_eq!(validate_shim_io(&ins1, &[io("y", Some(Float32), &[2048])], &m, 2048), Ok(()));
+        let dyn_ = [io("x", Some(Float32), &[-1, -1])];
+        assert_eq!(validate_shim_io(&dyn_, &[io("y", Some(Float32), &[-1, -1])], &m, 2048), Ok(()));
+    }
+
+    #[test]
+    fn wrong_input_width_is_refused() {
+        let m = manifest("steer", "hidden_delta", 2048);
+        let err = validate_shim_io(&[io("x", Some(Float32), &[-1, 512])], &[io("y", Some(Float32), &[-1, 2048])], &m, 2048)
+            .unwrap_err();
+        assert!(err.contains("input 'x'") && err.contains("2048"), "{err}");
+    }
+
+    #[test]
+    fn wrong_output_width_kind_or_type_is_refused() {
+        let ins = [io("x", Some(Float32), &[-1, 2048])];
+        let m = manifest("steer", "hidden_delta", 2048);
+        assert!(validate_shim_io(&ins, &[io("y", Some(Float32), &[-1, 512])], &m, 2048).is_err());
+        assert!(validate_shim_io(&ins, &[io("y", Some(Int64), &[-1, 2048])], &m, 2048).is_err());
+        assert!(validate_shim_io(&ins, &[], &m, 2048).unwrap_err().contains("no outputs"));
+        let scalar = manifest("gate", "scalar", 2048);
+        assert_eq!(validate_shim_io(&ins, &[io("y", Some(Float32), &[-1, 1])], &scalar, 2048), Ok(()));
+        assert_eq!(validate_shim_io(&ins, &[io("y", Some(Float32), &[1])], &scalar, 2048), Ok(()));
+        assert!(validate_shim_io(&ins, &[io("y", Some(Float32), &[-1, 3])], &scalar, 2048).is_err());
+        let cat = manifest("gate", "category:3", 2048);
+        assert_eq!(validate_shim_io(&ins, &[io("y", Some(Float32), &[-1, 3])], &cat, 2048), Ok(()));
+        assert!(validate_shim_io(&ins, &[io("y", Some(Float32), &[-1, 4])], &cat, 2048).is_err());
+        let bad_kind = manifest("gate", "tensor", 2048);
+        assert!(validate_shim_io(&ins, &[io("y", Some(Float32), &[-1, 1])], &bad_kind, 2048).unwrap_err().contains("not supported"));
+    }
+
+    #[test]
+    fn manifest_hidden_dim_must_match_the_model_and_inputs_must_be_one_f32() {
+        let ins = [io("x", Some(Float32), &[-1, 2048])];
+        let outs = [io("y", Some(Float32), &[-1, 2048])];
+        assert!(validate_shim_io(&ins, &outs, &manifest("steer", "hidden_delta", 1024), 2048).unwrap_err().contains("hidden_dim=1024"));
+        let two = [io("x", Some(Float32), &[-1, 2048]), io("z", Some(Float32), &[-1, 2048])];
+        assert!(validate_shim_io(&two, &outs, &manifest("steer", "hidden_delta", 2048), 2048).unwrap_err().contains("exactly one input"));
+        let int = [io("x", Some(Int64), &[-1, 2048])];
+        assert!(validate_shim_io(&int, &outs, &manifest("steer", "hidden_delta", 2048), 2048).unwrap_err().contains("float32"));
+        let rank1 = [io("x", Some(Float32), &[2048])];
+        assert!(validate_shim_io(&rank1, &outs, &manifest("steer", "hidden_delta", 2048), 2048).is_err());
+    }
+}

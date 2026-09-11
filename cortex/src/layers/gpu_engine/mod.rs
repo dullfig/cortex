@@ -386,6 +386,20 @@ fn read_back_buffer_f16_unpack(gpu: &GpuDevice, staging: &wgpu::Buffer, packed_b
     out
 }
 
+/// Review #26: RAII deferred-destroy flush. Holds the engine for a region
+/// that drops GPU caches and runs [`GpuEngine::poll_wait_quiet`] when the
+/// region ends — on the happy path, on an early `?` return, and during an
+/// unwind alike. The explicit `poll_wait` calls it replaced ran on the
+/// happy path only, so a panic between a drop and the flush left the
+/// budget ahead of the driver and the failure surfaced later, mislabeled.
+pub struct PollFlush<'a>(pub &'a GpuEngine);
+
+impl Drop for PollFlush<'_> {
+    fn drop(&mut self) {
+        self.0.poll_wait_quiet();
+    }
+}
+
 impl std::fmt::Debug for GpuEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "GpuEngine(wrapping {:?})", self.cpu)
@@ -709,6 +723,18 @@ impl GpuEngine {
             submission_index: None,
             timeout: None,
         }).unwrap();
+    }
+
+    /// [`Self::poll_wait`] that logs a poll error instead of panicking —
+    /// for [`PollFlush`]'s `Drop`, which may run during an unwind, where a
+    /// second panic aborts the process.
+    pub fn poll_wait_quiet(&self) {
+        if let Err(e) = self.gpu.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        }) {
+            tracing::error!(error = %e, "poll_wait failed");
+        }
     }
 
     /// Log wgpu's internal allocator report at INFO. Use to track

@@ -90,7 +90,9 @@ pub(super) struct KvWriteBatchParams {
     kv_dim: u32,
     start_pos: u32,
     n_tokens: u32,
-    _pad: u32,
+    /// Invocations per dispatch row (review #26): `65535 · 128`, so a
+    /// dispatch folded into `gid.y` addresses the right slot.
+    x_stride: u32,
 }
 
 /// Params struct for the add_inplace_batch shader. Two u32s.
@@ -1649,7 +1651,7 @@ impl GpuEngine {
             kv_dim: kv_dim as u32,
             start_pos: start_pos as u32,
             n_tokens: n_tokens as u32,
-            _pad: 0,
+            x_stride: 65535 * 128,
         };
         let params_buf = self.gpu.create_params_buffer(&params);
 

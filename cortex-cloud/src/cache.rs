@@ -166,6 +166,11 @@ pub(crate) async fn cache_load(
     // polar populate, the deferred-destroy flushes and the insert below
     // (gate -> pool lock order).
     let _gpu = state.gpu_gate.admit().await;
+    // Review #26: one deferred-destroy flush when this handler ends —
+    // after the polar_only drop of the f32 cache and after a same-id
+    // reload drops the old shard — on every exit path, unwind included.
+    // (Declared after the permit, so it runs while the gate is still held.)
+    let _flush = cortex::layers::gpu_engine::PollFlush(&state.engine);
 
     // Review #30/#31: a same-id reload builds the replacement BEFORE the
     // old shard is dropped (a failed reload must not lose the old shard),
@@ -246,16 +251,11 @@ pub(crate) async fn cache_load(
     // storage.
     let cache_opt = if req.polar_only {
         debug_assert!(polar.is_some(), "polar_only validated to require polar_cache_enabled");
+        // The f32 cache is dropped here; the `_flush` guard (review #26)
+        // drains wgpu's deferred-destroy queue when the handler ends, so
+        // the next cache_load allocates against a driver that has really
+        // freed it (review #30).
         drop(cache);
-        // Flush wgpu's deferred-destroy queue so the 300MB f32 cache we
-        // just dropped is actually freed before the next cache_load
-        // tries to allocate a fresh one. Without this, multiple back-
-        // to-back polar_only loads accumulate destroyed-but-not-yet-
-        // freed buffers in wgpu-29's allocator until allocation fails
-        // with a delayed validation error ("Buffer X is invalid")
-        // that surfaces at the NEXT poll/get_mapped_range — usually a
-        // subsequent retrieve, with a misleading buffer label.
-        tokio::task::block_in_place(|| state.engine.poll_wait());
         None
     } else {
         Some(cache)
@@ -299,8 +299,8 @@ pub(crate) async fn cache_load(
         // `wgpu error: Out of Memory`, fatal, on a worker thread. Same
         // mitigation as cache_delete and the polar_only path above; the
         // pool lock is already released so other handlers are not blocked.
+        // The flush itself is the `_flush` guard (review #26).
         drop(old);
-        tokio::task::block_in_place(|| state.engine.poll_wait());
     }
     // Drop any stale composition that referenced the old (or absent) version
     // of this shard. Cheap: a single buffer-array drop on the GPU.
@@ -561,20 +561,20 @@ pub(crate) async fn cache_delete(
     State(state): State<Arc<ServerState>>,
     Path(cache_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    // Review #26: flush wgpu's deferred-destroy queue when this handler
+    // ends (the evicted shard's heaps are dropped inside the block below).
+    let _flush = cortex::layers::gpu_engine::PollFlush(&state.engine);
     let mut pool = state.cache_pool.lock().await;
     if pool.remove(&cache_id).is_some() {
         let pool_size = pool.len();
         drop(pool);
         // Composition might reference the evicted shard; safest to drop.
         *state.composition.lock().await = None;
-        // Flush wgpu's deferred-destroy queue so the evicted cache's
-        // backing buffers (f32 kv_heap + polar const/data/signs heaps)
-        // are actually freed NOW. Without this, repeated
-        // load/retrieve/delete cycles accumulate destroyed-but-unfreed
-        // buffers until wgpu-29 surfaces a delayed "Validation Error"
-        // panic at the next Device::poll (observed at ~8-10 cycles).
-        // Same mitigation as the polar_only drop in cache_load.
-        tokio::task::block_in_place(|| state.engine.poll_wait());
+        // The evicted cache's backing buffers (f32 kv_heap + polar
+        // const/data/signs heaps) are freed by the `_flush` guard's poll
+        // as this handler returns; without a flush, repeated
+        // load/retrieve/delete cycles accumulated destroyed-but-unfreed
+        // buffers until wgpu-29 surfaced a delayed "Validation Error".
         info!(cache_id = %cache_id, pool_size = pool_size, "cache evicted");
         Ok(StatusCode::NO_CONTENT)
     } else {

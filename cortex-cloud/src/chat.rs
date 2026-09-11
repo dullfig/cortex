@@ -324,6 +324,26 @@ pub(crate) fn check_retrieve_fits(
     Ok(())
 }
 
+/// Review #26: `max_tokens: 0` is a 400 (OpenAI rejects it too). Before,
+/// the loops ran `for _ in 1..max_tokens` after an unconditional first
+/// sample, so 0 generated exactly one token with `finish_reason: "length"`.
+pub(crate) fn check_max_tokens(
+    max_tokens: u32,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if max_tokens == 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "invalid_request",
+                    "message": "max_tokens must be >= 1",
+                }
+            })),
+        ));
+    }
+    Ok(())
+}
+
 /// Review #10: bytes of client text one request may ask the tokenizer to
 /// encode — `max(64 KiB, 16 × max_seq_len)`. A text longer than that cannot
 /// tokenize into the window (a token is at least one byte... but Qwen's
@@ -531,6 +551,13 @@ pub(crate) fn generate_with_cache(
     if n == 0 {
         return Vec::new();
     }
+    // Review #26: clamped to zero (the shard has room for exactly the
+    // prompt) — the prompt still enters the cache so `entry.tokens` and
+    // the cache stay in lockstep, and nothing is sampled.
+    if max_tokens == 0 {
+        forward_chunked_into_cache(engine, prompt_tokens, cache, |_, _, _, _| {});
+        return Vec::new();
+    }
     if n > 1 {
         forward_chunked_into_cache(engine, &prompt_tokens[..n - 1], cache, |_, _, _, _| {});
     }
@@ -641,6 +668,11 @@ pub(crate) fn generate_with_polar_cache(
     if prompt_tokens.len() > engine.max_single_dispatch_tokens() {
         return None;
     }
+    // Review #26: same clamp-to-zero rule as generate_with_cache.
+    if max_tokens == 0 {
+        engine.forward_full_gpu_polar_with_cache_advance_only(prompt_tokens, polar_cache);
+        return Some(Vec::new());
+    }
     let mut next_token = engine.forward_full_gpu_polar_with_cache_inject_argmax_greedy(
         prompt_tokens, polar_cache, &[],
     )?;
@@ -744,7 +776,7 @@ pub(crate) fn generate_stateless_gpu(
     // prefill below on the last token — steer/greedy/projection code is
     // unchanged.
     let n = prompt_tokens.len();
-    if n == 0 {
+    if n == 0 || max_tokens == 0 {
         return Ok(Vec::new());
     }
     if n > 1 {
@@ -871,6 +903,10 @@ pub(crate) async fn chat_completions(
         .map(|m| m.role.len() + m.content.as_deref().map_or(0, str::len))
         .sum();
     check_input_bytes(content_bytes, state.max_seq_len)?;
+    // Review #26: a zero max_tokens is a 400; a clamp-to-zero (a shard
+    // with room for exactly the prompt) is an empty completion — the loops
+    // below return before sampling when `max_tokens == 0`.
+    check_max_tokens(req.max_tokens)?;
     let prompt_tokens = apply_chat_template(
         &req.messages,
         req.tools.as_deref(),
@@ -1189,6 +1225,12 @@ pub(crate) async fn chat_completions(
     // tokens + prompt tokens. Returns early with a RetrievalResponse.
     // ---------------------------------------------------------------
     let is_retrieve = req.mode.as_deref() == Some("retrieve");
+    // Review #26: the retrieve path drops per-forward captures and the
+    // composition; flush wgpu's deferred-destroy queue when this handler
+    // ends — including an early `?` return or an unwind, which the explicit
+    // happy-path `poll_wait` it replaces never covered. The GPU permit was
+    // taken above, so the flush runs while the gate is still held.
+    let _flush = is_retrieve.then(|| cortex::layers::gpu_engine::PollFlush(&state.engine));
 
     // Review #4: the traced retrieve forward is unchunked; bound the query
     // by the wgpu dispatch limit here (400) — the engine asserts as backstop.
@@ -1650,13 +1692,8 @@ pub(crate) async fn chat_completions(
             .take(top_k)
             .collect();
 
-        // Flush wgpu's deferred-destroy queue: each traced forward drops
-        // per-layer capture buffers + stagings at exit, and repeated
-        // retrieves accumulate them until wgpu-29 panics with a delayed
-        // Validation Error at a later Device::poll (observed at ~8-10
-        // load/retrieve/delete cycles). Mirrors the cache_delete flush.
-        tokio::task::block_in_place(|| state.engine.poll_wait());
-
+        // The deferred-destroy flush for this request is the `_flush`
+        // guard taken with the GPU permit (review #26).
         let retrieval_ms = retrieve_start.elapsed().as_millis() as u64;
 
         _telemetry.mark_success();
@@ -2784,6 +2821,15 @@ mod tests {
     }
 
     /// #1: the pure clamp that keeps decode away from the overflow assert.
+    #[test]
+    fn max_tokens_zero_is_rejected_at_the_boundary() {
+        assert!(check_max_tokens(0).is_err());
+        let err = check_max_tokens(0).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0["error"]["type"], "invalid_request");
+        assert!(check_max_tokens(1).is_ok());
+    }
+
     #[test]
     fn clamp_max_tokens_cases() {
         assert_eq!(clamp_max_tokens(100, 10, 50), Ok(40)); // fits
