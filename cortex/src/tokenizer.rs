@@ -73,8 +73,10 @@ pub struct Tokenizer {
     mode: BpeMode,
     /// Pre-tokenizer type (how text is split before BPE).
     pre_type: PreTokenizerType,
-    /// GPT-2 merge list: (left, right) → rank (lower = merge first).
-    merge_ranks: HashMap<(String, String), u32>,
+    /// GPT-2 merge list: `merge_key(left, right)` → rank (lower = merge
+    /// first). One `String` key so a lookup borrows a scratch buffer
+    /// instead of allocating a pair per adjacent symbol (review #10).
+    merge_ranks: HashMap<String, u32>,
     /// Whether to add BOS token by default (from `tokenizer.ggml.add_bos_token`).
     /// Default: true (LLaMA). Qwen2 sets this to false.
     add_bos_default: bool,
@@ -362,7 +364,7 @@ impl Tokenizer {
             if let (Some(left), Some(right), None) = (parts.next(), parts.next(), parts.next()) {
                 if !left.is_empty() && !right.is_empty() {
                     merge_ranks
-                        .entry((left.to_string(), right.to_string()))
+                        .entry(merge_key(left, right))
                         .or_insert(rank as u32);
                 }
             }
@@ -447,22 +449,50 @@ impl Tokenizer {
             return tokens;
         }
 
-        // Split on special-token occurrences. Iteratively find the
-        // leftmost match (longest on ties); BPE-encode the run before
-        // it; emit the special token as a single ID; repeat on the tail.
-        let mut remaining = text;
-        while !remaining.is_empty() {
-            match self.find_next_special(remaining) {
-                Some((pos, tok_str, tok_id)) => {
-                    if pos > 0 {
-                        self.encode_segment(&remaining[..pos], &mut tokens);
+        // Split on special-token occurrences: leftmost match first, longest
+        // on ties; BPE-encode the run before it; emit the special token as
+        // a single id; repeat on the tail. Review #10: each token's next
+        // occurrence is cached and re-searched only once the cursor has
+        // passed it, so a text with k occurrences costs O(S·n) instead of
+        // k searches of every token over the whole remainder (O(k·S·n)).
+        let mut next_pos: Vec<Option<usize>> = self
+            .special_tokens
+            .iter()
+            .map(|(s, _)| text.find(s.as_str()))
+            .collect();
+        let mut cursor = 0usize;
+        loop {
+            // `special_tokens` is sorted longest-first, so a strict `<`
+            // keeps the longest token among equal positions.
+            let mut best: Option<(usize, usize)> = None;
+            for (idx, pos) in next_pos.iter().enumerate() {
+                if let Some(pos) = *pos {
+                    if best.map_or(true, |(bp, _)| pos < bp) {
+                        best = Some((pos, idx));
                     }
-                    tokens.push(tok_id);
-                    remaining = &remaining[pos + tok_str.len()..];
                 }
-                None => {
-                    self.encode_segment(remaining, &mut tokens);
-                    break;
+            }
+            let Some((pos, idx)) = best else {
+                if cursor < text.len() {
+                    self.encode_segment(&text[cursor..], &mut tokens);
+                }
+                break;
+            };
+            if pos > cursor {
+                self.encode_segment(&text[cursor..pos], &mut tokens);
+            }
+            let (tok_str, tok_id) = &self.special_tokens[idx];
+            tokens.push(*tok_id);
+            cursor = pos + tok_str.len();
+            // Refresh only the cached matches the cursor has passed
+            // (including an overlapping match inside the token just consumed).
+            for (i, slot) in next_pos.iter_mut().enumerate() {
+                if let Some(p) = *slot {
+                    if p < cursor {
+                        *slot = text[cursor..]
+                            .find(self.special_tokens[i].0.as_str())
+                            .map(|r| r + cursor);
+                    }
                 }
             }
         }
@@ -493,31 +523,6 @@ impl Tokenizer {
         }
     }
 
-    /// Find the leftmost occurrence of any Control-type token string in
-    /// `text`. On ties (same starting position), prefer the longer
-    /// token. Returns `(byte_offset, token_string, token_id)` or None.
-    fn find_next_special<'a>(&'a self, text: &str) -> Option<(usize, &'a str, u32)> {
-        let mut best: Option<(usize, &'a str, u32)> = None;
-        for (tok_str, tok_id) in &self.special_tokens {
-            if let Some(rel_pos) = text.find(tok_str.as_str()) {
-                let candidate = (rel_pos, tok_str.as_str(), *tok_id);
-                best = Some(match best {
-                    None => candidate,
-                    Some(cur) => {
-                        if rel_pos < cur.0
-                            || (rel_pos == cur.0 && tok_str.len() > cur.1.len())
-                        {
-                            candidate
-                        } else {
-                            cur
-                        }
-                    }
-                });
-            }
-        }
-        best
-    }
-
     /// Decode token IDs back to text.
     pub fn decode(&self, tokens: &[u32]) -> String {
         match self.mode {
@@ -534,9 +539,38 @@ impl Tokenizer {
         // Prepend space, replace all spaces with ▁
         let text = format!(" {}", text).replace(' ', "\u{2581}");
 
-        let mut symbols = self.sp_initial_tokenize(&text);
-        self.sp_bpe_merge(&mut symbols);
-        tokens.extend(symbols.iter().map(|s| s.token_id));
+        // Review #10: symbols are byte ranges into `text`; a character the
+        // vocabulary lacks becomes one unmergeable range per UTF-8 byte
+        // (its `<0xHH>` byte token). The old loop also tried to merge a
+        // byte token's `<0xHH>` *text* with its neighbour — a pair no real
+        // SentencePiece vocabulary contains, so none is lost.
+        let mut pieces: Vec<(usize, usize, u32, bool)> = Vec::with_capacity(text.len());
+        let mut off = 0usize;
+        for ch in text.chars() {
+            let len = ch.len_utf8();
+            if let Some(&id) = self.token_to_id.get(&text[off..off + len]) {
+                pieces.push((off, off + len, id, true));
+            } else {
+                for k in 0..len {
+                    let byte_id = self.byte_to_token[text.as_bytes()[off + k] as usize];
+                    if byte_id != u32::MAX {
+                        pieces.push((off + k, off + k + 1, byte_id, false));
+                    }
+                }
+            }
+            off += len;
+        }
+        let mut key = String::new();
+        let merged = bpe_merge_ranges(&text, &pieces, |left, right| {
+            key.clear();
+            key.push_str(left);
+            key.push_str(right);
+            let &id = self.token_to_id.get(key.as_str())?;
+            let score = self.scores[id as usize];
+            // A NaN score never won the old `score < best` comparison.
+            if score.is_nan() { None } else { Some((OrdF32(score), id)) }
+        });
+        tokens.extend(merged.iter().map(|&(_, _, id)| id));
     }
 
     fn decode_sentencepiece(&self, tokens: &[u32]) -> String {
@@ -592,60 +626,6 @@ impl Tokenizer {
         text
     }
 
-    fn sp_initial_tokenize(&self, text: &str) -> Vec<Symbol> {
-        let mut symbols = Vec::new();
-        for ch in text.chars() {
-            let ch_str = ch.to_string();
-            if let Some(&id) = self.token_to_id.get(&ch_str) {
-                symbols.push(Symbol { text: ch_str, token_id: id });
-            } else {
-                let mut buf = [0u8; 4];
-                let bytes = ch.encode_utf8(&mut buf);
-                for b in bytes.bytes() {
-                    let byte_id = self.byte_to_token[b as usize];
-                    if byte_id != u32::MAX {
-                        symbols.push(Symbol {
-                            text: format!("<0x{:02X}>", b),
-                            token_id: byte_id,
-                        });
-                    }
-                }
-            }
-        }
-        symbols
-    }
-
-    fn sp_bpe_merge(&self, symbols: &mut Vec<Symbol>) {
-        loop {
-            if symbols.len() < 2 {
-                break;
-            }
-
-            let mut best_score = f32::INFINITY;
-            let mut best_idx = usize::MAX;
-            let mut best_id = 0u32;
-
-            for i in 0..symbols.len() - 1 {
-                let merged = format!("{}{}", symbols[i].text, symbols[i + 1].text);
-                if let Some(&id) = self.token_to_id.get(&merged) {
-                    let score = self.scores[id as usize];
-                    if score < best_score {
-                        best_score = score;
-                        best_idx = i;
-                        best_id = id;
-                    }
-                }
-            }
-
-            if best_idx == usize::MAX {
-                break;
-            }
-
-            let merged_text = format!("{}{}", symbols[best_idx].text, symbols[best_idx + 1].text);
-            symbols[best_idx] = Symbol { text: merged_text, token_id: best_id };
-            symbols.remove(best_idx + 1);
-        }
-    }
 
     // -----------------------------------------------------------------------
     // GPT-2 BPE
@@ -658,18 +638,31 @@ impl Tokenizer {
             PreTokenizerType::Llama3 => llama3_pre_tokenize(text),
         };
 
+        let mut key = String::new();
         for word in &words {
-            // Convert each byte to its GPT-2 Unicode character
-            let chars: Vec<String> = word
-                .bytes()
-                .map(|b| gpt2_byte_to_char(b).to_string())
-                .collect();
+            // Convert each byte to its GPT-2 Unicode character; the word
+            // buffer is the merge arena (review #10: ranges, not strings).
+            let mapped: String = word.bytes().map(gpt2_byte_to_char).collect();
+            let mut pieces: Vec<(usize, usize, u32, bool)> = Vec::with_capacity(word.len());
+            let mut off = 0usize;
+            for ch in mapped.chars() {
+                let len = ch.len_utf8();
+                pieces.push((off, off + len, u32::MAX, true));
+                off += len;
+            }
 
-            // Apply BPE merges
-            let merged = self.gpt2_bpe_merge(chars);
+            // Apply BPE merges: lowest rank first, leftmost on ties.
+            let merged = bpe_merge_ranges(&mapped, &pieces, |left, right| {
+                key.clear();
+                key.push_str(left);
+                key.push('\0');
+                key.push_str(right);
+                self.merge_ranks.get(key.as_str()).map(|&rank| (rank, u32::MAX))
+            });
 
             // Look up each merged piece in vocabulary
-            for piece in &merged {
+            for &(start, end, _) in &merged {
+                let piece = &mapped[start..end];
                 if let Some(&id) = self.token_to_id.get(piece) {
                     tokens.push(id);
                 } else {
@@ -712,37 +705,131 @@ impl Tokenizer {
         String::from_utf8_lossy(&bytes).to_string()
     }
 
-    fn gpt2_bpe_merge(&self, mut symbols: Vec<String>) -> Vec<String> {
-        loop {
-            if symbols.len() < 2 {
-                break;
-            }
+}
 
-            // Find the pair with the lowest merge rank
-            let mut best_rank = u32::MAX;
-            let mut best_idx = usize::MAX;
+/// The `merge_ranks` key for an adjacent pair: `left`, NUL, `right`. NUL
+/// never occurs inside a merge entry, so the key is unambiguous.
+fn merge_key(left: &str, right: &str) -> String {
+    let mut key = String::with_capacity(left.len() + right.len() + 1);
+    key.push_str(left);
+    key.push('\0');
+    key.push_str(right);
+    key
+}
 
-            for i in 0..symbols.len() - 1 {
-                let pair = (symbols[i].clone(), symbols[i + 1].clone());
-                if let Some(&rank) = self.merge_ranks.get(&pair) {
-                    if rank < best_rank {
-                        best_rank = rank;
-                        best_idx = i;
-                    }
-                }
-            }
-
-            if best_idx == usize::MAX {
-                break;
-            }
-
-            let merged = format!("{}{}", symbols[best_idx], symbols[best_idx + 1]);
-            symbols[best_idx] = merged;
-            symbols.remove(best_idx + 1);
-        }
-
-        symbols
+/// A SentencePiece merge score with a total order (lower merges first).
+#[derive(Clone, Copy, PartialEq)]
+struct OrdF32(f32);
+impl Eq for OrdF32 {}
+impl PartialOrd for OrdF32 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
+}
+impl Ord for OrdF32 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+/// One symbol of a BPE merge pass: a byte range into the word buffer,
+/// linked to its live neighbours.
+#[derive(Clone, Copy)]
+struct BpeSym {
+    start: usize,
+    end: usize,
+    prev: usize,
+    next: usize,
+    alive: bool,
+    mergeable: bool,
+    token_id: u32,
+}
+
+/// Review #10: one BPE merge pass in `O(m log m)` — the shape of
+/// llama.cpp's `llm_bigram` queue. `pieces` are the initial symbols as
+/// `(start, end, token_id, mergeable)` byte ranges tiling `word` in order;
+/// `rank_of(left, right)` gives two adjacent pieces' merge priority (lower
+/// merges first) and the merged token id, or `None`. Every adjacent pair
+/// is a heap candidate keyed `(priority, left index)`; after a merge the
+/// two new neighbour pairs are pushed; a popped candidate whose sides have
+/// since changed (dead, re-linked or grown) is stale and skipped. That is
+/// the same choice the previous loop made by rescanning every pair each
+/// iteration — lowest priority, leftmost on ties — without its `O(m²)`
+/// scans and its allocation per pair (a 2 MB word was minutes of CPU per
+/// request). Unmergeable pieces (byte-fallback bytes) never enter a pair.
+/// Returns the surviving `(start, end, token_id)` ranges in order.
+fn bpe_merge_ranges<P: Ord + Copy>(
+    word: &str,
+    pieces: &[(usize, usize, u32, bool)],
+    mut rank_of: impl FnMut(&str, &str) -> Option<(P, u32)>,
+) -> Vec<(usize, usize, u32)> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    let n = pieces.len();
+    let mut syms: Vec<BpeSym> = pieces
+        .iter()
+        .enumerate()
+        .map(|(i, &(start, end, token_id, mergeable))| BpeSym {
+            start,
+            end,
+            prev: if i == 0 { usize::MAX } else { i - 1 },
+            next: i + 1,
+            alive: true,
+            mergeable,
+            token_id,
+        })
+        .collect();
+    // (priority, left, right, left len, right len, merged id)
+    let mut heap: BinaryHeap<Reverse<(P, usize, usize, usize, usize, u32)>> = BinaryHeap::new();
+    let mut push = |heap: &mut BinaryHeap<Reverse<(P, usize, usize, usize, usize, u32)>>,
+                    syms: &[BpeSym],
+                    l: usize,
+                    r: usize| {
+        let (sl, sr) = (syms[l], syms[r]);
+        if !sl.mergeable || !sr.mergeable {
+            return;
+        }
+        if let Some((p, id)) = rank_of(&word[sl.start..sl.end], &word[sr.start..sr.end]) {
+            heap.push(Reverse((p, l, r, sl.end - sl.start, sr.end - sr.start, id)));
+        }
+    };
+    for i in 0..n.saturating_sub(1) {
+        push(&mut heap, &syms, i, i + 1);
+    }
+    while let Some(Reverse((_, l, r, left_len, right_len, id))) = heap.pop() {
+        let (sl, sr) = (syms[l], syms[r]);
+        if !sl.alive
+            || !sr.alive
+            || sl.next != r
+            || sl.end - sl.start != left_len
+            || sr.end - sr.start != right_len
+        {
+            continue; // stale: one side merged since this candidate was pushed
+        }
+        syms[l].end = sr.end;
+        syms[l].token_id = id;
+        syms[l].next = sr.next;
+        syms[r].alive = false;
+        if sr.next < n {
+            syms[sr.next].prev = l;
+        }
+        if sl.prev != usize::MAX {
+            push(&mut heap, &syms, sl.prev, l);
+        }
+        if syms[l].next < n {
+            push(&mut heap, &syms, l, syms[l].next);
+        }
+    }
+    let mut out = Vec::with_capacity(n);
+    let mut i = 0usize;
+    while i < n {
+        let s = syms[i];
+        debug_assert!(s.alive);
+        out.push((s.start, s.end, s.token_id));
+        i = s.next;
+    }
+    out
 }
 
 impl std::fmt::Debug for Tokenizer {
@@ -756,13 +843,6 @@ impl std::fmt::Debug for Tokenizer {
             self.mode,
         )
     }
-}
-
-/// A symbol during BPE processing.
-#[derive(Debug, Clone)]
-struct Symbol {
-    text: String,
-    token_id: u32,
 }
 
 /// Parse a byte fallback token like "<0x41>" → Some(0x41).
@@ -1231,7 +1311,7 @@ mod tests {
             "h e".to_string(),      // duplicate: must not overwrite rank 0
         ];
         let tok = Tokenizer::from_parts_gpt2(vocab, types, 0, 0, &merges).unwrap();
-        assert_eq!(tok.merge_ranks.get(&("h".to_string(), "e".to_string())), Some(&0));
+        assert_eq!(tok.merge_ranks.get(&merge_key("h", "e")), Some(&0));
         assert_eq!(tok.merge_ranks.len(), 1);
     }
 
@@ -1777,6 +1857,227 @@ mod tests {
             let decoded = tok.decode(&tokens);
             assert_eq!(&decoded, text, "roundtrip failed for {:?}", text);
         }
+    }
+
+    // =======================================================================
+    // Review #10: the bigram-heap merge is the old rescan loop, faster
+    // =======================================================================
+
+    /// The pre-#10 GPT-2 merge loop, kept as the oracle: rescan every
+    /// adjacent pair, take the lowest rank (leftmost on ties), repeat.
+    fn reference_gpt2_merge(tok: &Tokenizer, mut symbols: Vec<String>) -> Vec<String> {
+        loop {
+            if symbols.len() < 2 {
+                break;
+            }
+            let mut best_rank = u32::MAX;
+            let mut best_idx = usize::MAX;
+            for i in 0..symbols.len() - 1 {
+                if let Some(&rank) = tok.merge_ranks.get(&merge_key(&symbols[i], &symbols[i + 1])) {
+                    if rank < best_rank {
+                        best_rank = rank;
+                        best_idx = i;
+                    }
+                }
+            }
+            if best_idx == usize::MAX {
+                break;
+            }
+            let merged = format!("{}{}", symbols[best_idx], symbols[best_idx + 1]);
+            symbols[best_idx] = merged;
+            symbols.remove(best_idx + 1);
+        }
+        symbols
+    }
+
+    fn reference_encode_gpt2(tok: &Tokenizer, text: &str) -> Vec<u32> {
+        let mut tokens = Vec::new();
+        for word in gpt2_pre_tokenize(text) {
+            let chars: Vec<String> = word.bytes().map(|b| gpt2_byte_to_char(b).to_string()).collect();
+            for piece in reference_gpt2_merge(tok, chars) {
+                if let Some(&id) = tok.token_to_id.get(&piece) {
+                    tokens.push(id);
+                } else {
+                    for b in piece.bytes() {
+                        let byte_id = tok.byte_to_token[b as usize];
+                        if byte_id != u32::MAX {
+                            tokens.push(byte_id);
+                        }
+                    }
+                }
+            }
+        }
+        tokens
+    }
+
+    /// The pre-#10 SentencePiece loop: rescan, lowest score first,
+    /// leftmost on ties, byte-fallback pieces carry their `<0xHH>` text.
+    fn reference_encode_sp(tok: &Tokenizer, text: &str) -> Vec<u32> {
+        let text = format!(" {}", text).replace(' ', "\u{2581}");
+        let mut symbols: Vec<(String, u32)> = Vec::new();
+        for ch in text.chars() {
+            let ch_str = ch.to_string();
+            if let Some(&id) = tok.token_to_id.get(&ch_str) {
+                symbols.push((ch_str, id));
+            } else {
+                let mut buf = [0u8; 4];
+                for b in ch.encode_utf8(&mut buf).bytes() {
+                    let byte_id = tok.byte_to_token[b as usize];
+                    if byte_id != u32::MAX {
+                        symbols.push((format!("<0x{:02X}>", b), byte_id));
+                    }
+                }
+            }
+        }
+        loop {
+            if symbols.len() < 2 {
+                break;
+            }
+            let mut best_score = f32::INFINITY;
+            let mut best_idx = usize::MAX;
+            let mut best_id = 0u32;
+            for i in 0..symbols.len() - 1 {
+                let merged = format!("{}{}", symbols[i].0, symbols[i + 1].0);
+                if let Some(&id) = tok.token_to_id.get(&merged) {
+                    let score = tok.scores[id as usize];
+                    if score < best_score {
+                        best_score = score;
+                        best_idx = i;
+                        best_id = id;
+                    }
+                }
+            }
+            if best_idx == usize::MAX {
+                break;
+            }
+            let merged_text = format!("{}{}", symbols[best_idx].0, symbols[best_idx + 1].0);
+            symbols[best_idx] = (merged_text, best_id);
+            symbols.remove(best_idx + 1);
+        }
+        symbols.iter().map(|s| s.1).collect()
+    }
+
+    /// Deterministic xorshift so the differential corpus is reproducible.
+    fn random_words(seed: u64, n: usize, alphabet: &[&str], max_len: usize) -> Vec<String> {
+        let mut x = seed | 1;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        (0..n)
+            .map(|_| {
+                let len = 1 + (next() as usize) % max_len;
+                (0..len).map(|_| alphabet[(next() as usize) % alphabet.len()]).collect::<String>()
+            })
+            .collect()
+    }
+
+    /// A SentencePiece fixture with a real merge ladder: scores are
+    /// "lower merges first", with ties to exercise leftmost-wins.
+    fn make_sp_tokenizer() -> Tokenizer {
+        let pieces: &[(&str, f32, TokenType)] = &[
+            ("<unk>", 0.0, TokenType::Unknown),
+            ("<s>", 0.0, TokenType::Control),
+            ("</s>", 0.0, TokenType::Control),
+            ("\u{2581}", -1.0, TokenType::Normal),
+            ("h", -1.0, TokenType::Normal),
+            ("e", -1.0, TokenType::Normal),
+            ("l", -1.0, TokenType::Normal),
+            ("o", -1.0, TokenType::Normal),
+            ("w", -1.0, TokenType::Normal),
+            ("he", -10.0, TokenType::Normal),
+            ("ll", -10.0, TokenType::Normal),   // ties with "he": leftmost wins
+            ("lo", -9.0, TokenType::Normal),
+            ("hel", -8.0, TokenType::Normal),
+            ("hell", -7.0, TokenType::Normal),
+            ("hello", -6.0, TokenType::Normal),
+            ("\u{2581}h", -5.0, TokenType::Normal),
+            ("\u{2581}he", -4.5, TokenType::Normal),
+            ("\u{2581}hello", -4.0, TokenType::Normal),
+            ("ow", -3.0, TokenType::Normal),
+            ("low", -2.0, TokenType::Normal),
+            ("<0xC3>", 0.0, TokenType::Byte),
+            ("<0xA9>", 0.0, TokenType::Byte),
+        ];
+        let vocab = pieces.iter().map(|p| p.0.to_string()).collect();
+        let scores = pieces.iter().map(|p| p.1).collect();
+        let types = pieces.iter().map(|p| p.2).collect();
+        Tokenizer::from_parts(vocab, scores, types, 1, 2).unwrap()
+    }
+
+    #[test]
+    fn bigram_merge_matches_the_rescan_loop_gpt2() {
+        let tok = make_gpt2_tokenizer();
+        let words = random_words(0x5eed, 500, &["h", "e", "l", "o", " ", "w", "'s", "1", "."], 24);
+        for w in &words {
+            assert_eq!(tok.encode(w, false), reference_encode_gpt2(&tok, w), "word {w:?}");
+        }
+        for w in ["hello", "hell", "hello hello", "helloworld", "ll", "lo", "hellohello", "he ll o"] {
+            assert_eq!(tok.encode(w, false), reference_encode_gpt2(&tok, w), "word {w:?}");
+        }
+    }
+
+    #[test]
+    fn bigram_merge_matches_the_rescan_loop_sentencepiece() {
+        let tok = make_sp_tokenizer();
+        let words = random_words(0xbeef, 500, &["h", "e", "l", "o", "w", " ", "é"], 20);
+        for w in &words {
+            assert_eq!(tok.encode(w, false), reference_encode_sp(&tok, w), "word {w:?}");
+        }
+        for w in ["hello", "hello world", "low", "hellow", "héllo", "llll", "hehe"] {
+            assert_eq!(tok.encode(w, false), reference_encode_sp(&tok, w), "word {w:?}");
+        }
+    }
+
+    #[test]
+    fn bigram_merge_ties_break_leftmost() {
+        // "he" and "ll" share a score; in "hell" the leftmost pair merges
+        // first either way, but in "llhe" it is "ll" — the position, not
+        // the vocabulary order, decides.
+        let tok = make_sp_tokenizer();
+        assert_eq!(tok.encode("llhe", false), reference_encode_sp(&tok, "llhe"));
+        let gpt2 = make_gpt2_tokenizer();
+        assert_eq!(gpt2.encode("hell", false), vec![257, 258]);
+    }
+
+    #[test]
+    fn long_inputs_encode_in_bounded_time() {
+        // Review #10: an unbroken 512 KB word was O(m²) rescans with two
+        // allocations per pair — effectively never. Bound: seconds in debug.
+        let tok = make_gpt2_tokenizer();
+        let t = std::time::Instant::now();
+        let word_a = "a".repeat(512 * 1024);
+        assert_eq!(tok.encode(&word_a, false).len(), 512 * 1024);
+        // One 500 KB word of "hello"s: with this fixture "ll" (rank 1)
+        // outranks "hel" (rank 3), so each "hello" is [he, ll, o] — the
+        // same answer `gpt2_encode_hello` pins for a single word.
+        let word_hello = "hello".repeat(100 * 1024);
+        let toks = tok.encode(&word_hello, false);
+        assert_eq!(toks.len(), 3 * 100 * 1024);
+        let o_id = tok.token_id("o").unwrap();
+        assert!(toks.chunks_exact(3).all(|c| c == [257, 258, o_id]));
+        let alternating = "ab".repeat(256 * 1024);
+        assert_eq!(tok.encode(&alternating, false).len(), 512 * 1024);
+        let sp = make_sp_tokenizer();
+        let sp_toks = sp.encode(&"hello".repeat(100 * 1024), false);
+        assert!(sp_toks.len() <= 100 * 1024 + 1);
+        assert!(t.elapsed().as_secs() < 20, "long inputs took {:?}", t.elapsed());
+    }
+
+    #[test]
+    fn repeated_special_tokens_scan_in_linear_time() {
+        let (vocab, scores, types) = tiny_parts();
+        let tok = Tokenizer::from_parts(vocab, scores, types, 1, 2).unwrap();
+        let text = "<|im_start|>".repeat(17_000); // ~200 KB
+        let t = std::time::Instant::now();
+        let toks = tok.encode(&text, false);
+        assert_eq!(toks.len(), 17_000);
+        assert!(toks.iter().all(|&t| t == 4));
+        assert!(t.elapsed().as_secs() < 5, "special scan took {:?}", t.elapsed());
+        // Tie-breaking and the run between specials are unchanged.
+        assert_eq!(tok.encode("a<|im_start|>a", false), vec![3, 4, 3]);
     }
 
     #[test]

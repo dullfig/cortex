@@ -324,6 +324,40 @@ pub(crate) fn check_retrieve_fits(
     Ok(())
 }
 
+/// Review #10: bytes of client text one request may ask the tokenizer to
+/// encode — `max(64 KiB, 16 × max_seq_len)`. A text longer than that cannot
+/// tokenize into the window (a token is at least one byte... but Qwen's
+/// vocabulary averages ~4 bytes per token, so 16× is generous), and would
+/// have been a 400 after paying the encode. Checked BEFORE tokenization.
+pub(crate) fn input_byte_cap(max_seq_len: usize) -> usize {
+    (64 * 1024).max(max_seq_len.saturating_mul(16))
+}
+
+/// Review #10: the 400 for text over [`input_byte_cap`].
+pub(crate) fn check_input_bytes(
+    bytes: usize,
+    max_seq_len: usize,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let cap = input_byte_cap(max_seq_len);
+    if bytes > cap {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "input_too_long",
+                    "message": format!(
+                        "request text is {bytes} bytes; the limit is {cap} bytes \
+                         (max(64 KiB, 16 x --max-seq-len))"
+                    ),
+                    "input_bytes": bytes,
+                    "max_input_bytes": cap,
+                }
+            })),
+        ));
+    }
+    Ok(())
+}
+
 /// Review #5: a prompt that cannot fit the context window at all is a 400,
 /// not an `assert!("cache overflow")` inside the prefill.
 pub(crate) fn check_prompt_len(
@@ -828,6 +862,15 @@ pub(crate) async fn chat_completions(
     let cancel = CancelOnDrop::new();
     let should_stop = stop_when(cancel.flag());
 
+    // Review #10: bound the bytes handed to the tokenizer before encoding
+    // (the merge loop is linearithmic now, but a 2 MB body is still work
+    // the window could never use).
+    let content_bytes: usize = req
+        .messages
+        .iter()
+        .map(|m| m.role.len() + m.content.as_deref().map_or(0, str::len))
+        .sum();
+    check_input_bytes(content_bytes, state.max_seq_len)?;
     let prompt_tokens = apply_chat_template(
         &req.messages,
         req.tools.as_deref(),

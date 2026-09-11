@@ -224,11 +224,14 @@ fn _stream_marker(_: impl Stream) {}
 async fn tokenize(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<TokenizeRequest>,
-) -> Json<TokenizeResponse> {
+) -> Result<Json<TokenizeResponse>, (StatusCode, Json<serde_json::Value>)> {
+    // Review #10: cap the text before encoding, and encode off the reactor
+    // thread — a large tokenize used to stall every other request.
+    crate::chat::check_input_bytes(req.text.len(), state.max_seq_len)?;
     let add_bos = req.add_bos.unwrap_or(state.tokenizer.add_bos_default());
-    let tokens = state.tokenizer.encode(&req.text, add_bos);
+    let tokens = tokio::task::block_in_place(|| state.tokenizer.encode(&req.text, add_bos));
     let count = tokens.len();
-    Json(TokenizeResponse { tokens, count })
+    Ok(Json(TokenizeResponse { tokens, count }))
 }
 
 
@@ -519,7 +522,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .route("/v1/shims/{id}", get(shim_get).put(shim_put).delete(shim_delete));
     }
 
-    let app = app.with_state(state);
+    // Review #10: the body limit was axum's implicit 2 MiB `Json` default;
+    // make it explicit (and one place to tune) — every JSON body above it
+    // is a 413 before deserialization.
+    let app = app
+        .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024))
+        .with_state(state);
 
     let addr = format!("{}:{}", cli.bind, cli.port);
     info!(
