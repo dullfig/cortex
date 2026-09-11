@@ -103,6 +103,55 @@ fn load_linear_layer(
     Ok(Box::new(FloatLinear::from_float_tensor(tensor)))
 }
 
+/// Review #18: the RoPE layout is a property of the architecture — what
+/// llama.cpp calls `LLAMA_ROPE_TYPE_NORM` (adjacent pairs, "interleaved")
+/// versus `LLAMA_ROPE_TYPE_NEOX` (first half / second half, "halved") —
+/// not of `rope.scaling.type`, which the old code read (as the wrong type)
+/// and treated as this selector. An architecture this table does not
+/// know is refused with a clear message rather than loaded with a
+/// guessed layout, which produces fluent garbage with no error;
+/// `CORTEX_ROPE_LAYOUT=halved|interleaved` overrides for experiments.
+pub fn rope_layout_for(arch: &str) -> Result<RoPELayout, GgufError> {
+    if let Ok(v) = std::env::var("CORTEX_ROPE_LAYOUT") {
+        return match v.as_str() {
+            "halved" | "neox" => Ok(RoPELayout::Halved),
+            "interleaved" | "norm" => Ok(RoPELayout::Interleaved),
+            other => Err(GgufError::InvalidConfig {
+                key: "CORTEX_ROPE_LAYOUT".to_string(),
+                value: other.to_string(),
+                reason: "expected halved|neox or interleaved|norm",
+            }),
+        };
+    }
+    // llama.cpp `llama_model_rope_type` (NEOX list).
+    const HALVED: &[&str] = &[
+        "qwen", "qwen2", "qwen2moe", "qwen2vl", "qwen3", "qwen3moe",
+        "phi2", "phi3", "phimoe", "gemma", "gemma2", "gemma3",
+        "stablelm", "starcoder2", "gptneox", "falcon", "olmo2", "olmoe",
+        "exaone", "nemotron", "orion", "codeshell", "dbrx", "grok", "plamo",
+        "minicpm3", "openelm", "bitnet",
+    ];
+    // llama.cpp `LLAMA_ROPE_TYPE_NORM` list.
+    const INTERLEAVED: &[&str] = &[
+        "llama", "llama4", "mistral", "mixtral", "deci", "baichuan",
+        "starcoder", "internlm2", "minicpm", "xverse", "command-r", "cohere2",
+        "olmo", "arctic", "deepseek", "deepseek2", "chatglm", "granite",
+        "granitemoe", "chameleon", "bailingmoe",
+    ];
+    if HALVED.contains(&arch) {
+        Ok(RoPELayout::Halved)
+    } else if INTERLEAVED.contains(&arch) {
+        Ok(RoPELayout::Interleaved)
+    } else {
+        Err(GgufError::InvalidConfig {
+            key: "general.architecture".to_string(),
+            value: arch.to_string(),
+            reason: "unknown architecture: its RoPE layout (NORM vs NEOX) is not in loader::rope_layout_for; \
+                     add it there, or set CORTEX_ROPE_LAYOUT=halved|interleaved to experiment",
+        })
+    }
+}
+
 /// A fully loaded model ready for inference.
 pub struct LoadedModel {
     /// The transformer model.
@@ -199,22 +248,30 @@ pub fn load_from_gguf(
         .and_then(|v| v.as_str())
         .unwrap_or("llama");
 
-    // RoPE layout: HuggingFace models (Qwen2 etc.) use halved (NeoX).
-    // Only pure llama.cpp-converted LLaMA models use interleaved.
-    let rope_layout = match config.rope_type {
-        2 => {
-            info!("using halved (NeoX/HF) RoPE layout (from rope_type=2)");
-            RoPELayout::Halved
+    // RoPE layout from the architecture (review #18).
+    let rope_layout = rope_layout_for(arch)?;
+    info!(arch, ?rope_layout, "RoPE layout");
+    if let Some(scaling) = &config.rope_scaling {
+        tracing::warn!(
+            arch,
+            scaling = %scaling,
+            context_length = config.context_length,
+            "the model declares RoPE scaling that cortex does not implement; \
+             positions beyond the original (unscaled) context will degrade"
+        );
+    }
+    // The FFN is SiLU-gated on every path; a model that needs another
+    // activation must not load silently wrong (review #18).
+    match config.hidden_act.as_str() {
+        "silu" | "swiglu" => {}
+        other => {
+            return Err(GgufError::InvalidConfig {
+                key: "hidden_act".to_string(),
+                value: other.to_string(),
+                reason: "only SiLU-gated FFNs (silu / swiglu) are supported",
+            });
         }
-        _ if arch.contains("qwen") => {
-            info!(arch, "using halved (NeoX/HF) RoPE layout (architecture default)");
-            RoPELayout::Halved
-        }
-        _ => {
-            info!("using interleaved (llama.cpp) RoPE layout");
-            RoPELayout::Interleaved
-        }
-    };
+    }
 
     let ctx = LoadCtx {
         #[cfg(feature = "gpu")]
@@ -364,6 +421,9 @@ mod tests {
         n_tokens: Option<usize>,
         head_count: Option<u32>,
         q_bias_len: Option<usize>,
+        arch: Option<&'static str>,
+        hidden_act: Option<&'static str>,
+        rope_scaling: Option<&'static str>,
     }
 
     /// A complete, loadable toy model: vocab 8, embed 8, 2 layers, 2 heads,
@@ -372,16 +432,23 @@ mod tests {
     fn tiny_model(c: &Corrupt) -> Vec<u8> {
         let (vocab, embed, inter, n_layers) = (8usize, 8usize, 16usize, 2u32);
         let zeros = |n: usize| vec![0u8; n * 4];
+        let arch = c.arch.unwrap_or("llama");
         let mut b = GgufBuilder::new();
-        b.add_metadata_string("general.architecture", "llama");
-        b.add_metadata_u32("llama.embedding_length", embed as u32);
-        b.add_metadata_u32("llama.block_count", n_layers);
-        b.add_metadata_u32("llama.attention.head_count", c.head_count.unwrap_or(2));
-        b.add_metadata_u32("llama.attention.head_count_kv", 1);
-        b.add_metadata_u32("llama.context_length", 16);
-        b.add_metadata_u32("llama.feed_forward_length", inter as u32);
-        b.add_metadata_f32("llama.rope.freq_base", 10000.0);
-        b.add_metadata_f32("llama.attention.layer_norm_rms_epsilon", 1e-5);
+        b.add_metadata_string("general.architecture", arch);
+        b.add_metadata_u32(&format!("{arch}.embedding_length"), embed as u32);
+        b.add_metadata_u32(&format!("{arch}.block_count"), n_layers);
+        b.add_metadata_u32(&format!("{arch}.attention.head_count"), c.head_count.unwrap_or(2));
+        b.add_metadata_u32(&format!("{arch}.attention.head_count_kv"), 1);
+        b.add_metadata_u32(&format!("{arch}.context_length"), 16);
+        b.add_metadata_u32(&format!("{arch}.feed_forward_length"), inter as u32);
+        b.add_metadata_f32(&format!("{arch}.rope.freq_base"), 10000.0);
+        b.add_metadata_f32(&format!("{arch}.attention.layer_norm_rms_epsilon"), 1e-5);
+        if let Some(act) = c.hidden_act {
+            b.add_metadata_string("general.hidden_act", act);
+        }
+        if let Some(s) = c.rope_scaling {
+            b.add_metadata_string(&format!("{arch}.rope.scaling.type"), s);
+        }
         let names: Vec<String> = (0..c.n_tokens.unwrap_or(vocab)).map(|i| format!("t{i}")).collect();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         b.add_metadata_array_string("tokenizer.ggml.tokens", &refs);
@@ -472,6 +539,52 @@ mod tests {
         // 8 rows: used to be an assert_eq! after the whole model was built.
         let t = mismatch_tensor(load(tiny_model(&Corrupt { n_tokens: Some(9), ..Default::default() })));
         assert_eq!(t, "token_embd.weight");
+    }
+
+    #[test]
+    fn rope_layout_comes_from_the_architecture_table() {
+        // Review #18: rope.scaling.type was read as a u32 (always 0) and only
+        // an `arch.contains("qwen")` heuristic kept Qwen on NEOX.
+        for a in ["qwen2", "qwen3", "phi3", "gemma2", "stablelm", "starcoder2", "gptneox", "olmo2"] {
+            assert!(matches!(rope_layout_for(a), Ok(RoPELayout::Halved)), "{a}");
+        }
+        for a in ["llama", "mistral", "deepseek2", "granite", "internlm2", "olmo", "command-r"] {
+            assert!(matches!(rope_layout_for(a), Ok(RoPELayout::Interleaved)), "{a}");
+        }
+        match rope_layout_for("made-up-arch") {
+            Err(GgufError::InvalidConfig { key, .. }) => assert_eq!(key, "general.architecture"),
+            other => panic!("expected InvalidConfig, got {:?}", other.map(|_| ())),
+        }
+        // An unknown architecture refuses to load (a guessed layout is
+        // fluent garbage with no error).
+        let mut arch_model = tiny_model(&Corrupt { arch: Some("made-up-arch"), ..Default::default() });
+        match load(std::mem::take(&mut arch_model)) {
+            Err(GgufError::InvalidConfig { key, .. }) => assert_eq!(key, "general.architecture"),
+            other => panic!("expected InvalidConfig, got {:?}", other.map(|_| ())),
+        }
+        // Known NEOX architecture loads.
+        assert!(load(tiny_model(&Corrupt { arch: Some("qwen2"), ..Default::default() })).is_ok());
+    }
+
+    #[test]
+    fn rope_scaling_is_read_as_a_string_and_only_warns() {
+        let m = load(tiny_model(&Corrupt { rope_scaling: Some("yarn"), ..Default::default() })).unwrap();
+        assert_eq!(m.config.rope_scaling.as_deref(), Some("yarn"));
+        let m = load(tiny_model(&Corrupt { rope_scaling: Some("none"), ..Default::default() })).unwrap();
+        assert_eq!(m.config.rope_scaling, None);
+    }
+
+    #[test]
+    fn unsupported_hidden_act_is_rejected_at_load() {
+        // A relu2 model used to load with a SiLU FFN and run silently wrong.
+        match load(tiny_model(&Corrupt { hidden_act: Some("relu2"), ..Default::default() })) {
+            Err(GgufError::InvalidConfig { key, value, .. }) => {
+                assert_eq!(key, "hidden_act");
+                assert_eq!(value, "relu2");
+            }
+            other => panic!("expected InvalidConfig, got {:?}", other.map(|_| ())),
+        }
+        assert!(load(tiny_model(&Corrupt { hidden_act: Some("silu"), ..Default::default() })).is_ok());
     }
 
     #[test]

@@ -290,9 +290,13 @@ pub struct ModelConfig {
     pub intermediate_size: u32,
     pub rope_theta: f32,
     pub rms_norm_eps: f32,
-    /// RoPE type: 0 = interleaved (llama.cpp NORM), 2 = halved (NeoX/HF).
-    /// -1 or absent defaults to interleaved.
-    pub rope_type: i32,
+    /// `{arch}.rope.scaling.type` as the GGUF spec stores it — a string
+    /// ("linear", "yarn"; "none"/absent → `None`). Review #18: this used to
+    /// be read as a u32 (always 0) and misused as the NORM/NEOX layout
+    /// selector. The layout is a property of the architecture
+    /// (`loader::rope_layout_for`); the scaling method is not implemented
+    /// and is surfaced as a warning by the loader.
+    pub rope_scaling: Option<String>,
     /// Hidden activation function name (e.g., "silu", "relu2", "gelu").
     /// Defaults to "silu" if not specified.
     pub hidden_act: String,
@@ -904,14 +908,19 @@ impl GgufFile {
                 })
         };
 
-        // rope_type: optional, defaults to 0 (interleaved/NORM) if absent.
-        // In llama.cpp: 0=NORM (interleaved), 2=NEOX (halved), -1=unset.
-        let rope_type = {
+        // `{arch}.rope.scaling.type` is a string ("none" | "linear" | "yarn").
+        let rope_scaling = {
             let key = format!("{arch}.rope.scaling.type");
-            self.metadata
-                .get(&key)
-                .and_then(|v| v.as_u32().map(|u| u as i32))
-                .unwrap_or(0)
+            match self.metadata.get(&key) {
+                None => None,
+                Some(v) => {
+                    let s = v.as_str().ok_or_else(|| GgufError::MetadataTypeMismatch {
+                        key: key.clone(),
+                        expected: "string",
+                    })?;
+                    if s.is_empty() || s == "none" { None } else { Some(s.to_string()) }
+                }
+            }
         };
 
         // Hidden activation: check general.hidden_act or {arch}.hidden_act, default to "silu"
@@ -956,7 +965,7 @@ impl GgufFile {
             intermediate_size: get_u32("feed_forward_length")?,
             rope_theta: get_f32("rope.freq_base")?,
             rms_norm_eps: get_f32("attention.layer_norm_rms_epsilon")?,
-            rope_type,
+            rope_scaling,
             hidden_act,
             model_name,
             expert_count,
@@ -1516,7 +1525,7 @@ pub(crate) mod tests {
             intermediate_size: 11008,
             rope_theta: 1_000_000.0,
             rms_norm_eps: 1e-6,
-            rope_type: 0,
+            rope_scaling: None,
             hidden_act: "silu".into(),
             model_name: None,
             expert_count: None,
