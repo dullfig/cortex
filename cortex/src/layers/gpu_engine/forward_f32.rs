@@ -83,18 +83,16 @@ impl GpuEngine {
         // advance_only (7d63396) but never in this path — review #28.
         let packed_bytes = (hidden_init.len() * 2) as u64;
         let hidden_packed = GpuDevice::pack_f16(&hidden_init);
-        let hidden_buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("forward_full_traced.hidden"),
-            contents: bytemuck::cast_slice(&hidden_packed),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
-        let normed_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("forward_full_traced.normed"),
-            size: packed_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let normed_staging = self.gpu.create_staging_buffer(packed_bytes);
+        // Review #23/#31: hidden on Lane A, normed on Lane B, the score
+        // captures on Lane A and every readback region in ONE
+        // host_readback_heap span — no raw per-request buffers. The
+        // bounds (`max_traced_query_tokens`) include all of them. The
+        // captures cannot share Lane B with `scratch.scores`: wgpu rejects
+        // a `copy_buffer_to_buffer` whose source and destination are the
+        // same buffer (the #29 class), and a lane is one buffer.
+        let hidden_buf = lane_alloc(&self.gpu.transient_heap_a, packed_bytes, "forward_full_traced.hidden");
+        hidden_buf.write(&self.gpu.queue, bytemuck::cast_slice(&hidden_packed));
+        let normed_buf = lane_alloc(&self.gpu.transient_heap_b, packed_bytes, "forward_full_traced.normed");
 
         let attn0 = self.cpu.blocks()[0].attention();
         let intermediate = self.cpu.blocks()[0].ffn().as_any()
@@ -111,22 +109,18 @@ impl GpuEngine {
         // Per-captured-layer score storage buffers. Same shape as scratch.scores
         // but persistent across the whole forward.
         let scores_bytes = (n_tokens * n_heads * n_tokens * std::mem::size_of::<f32>()) as u64;
-        let capture_bufs: Vec<wgpu::Buffer> = capture_layers.iter().map(|&l| {
-            self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(&format!("forward_full_traced.scores.layer{l}")),
-                size: scores_bytes,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
+        let capture_bufs: Vec<::vram_heap::VramAllocation> = capture_layers.iter().map(|&l| {
+            lane_alloc(&self.gpu.transient_heap_a, scores_bytes, &format!("forward_full_traced.scores.layer{l}"))
         }).collect();
-        let capture_stagings: Vec<wgpu::Buffer> = (0..capture_layers.len())
-            .map(|_| self.gpu.create_staging_buffer(scores_bytes))
-            .collect();
+        // Readback span: region 0 = normed, regions 1.. = captures.
+        let mut region_sizes = vec![packed_bytes];
+        region_sizes.extend(capture_layers.iter().map(|_| scores_bytes));
+        let readback = ReadbackSpan::allocate(&self.gpu, &region_sizes, "forward_full_traced.readback");
 
-        // Build a layer_idx -> capture_buf lookup for O(1) access in the loop.
-        let capture_lookup: std::collections::HashMap<usize, &wgpu::Buffer> =
+        // Build a layer_idx -> capture range lookup for O(1) access in the loop.
+        let capture_lookup: std::collections::HashMap<usize, BufRange<'_>> =
             capture_layers.iter().zip(capture_bufs.iter())
-                .map(|(&l, buf)| (l, buf))
+                .map(|(&l, buf)| (l, BufRange::of(buf)))
                 .collect();
 
         // ---- 2-3. All blocks + final_norm in one encoder ----
@@ -135,59 +129,28 @@ impl GpuEngine {
         });
         for i in 0..n_layers {
             let capture = capture_lookup.get(&i).copied();
-            self.forward_block_gpu_inner(&mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch, capture, None, None, None);
+            self.forward_block_gpu_inner(&mut encoder, i, BufRange::of(&hidden_buf), n_tokens, start_pos, &scratch, capture, None, None, None);
         }
         // Final norm: hidden packed → normed packed.
         self.dispatch_rmsnorm_packed_to_packed_into(
-            &mut encoder, hidden_buf.as_entire_binding(), self.final_norm_weight_buf.binding(), normed_buf.as_entire_binding(),
+            &mut encoder, hidden_buf.binding(), self.final_norm_weight_buf.binding(), normed_buf.binding(),
             self.embed_dim, n_tokens, self.final_norm_eps,
         );
-        encoder.copy_buffer_to_buffer(&normed_buf, 0, &normed_staging, 0, packed_bytes);
-        for (cap_buf, stg_buf) in capture_bufs.iter().zip(capture_stagings.iter()) {
-            encoder.copy_buffer_to_buffer(cap_buf, 0, stg_buf, 0, scores_bytes);
+        {
+            let (dst, off) = readback.dst(0);
+            encoder.copy_buffer_to_buffer(normed_buf.buffer(), normed_buf.offset(), dst, off, packed_bytes);
+        }
+        for (i, cap_buf) in capture_bufs.iter().enumerate() {
+            let (dst, off) = readback.dst(1 + i);
+            encoder.copy_buffer_to_buffer(cap_buf.buffer(), cap_buf.offset(), dst, off, scores_bytes);
         }
         self.gpu.queue.submit(Some(encoder.finish()));
 
-        // Issue all map_async calls together, then poll once. Sequential
-        // poll(Wait) per buffer was hanging — possibly because the wgpu
-        // device only fires callbacks inside poll, and re-polling after
-        // a buffer's already mapped doesn't re-fire pending callbacks for
-        // others in some cases. Single poll drives all of them at once.
-        use std::sync::mpsc;
-        let mut receivers: Vec<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>> = Vec::with_capacity(1 + capture_stagings.len());
-        let normed_slice = normed_staging.slice(..);
-        let (tx, rx) = mpsc::channel();
-        normed_slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
-        receivers.push(rx);
-        let capture_slices: Vec<wgpu::BufferSlice> = capture_stagings.iter().map(|stg| {
-            let slice = stg.slice(..);
-            let (tx, rx) = mpsc::channel();
-            slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
-            receivers.push(rx);
-            slice
-        }).collect();
-
-        self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
-        for rx in &receivers {
-            rx.recv().expect("readback channel closed").expect("buffer map failed");
-        }
-
-        // ---- Decode the readbacks (normed is packed f16) ----
-        let normed: Vec<f32> = {
-            let data = normed_slice.get_mapped_range();
-            let v = super::unpack_f16_bytes(&data[..packed_bytes as usize]);
-            drop(data);
-            normed_staging.unmap();
-            v
-        };
-        let per_layer_scores: Vec<Vec<f32>> = capture_slices.iter().zip(capture_stagings.iter()).map(|(slice, stg)| {
-            let data = slice.get_mapped_range();
-            let v: Vec<f32> = data[..scores_bytes as usize].chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-            drop(data);
-            stg.unmap();
-            v
-        }).collect();
+        // One map + one poll for the whole span (normed is packed f16,
+        // the captures are f32).
+        let (normed, per_layer_scores): (Vec<f32>, Vec<Vec<f32>>) = readback.read(&self.gpu, |m| {
+            (m.f16_unpacked(0), (0..capture_bufs.len()).map(|i| m.f32s(1 + i)).collect())
+        });
 
         // ---- 4. Output projection (CPU; vocab matmul deferred). Skipped
         //         when caller doesn't need logits (retrieve path) — that
@@ -246,18 +209,19 @@ impl GpuEngine {
         // (review #27).
         let packed_bytes = (hidden_init.len() * 2) as u64;
         let hidden_packed = GpuDevice::pack_f16(&hidden_init);
-        let hidden_buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("forward_hidden_capture.hidden"),
-            contents: bytemuck::cast_slice(&hidden_packed),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
-        let normed_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("forward_hidden_capture.normed"),
-            size: packed_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let normed_staging = self.gpu.create_staging_buffer(packed_bytes);
+        // Review #23/#31: hidden on Lane A, normed + per-layer captures on
+        // Lane B, one readback span. `max_hidden_capture_tokens` is the
+        // matching bound (the HTTP layer applies it; asserted here).
+        let max_n = self.max_hidden_capture_tokens(capture_layers.len());
+        assert!(
+            n_tokens <= max_n,
+            "hidden-capture forward too long: {n_tokens} tokens > {max_n} with {} captured \
+             layers (lane A/B, storage binding, wgpu dispatch and host readback heap bounds)",
+            capture_layers.len(),
+        );
+        let hidden_buf = lane_alloc(&self.gpu.transient_heap_a, packed_bytes, "forward_hidden_capture.hidden");
+        hidden_buf.write(&self.gpu.queue, bytemuck::cast_slice(&hidden_packed));
+        let normed_buf = lane_alloc(&self.gpu.transient_heap_b, packed_bytes, "forward_hidden_capture.normed");
 
         let attn0 = self.cpu.blocks()[0].attention();
         let intermediate = self.cpu.blocks()[0].ffn().as_any()
@@ -273,20 +237,15 @@ impl GpuEngine {
 
         // Per-captured-layer hidden buffers (post-FFN-residual). Same shape
         // as hidden_buf: [n_tokens, embed_dim] packed f16.
-        let capture_bufs: Vec<wgpu::Buffer> = capture_layers.iter().map(|&l| {
-            self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(&format!("forward_hidden_capture.layer{l}")),
-                size: packed_bytes,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
+        let capture_bufs: Vec<::vram_heap::VramAllocation> = capture_layers.iter().map(|&l| {
+            lane_alloc(&self.gpu.transient_heap_b, packed_bytes, &format!("forward_hidden_capture.layer{l}"))
         }).collect();
-        let capture_stagings: Vec<wgpu::Buffer> = (0..capture_layers.len())
-            .map(|_| self.gpu.create_staging_buffer(packed_bytes))
-            .collect();
-        let capture_lookup: std::collections::HashMap<usize, &wgpu::Buffer> =
+        // Readback span: region 0 = normed, regions 1.. = captures.
+        let region_sizes = vec![packed_bytes; 1 + capture_layers.len()];
+        let readback = ReadbackSpan::allocate(&self.gpu, &region_sizes, "forward_hidden_capture.readback");
+        let capture_lookup: std::collections::HashMap<usize, BufRange<'_>> =
             capture_layers.iter().zip(capture_bufs.iter())
-                .map(|(&l, buf)| (l, buf))
+                .map(|(&l, buf)| (l, BufRange::of(buf)))
                 .collect();
 
         let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -295,58 +254,31 @@ impl GpuEngine {
         for i in 0..n_layers {
             let post_capture = capture_lookup.get(&i).copied();
             self.forward_block_gpu_inner(
-                &mut encoder, i, &hidden_buf, n_tokens, /*start_pos*/ 0, &scratch,
+                &mut encoder, i, BufRange::of(&hidden_buf), n_tokens, /*start_pos*/ 0, &scratch,
                 /*pre_softmax_capture*/ None, /*kv_cache_target*/ None, post_capture,
                 /*pre_block_hidden_inject*/ None,
             );
         }
         // Final RMSNorm (packed → packed) — the post-norm hidden shims read.
         self.dispatch_rmsnorm_packed_to_packed_into(
-            &mut encoder, hidden_buf.as_entire_binding(), self.final_norm_weight_buf.binding(), normed_buf.as_entire_binding(),
+            &mut encoder, hidden_buf.binding(), self.final_norm_weight_buf.binding(), normed_buf.binding(),
             self.embed_dim, n_tokens, self.final_norm_eps,
         );
-        encoder.copy_buffer_to_buffer(&normed_buf, 0, &normed_staging, 0, packed_bytes);
-        for (cap_buf, stg_buf) in capture_bufs.iter().zip(capture_stagings.iter()) {
-            encoder.copy_buffer_to_buffer(cap_buf, 0, stg_buf, 0, packed_bytes);
+        {
+            let (dst, off) = readback.dst(0);
+            encoder.copy_buffer_to_buffer(normed_buf.buffer(), normed_buf.offset(), dst, off, packed_bytes);
+        }
+        for (i, cap_buf) in capture_bufs.iter().enumerate() {
+            let (dst, off) = readback.dst(1 + i);
+            encoder.copy_buffer_to_buffer(cap_buf.buffer(), cap_buf.offset(), dst, off, packed_bytes);
         }
         self.gpu.queue.submit(Some(encoder.finish()));
 
-        // Batched readback (single poll for all stagings).
-        use std::sync::mpsc;
-        let mut receivers: Vec<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>> =
-            Vec::with_capacity(1 + capture_stagings.len());
-        let normed_slice = normed_staging.slice(..);
-        let (tx, rx) = mpsc::channel();
-        normed_slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
-        receivers.push(rx);
-        let capture_slices: Vec<wgpu::BufferSlice> = capture_stagings.iter().map(|stg| {
-            let slice = stg.slice(..);
-            let (tx, rx) = mpsc::channel();
-            slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
-            receivers.push(rx);
-            slice
-        }).collect();
-
-        self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
-        for rx in &receivers {
-            rx.recv().expect("readback channel closed").expect("buffer map failed");
-        }
-
         // Both readbacks are packed f16; unpack to the f32 the API returns.
-        let final_post_norm_hidden: Vec<f32> = {
-            let data = normed_slice.get_mapped_range();
-            let v = super::unpack_f16_bytes(&data[..packed_bytes as usize]);
-            drop(data);
-            normed_staging.unmap();
-            v
-        };
-        let per_layer_hidden: Vec<Vec<f32>> = capture_slices.iter().zip(capture_stagings.iter()).map(|(slice, stg)| {
-            let data = slice.get_mapped_range();
-            let v = super::unpack_f16_bytes(&data[..packed_bytes as usize]);
-            drop(data);
-            stg.unmap();
-            v
-        }).collect();
+        let (final_post_norm_hidden, per_layer_hidden): (Vec<f32>, Vec<Vec<f32>>) =
+            readback.read(&self.gpu, |m| {
+                (m.f16_unpacked(0), (0..capture_bufs.len()).map(|i| m.f16_unpacked(1 + i)).collect())
+            });
 
         HiddenCaptures {
             per_layer_hidden,
@@ -408,8 +340,11 @@ impl GpuEngine {
         assert!(
             n_tokens <= max_q,
             "traced retrieve query too long: {n_tokens} tokens > {max_q} for a \
-             {start_pos}-token shard (lane B / storage binding / dispatch bound). \
-             Shorten the query or raise CORTEX_VRAM_HEAP_B_MB.",
+             {start_pos}-token shard with {} captured layers (lane A/B/C, storage \
+             binding, wgpu dispatch and host readback heap bounds). Shorten the \
+             query, split the shard, or raise CORTEX_VRAM_HEAP_B_MB / \
+             CORTEX_VRAM_HEAP_READBACK_MB.",
+            capture_layers.len(),
         );
 
         // ---- Embedding lookup (CPU) ----
@@ -432,11 +367,14 @@ impl GpuEngine {
         // of corpus or top_k. cache_traced was the last sibling left
         // unpatched after the f5b55a2/7d63396 hunt.
         let hidden_packed = GpuDevice::pack_f16(&hidden_init);
-        let hidden_buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("forward_traced_with_cache.hidden"),
-            contents: bytemuck::cast_slice(&hidden_packed),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
+        // Review #23/#31: hidden on Lane A (this raw buffer was the one
+        // whose failed allocation surfaced as "buffer is invalid" under
+        // shard churn), captures on Lane A too (not Lane B: the capture is a
+        // copy out of `scratch.scores`, and wgpu rejects a copy within one
+        // buffer), stagings in one readback span.
+        let packed_bytes = (hidden_packed.len() * std::mem::size_of::<u32>()) as u64;
+        let hidden_buf = lane_alloc(&self.gpu.transient_heap_a, packed_bytes, "forward_traced_with_cache.hidden");
+        hidden_buf.write(&self.gpu.queue, bytemuck::cast_slice(&hidden_packed));
 
         let intermediate = self.cpu.blocks()[0].ffn().as_any()
             .downcast_ref::<crate::layers::swiglu::SwiGLU>()
@@ -452,20 +390,14 @@ impl GpuEngine {
         // Per-captured-layer score storage. Shape: [n_tokens, n_heads, max_seq]
         // where max_seq = start_pos + n_tokens (the full attention window).
         let scores_bytes = (n_tokens * n_heads * attn_max_seq * std::mem::size_of::<f32>()) as u64;
-        let capture_bufs: Vec<wgpu::Buffer> = capture_layers.iter().map(|&l| {
-            self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(&format!("forward_traced_with_cache.scores.layer{l}")),
-                size: scores_bytes,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
+        let capture_bufs: Vec<::vram_heap::VramAllocation> = capture_layers.iter().map(|&l| {
+            lane_alloc(&self.gpu.transient_heap_a, scores_bytes, &format!("forward_traced_with_cache.scores.layer{l}"))
         }).collect();
-        let capture_stagings: Vec<wgpu::Buffer> = (0..capture_layers.len())
-            .map(|_| self.gpu.create_staging_buffer(scores_bytes))
-            .collect();
-        let capture_lookup: std::collections::HashMap<usize, &wgpu::Buffer> =
+        let region_sizes = vec![scores_bytes; capture_layers.len()];
+        let readback = ReadbackSpan::allocate(&self.gpu, &region_sizes, "forward_traced_with_cache.readback");
+        let capture_lookup: std::collections::HashMap<usize, BufRange<'_>> =
             capture_layers.iter().zip(capture_bufs.iter())
-                .map(|(&l, buf)| (l, buf))
+                .map(|(&l, buf)| (l, BufRange::of(buf)))
                 .collect();
 
         // ---- All blocks in one encoder, with cache target + optional capture ----
@@ -476,40 +408,22 @@ impl GpuEngine {
             let capture = capture_lookup.get(&i).copied();
             let target = (cache.k_layer(i), cache.v_layer(i));
             self.forward_block_gpu_inner(
-                &mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch,
+                &mut encoder, i, BufRange::of(&hidden_buf), n_tokens, start_pos, &scratch,
                 capture, Some(target), None, None,
             );
         }
         // Skip final_norm + output projection — retrieval doesn't need
         // logits, only the captured scores.
-        for (cap_buf, stg_buf) in capture_bufs.iter().zip(capture_stagings.iter()) {
-            encoder.copy_buffer_to_buffer(cap_buf, 0, stg_buf, 0, scores_bytes);
+        for (i, cap_buf) in capture_bufs.iter().enumerate() {
+            let (dst, off) = readback.dst(i);
+            encoder.copy_buffer_to_buffer(cap_buf.buffer(), cap_buf.offset(), dst, off, scores_bytes);
         }
         self.gpu.queue.submit(Some(encoder.finish()));
 
-        // Batched readback (single poll for all stagings).
-        use std::sync::mpsc;
-        let mut receivers: Vec<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>> = Vec::with_capacity(capture_stagings.len());
-        let capture_slices: Vec<wgpu::BufferSlice> = capture_stagings.iter().map(|stg| {
-            let slice = stg.slice(..);
-            let (tx, rx) = mpsc::channel();
-            slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
-            receivers.push(rx);
-            slice
-        }).collect();
-        self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
-        for rx in &receivers {
-            rx.recv().expect("readback channel closed").expect("buffer map failed");
-        }
-
-        let per_layer_scores: Vec<Vec<f32>> = capture_slices.iter().zip(capture_stagings.iter()).map(|(slice, stg)| {
-            let data = slice.get_mapped_range();
-            let v: Vec<f32> = data[..scores_bytes as usize].chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-            drop(data);
-            stg.unmap();
-            v
-        }).collect();
+        // One map + one poll for every captured layer.
+        let per_layer_scores: Vec<Vec<f32>> = readback.read(&self.gpu, |m| {
+            (0..capture_bufs.len()).map(|i| m.f32s(i)).collect()
+        });
 
         // NOTE: we deliberately do NOT call cache.advance() — see method docs.
         per_layer_scores
@@ -634,11 +548,13 @@ impl GpuEngine {
         // against a cache_load'd shard outputs `!!!!` regardless of
         // polar/QJL/etc.
         let hidden_packed = GpuDevice::pack_f16(&hidden_init);
-        let hidden_buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("forward_advance_only.hidden"),
-            contents: bytemuck::cast_slice(&hidden_packed),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
+        // Review #31: this was the raw `create_buffer_init` whose failed
+        // allocation under shard churn came back as `Buffer with
+        // 'forward_advance_only.hidden' label is invalid`. Lane A now;
+        // the chunker's Lane A term includes it.
+        let packed_bytes = (hidden_packed.len() * std::mem::size_of::<u32>()) as u64;
+        let hidden_buf = lane_alloc(&self.gpu.transient_heap_a, packed_bytes, "forward_advance_only.hidden");
+        hidden_buf.write(&self.gpu.queue, bytemuck::cast_slice(&hidden_packed));
 
         let intermediate = self.cpu.blocks()[0].ffn().as_any()
             .downcast_ref::<crate::layers::swiglu::SwiGLU>()
@@ -663,7 +579,7 @@ impl GpuEngine {
             for i in 0..n_layers {
                 let target = (cache.k_layer(i), cache.v_layer(i));
                 self.forward_block_gpu_inner(
-                    &mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch,
+                    &mut encoder, i, BufRange::of(&hidden_buf), n_tokens, start_pos, &scratch,
                     None, Some(target), None, None,
                 );
             }
@@ -753,18 +669,11 @@ impl GpuEngine {
         // so the packed path is restored for the ~9% Qwen prefill win.)
         let packed_bytes = (hidden_init.len() * 2) as u64;
         let hidden_packed = GpuDevice::pack_f16(&hidden_init);
-        let hidden_buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("forward_with_cache.hidden"),
-            contents: bytemuck::cast_slice(&hidden_packed),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
-        let normed_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("forward_with_cache.normed"),
-            size: packed_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let staging = self.gpu.create_staging_buffer(packed_bytes);
+        // Review #23/#31: hidden on Lane A, normed on Lane B, readback span.
+        let hidden_buf = lane_alloc(&self.gpu.transient_heap_a, packed_bytes, "forward_with_cache.hidden");
+        hidden_buf.write(&self.gpu.queue, bytemuck::cast_slice(&hidden_packed));
+        let normed_buf = lane_alloc(&self.gpu.transient_heap_b, packed_bytes, "forward_with_cache.normed");
+        let readback = ReadbackSpan::allocate(&self.gpu, &[packed_bytes], "forward_with_cache.readback");
         let t_io_alloc = t_start.elapsed() - t_embed;
 
         let intermediate = self.cpu.blocks()[0].ffn().as_any()
@@ -843,9 +752,9 @@ impl GpuEngine {
         for i in 0..n_layers {
             let target = (cache.k_layer(i), cache.v_layer(i));
             let inject = inject_deltas.get(i).and_then(|opt| opt.as_ref());
-            let capture = if debug_finite { Some(&debug_captures[i]) } else { None };
+            let capture = if debug_finite { Some(BufRange::whole(&debug_captures[i])) } else { None };
             self.forward_block_gpu_inner(
-                &mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch,
+                &mut encoder, i, BufRange::of(&hidden_buf), n_tokens, start_pos, &scratch,
                 None, Some(target), capture, inject,
             );
             if debug_finite {
@@ -859,14 +768,17 @@ impl GpuEngine {
         {
             let mut pass = self.begin_timed_pass(&mut encoder, "final_norm");
             self.dispatch_rmsnorm_packed_to_packed_in_pass(
-                &mut pass, hidden_buf.as_entire_binding(), self.final_norm_weight_buf.binding(), normed_buf.as_entire_binding(),
+                &mut pass, hidden_buf.binding(), self.final_norm_weight_buf.binding(), normed_buf.binding(),
                 self.embed_dim, n_tokens, self.final_norm_eps,
             );
         }
         if let (true, Some(t)) = (timer_active, self.timer.as_ref()) {
             encoder.write_timestamp(&t.query_set, (n_layers as u32) + 1);
         }
-        encoder.copy_buffer_to_buffer(&normed_buf, 0, &staging, 0, packed_bytes);
+        {
+            let (dst, off) = readback.dst(0);
+            encoder.copy_buffer_to_buffer(normed_buf.buffer(), normed_buf.offset(), dst, off, packed_bytes);
+        }
         // Capture the actual range used by the pass-level timer
         // (begin_timed_pass advanced state.next_idx).
         let pass_final_idx: u32 = self.pass_timer.lock().unwrap()
@@ -890,7 +802,7 @@ impl GpuEngine {
         let t_pre_readback = t_start.elapsed();
         // Phase B: normed_buf is packed f16. Unpack to Vec<f32> for the
         // CPU finalize_logits (LM head matmul) which still consumes f32.
-        let normed = read_back_buffer_f16_unpack(&self.gpu, &staging, packed_bytes as usize);
+        let normed = readback.read(&self.gpu, |m| m.f16_unpacked(0));
         let t_readback = t_start.elapsed() - t_pre_readback;
 
         // Per-block hidden-state finite check (CORTEX_DEBUG_HIDDEN_FINITE).
@@ -1084,17 +996,12 @@ impl GpuEngine {
 
         let packed_bytes = (hidden_init.len() * 2) as u64;
         let hidden_packed = GpuDevice::pack_f16(&hidden_init);
-        let hidden_buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("forward_with_cache_argmax.hidden"),
-            contents: bytemuck::cast_slice(&hidden_packed),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
-        let normed_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("forward_with_cache_argmax.normed"),
-            size: packed_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        // Review #23/#31: hidden on Lane A, normed on Lane B, the argmax
+        // scratch (last-token row, logits, token id) on Lane C — the
+        // chunker's `fixed_c` term — and the 4-byte readback on the span.
+        let hidden_buf = lane_alloc(&self.gpu.transient_heap_a, packed_bytes, "forward_with_cache_argmax.hidden");
+        hidden_buf.write(&self.gpu.queue, bytemuck::cast_slice(&hidden_packed));
+        let normed_buf = lane_alloc(&self.gpu.transient_heap_b, packed_bytes, "forward_with_cache_argmax.normed");
 
         let intermediate = self.cpu.blocks()[0].ffn().as_any()
             .downcast_ref::<crate::layers::swiglu::SwiGLU>()
@@ -1117,28 +1024,13 @@ impl GpuEngine {
 
         // Last-token slice buffer (packed f16, [embed_dim/2] u32s).
         let last_token_bytes = (self.embed_dim * 2) as u64;
-        let last_token_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("forward_with_cache_argmax.last_token_packed"),
-            size: last_token_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let last_token_buf = lane_alloc(&self.gpu.transient_heap_c, last_token_bytes, "forward_with_cache_argmax.last_token_packed");
         // Vocab-sized f32 logits buffer.
         let logits_bytes = (lm_head.vocab_size * std::mem::size_of::<f32>()) as u64;
-        let logits_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("forward_with_cache_argmax.logits"),
-            size: logits_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        // 4-byte argmax output + matching staging.
-        let token_id_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("forward_with_cache_argmax.token_id"),
-            size: 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let staging = self.gpu.create_staging_buffer(4);
+        let logits_buf = lane_alloc(&self.gpu.transient_heap_c, logits_bytes, "forward_with_cache_argmax.logits");
+        // 4-byte argmax output + its readback region.
+        let token_id_buf = lane_alloc(&self.gpu.transient_heap_c, 4, "forward_with_cache_argmax.token_id");
+        let readback = ReadbackSpan::allocate(&self.gpu, &[4], "forward_with_cache_argmax.readback");
 
         let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("forward_with_cache_argmax.encoder"),
@@ -1150,7 +1042,7 @@ impl GpuEngine {
             let target = (cache.k_layer(i), cache.v_layer(i));
             let inject = inject_deltas.get(i).and_then(|opt| opt.as_ref());
             self.forward_block_gpu_inner(
-                &mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch,
+                &mut encoder, i, BufRange::of(&hidden_buf), n_tokens, start_pos, &scratch,
                 None, Some(target), None, inject,
             );
         }
@@ -1162,7 +1054,7 @@ impl GpuEngine {
                 timestamp_writes: None,
             });
             self.dispatch_rmsnorm_packed_to_packed_in_pass(
-                &mut pass, hidden_buf.as_entire_binding(), self.final_norm_weight_buf.binding(), normed_buf.as_entire_binding(),
+                &mut pass, hidden_buf.binding(), self.final_norm_weight_buf.binding(), normed_buf.binding(),
                 self.embed_dim, n_tokens, self.final_norm_eps,
             );
         }
@@ -1172,8 +1064,8 @@ impl GpuEngine {
         // token starts at byte offset (n_tokens-1) * embed_dim * 2.
         let last_token_offset = ((n_tokens - 1) * self.embed_dim * 2) as u64;
         encoder.copy_buffer_to_buffer(
-            &normed_buf, last_token_offset,
-            &last_token_buf, 0,
+            normed_buf.buffer(), normed_buf.offset() + last_token_offset,
+            last_token_buf.buffer(), last_token_buf.offset(),
             last_token_bytes,
         );
 
@@ -1184,7 +1076,7 @@ impl GpuEngine {
                 timestamp_writes: None,
             });
             self.dispatch_lm_head_matmul_pin_in_pass(
-                &mut pass, lm_head, &last_token_buf, &logits_buf,
+                &mut pass, lm_head, last_token_buf.binding(), logits_buf.binding(),
             );
         }
 
@@ -1195,23 +1087,21 @@ impl GpuEngine {
                 timestamp_writes: None,
             });
             self.dispatch_argmax_vocab_in_pass(
-                &mut pass, &logits_buf, &token_id_buf, lm_head.vocab_size,
+                &mut pass, logits_buf.binding(), token_id_buf.binding(), lm_head.vocab_size,
             );
         }
-        encoder.copy_buffer_to_buffer(&token_id_buf, 0, &staging, 0, 4);
+        {
+            let (dst, off) = readback.dst(0);
+            encoder.copy_buffer_to_buffer(token_id_buf.buffer(), token_id_buf.offset(), dst, off, 4);
+        }
 
         self.gpu.queue.submit(Some(encoder.finish()));
 
         // 4-byte readback (vs ~1.2 MB on the legacy path for Qwen 3B).
-        let slice = staging.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
-        self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
-        rx.recv().expect("token-id readback failed").expect("token-id map failed");
-        let data = slice.get_mapped_range();
-        let token_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-        drop(data);
-        staging.unmap();
+        let token_id = readback.read(&self.gpu, |m| {
+            let d = m.region(0);
+            u32::from_le_bytes([d[0], d[1], d[2], d[3]])
+        });
 
         cache.advance(n_tokens);
         Some(token_id)
@@ -1242,20 +1132,13 @@ impl GpuEngine {
         }
 
         // ---- Allocate buffers — C3 restored: hidden + normed packed f16 ----
+        // Review #23/#31: hidden on Lane A, normed on Lane B, readback span.
         let packed_bytes = (hidden_init.len() * 2) as u64;
         let hidden_packed = GpuDevice::pack_f16(&hidden_init);
-        let hidden_buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("forward_full.hidden"),
-            contents: bytemuck::cast_slice(&hidden_packed),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
-        let normed_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("forward_full.normed"),
-            size: packed_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let staging = self.gpu.create_staging_buffer(packed_bytes);
+        let hidden_buf = lane_alloc(&self.gpu.transient_heap_a, packed_bytes, "forward_full.hidden");
+        hidden_buf.write(&self.gpu.queue, bytemuck::cast_slice(&hidden_packed));
+        let normed_buf = lane_alloc(&self.gpu.transient_heap_b, packed_bytes, "forward_full.normed");
+        let readback = ReadbackSpan::allocate(&self.gpu, &[packed_bytes], "forward_full.readback");
 
         // Per-block sizing (consistent across blocks for non-MoE models).
         let attn0 = self.cpu.blocks()[0].attention();
@@ -1275,7 +1158,7 @@ impl GpuEngine {
             label: Some("forward_full.encoder"),
         });
         for i in 0..self.cpu.n_layers() {
-            self.forward_block_gpu(&mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch);
+            self.forward_block_gpu(&mut encoder, i, BufRange::of(&hidden_buf), n_tokens, start_pos, &scratch);
         }
         // Final norm (Phase B): hidden_buf and normed_buf are both packed.
         {
@@ -1285,15 +1168,18 @@ impl GpuEngine {
             });
             // C3: hidden packed, normed packed.
             self.dispatch_rmsnorm_packed_to_packed_in_pass(
-                &mut pass, hidden_buf.as_entire_binding(), self.final_norm_weight_buf.binding(), normed_buf.as_entire_binding(),
+                &mut pass, hidden_buf.binding(), self.final_norm_weight_buf.binding(), normed_buf.binding(),
                 self.embed_dim, n_tokens, self.final_norm_eps,
             );
         }
-        encoder.copy_buffer_to_buffer(&normed_buf, 0, &staging, 0, packed_bytes);
+        {
+            let (dst, off) = readback.dst(0);
+            encoder.copy_buffer_to_buffer(normed_buf.buffer(), normed_buf.offset(), dst, off, packed_bytes);
+        }
         self.gpu.queue.submit(Some(encoder.finish()));
 
         // ---- Read back final-normed hidden state (Phase B: f16 unpack) ----
-        let normed = read_back_buffer_f16_unpack(&self.gpu, &staging, packed_bytes as usize);
+        let normed = readback.read(&self.gpu, |m| m.f16_unpacked(0));
 
         // ---- 4. Output projection (CPU; vocab matmul deferred) ----
         self.cpu.finalize_logits(&normed, n_tokens)
@@ -1318,7 +1204,7 @@ impl GpuEngine {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         block_idx: usize,
-        hidden_buf: &wgpu::Buffer,
+        hidden_buf: BufRange<'_>,
         n_tokens: usize,
         start_pos: usize,
         scratch: &BlockScratch,
@@ -1360,20 +1246,24 @@ impl GpuEngine {
     /// supplied buffer. This is the natural attachment point for
     /// "entrance:N+1" shim hooks (the input to block N+1) and, when
     /// captured at the last block, the input to the final RMSNorm — i.e.
-    /// what gate / steer shims read. Buffer must be sized
-    /// `n_tokens * embed_dim * 4` bytes.
+    /// what gate / steer shims read. Range must be sized
+    /// `n_tokens * embed_dim * 2` bytes (packed f16).
+    ///
+    /// `hidden_buf` and both captures are [`BufRange`]s (review #23/#31):
+    /// heap sub-allocations on the request path, whole raw buffers in the
+    /// parity tests.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_block_gpu_inner(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         block_idx: usize,
-        hidden_buf: &wgpu::Buffer,
+        hidden_buf: BufRange<'_>,
         n_tokens: usize,
         start_pos: usize,
         scratch: &BlockScratch,
-        pre_softmax_capture: Option<&wgpu::Buffer>,
+        pre_softmax_capture: Option<BufRange<'_>>,
         kv_cache_target: Option<(&::vram_heap::VramAllocation, &::vram_heap::VramAllocation)>,
-        post_block_hidden_capture: Option<&wgpu::Buffer>,
+        post_block_hidden_capture: Option<BufRange<'_>>,
         pre_block_hidden_inject: Option<&wgpu::Buffer>,
     ) {
         let block = &self.cpu.blocks()[block_idx];
@@ -1426,13 +1316,13 @@ impl GpuEngine {
             // C3: hidden_buf is packed — use packed broadcast.
             if let Some(delta_buf) = pre_block_hidden_inject {
                 self.dispatch_add_broadcast_in_pass(
-                    &mut pass, hidden_buf.as_entire_binding(), delta_buf, embed_dim, n_tokens,
+                    &mut pass, hidden_buf.binding(), delta_buf, embed_dim, n_tokens,
                 );
             }
 
             // 1. attn_norm: hidden packed → normed packed.
             self.dispatch_rmsnorm_packed_to_packed_in_pass(
-                &mut pass, hidden_buf.as_entire_binding(), block_gpu.attn_norm_weight_buf.binding(), scratch.normed.binding(),
+                &mut pass, hidden_buf.binding(), block_gpu.attn_norm_weight_buf.binding(), scratch.normed.binding(),
                 embed_dim, n_tokens, block_gpu.attn_norm_eps,
             );
 
@@ -1526,11 +1416,11 @@ impl GpuEngine {
             self.dispatch_linear_batch_packed_io_in_pass(&mut pass, attn.o_proj(), scratch.attn_out.binding(), scratch.projected.binding(), n_tokens);
 
             // 8. Residual: hidden (packed) += projected (packed) — C3.
-            self.dispatch_add_packed_in_pass(&mut pass, hidden_buf.as_entire_binding(), scratch.projected.binding(), embed_dim, n_tokens);
+            self.dispatch_add_packed_in_pass(&mut pass, hidden_buf.binding(), scratch.projected.binding(), embed_dim, n_tokens);
 
             // 9. ffn_norm: hidden packed → normed packed — C3.
             self.dispatch_rmsnorm_packed_to_packed_in_pass(
-                &mut pass, hidden_buf.as_entire_binding(), block_gpu.ffn_norm_weight_buf.binding(), scratch.normed.binding(),
+                &mut pass, hidden_buf.binding(), block_gpu.ffn_norm_weight_buf.binding(), scratch.normed.binding(),
                 embed_dim, n_tokens, block_gpu.ffn_norm_eps,
             );
 
@@ -1558,15 +1448,15 @@ impl GpuEngine {
             self.dispatch_linear_batch_packed_io_in_pass(&mut pass, swiglu.down_proj(), scratch.activated.binding(), scratch.projected.binding(), n_tokens);
 
             // 14. Residual: hidden (packed) += projected (packed) — C3.
-            self.dispatch_add_packed_in_pass(&mut pass, hidden_buf.as_entire_binding(), scratch.projected.binding(), embed_dim, n_tokens);
+            self.dispatch_add_packed_in_pass(&mut pass, hidden_buf.binding(), scratch.projected.binding(), embed_dim, n_tokens);
             // pass2 ends here (drop)
         }
 
         // 15. (optional) capture post-block hidden state — shim hook point.
         // C3: hidden_buf is packed f16; capture is half size.
-        if let Some(capture_buf) = post_block_hidden_capture {
+        if let Some(capture) = post_block_hidden_capture {
             let bytes = (n_tokens * embed_dim * 2) as u64;
-            encoder.copy_buffer_to_buffer(hidden_buf, 0, capture_buf, 0, bytes);
+            encoder.copy_buffer_to_buffer(hidden_buf.buffer, hidden_buf.offset, capture.buffer, capture.offset, bytes);
         }
     }
 

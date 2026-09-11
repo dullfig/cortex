@@ -1018,11 +1018,12 @@ pub(crate) async fn shim_infer(
 
     let tokens = state.tokenizer.encode(&req.context, /*add_bos*/ true);
     // Review #5: bound the (unchunked) hidden-capture forward to the window.
-    // Review #4: this forward is unchunked, so it must also respect wgpu's
-    // 65535 dispatch-dimension limit (Qwen 3B: 4095 tokens).
+    // Review #4 / #23: unchunked, so it must also fit wgpu's 65535
+    // dispatch-dimension limit and the lanes + readback span with no
+    // per-layer captures (`max_hidden_capture_tokens(0)`; Qwen 3B: 4095).
     crate::chat::check_prompt_len(
         tokens.len(),
-        state.max_seq_len.min(state.engine.max_single_dispatch_tokens()),
+        state.max_seq_len.min(state.engine.max_hidden_capture_tokens(0)),
     )?;
     if tokens.is_empty() {
         return Err((
@@ -1151,12 +1152,19 @@ pub(crate) async fn shim_embed(
         ));
     }
     let tokens = state.tokenizer.encode(&req.text, /*add_bos*/ true);
+    // Build capture_layers: empty for Final (only need final post-norm),
+    // single-element for EntranceN(idx).
+    let capture_layers: Vec<usize> = match layer {
+        EmbedLayer::Final => Vec::new(),
+        EmbedLayer::EntranceN(idx) => vec![idx],
+    };
     // Review #5: bound the (unchunked) hidden-capture forward to the window.
-    // Review #4: this forward is unchunked, so it must also respect wgpu's
-    // 65535 dispatch-dimension limit (Qwen 3B: 4095 tokens).
+    // Review #4 / #23: unchunked, so it must also fit wgpu's 65535
+    // dispatch-dimension limit and the lanes + readback span with
+    // `capture_layers.len()` per-layer captures (`max_hidden_capture_tokens`).
     crate::chat::check_prompt_len(
         tokens.len(),
-        state.max_seq_len.min(state.engine.max_single_dispatch_tokens()),
+        state.max_seq_len.min(state.engine.max_hidden_capture_tokens(capture_layers.len())),
     )?;
     if tokens.is_empty() {
         return Err((
@@ -1166,13 +1174,6 @@ pub(crate) async fn shim_embed(
             })),
         ));
     }
-
-    // Build capture_layers: empty for Final (only need final post-norm),
-    // single-element for EntranceN(idx).
-    let capture_layers: Vec<usize> = match layer {
-        EmbedLayer::Final => Vec::new(),
-        EmbedLayer::EntranceN(idx) => vec![idx],
-    };
 
     // Review #7: one GPU region at a time.
     let _gpu = state.gpu_gate.admit().await;

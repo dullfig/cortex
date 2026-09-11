@@ -142,34 +142,21 @@ impl GpuEngine {
         // Per-captured-layer scores. Same shape as the f32 path:
         // [n_tokens, n_heads, attn_max_seq].
         let scores_bytes = (n_tokens * n_heads * attn_max_seq * std::mem::size_of::<f32>()) as u64;
-        let capture_bufs: Vec<wgpu::Buffer> = capture_layers.iter().map(|&l| {
-            self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(&format!("forward_polar_traced.scores.layer{l}")),
-                size: scores_bytes,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
+        // Review #23/#31: the per-layer score captures live on Lane A (the
+        // `polar_traced_query_max` Lane A term counts them; not Lane B,
+        // because each capture is a copy out of `scratch.scores` on Lane B
+        // and wgpu rejects a copy within one buffer) and their stagings are
+        // one `host_readback_heap` span mapped once — the pattern this
+        // function established for the stagings, now applied to the
+        // captures too.
+        let capture_bufs: Vec<::vram_heap::VramAllocation> = capture_layers.iter().map(|&l| {
+            lane_alloc(&self.gpu.transient_heap_a, scores_bytes, &format!("forward_polar_traced.scores.layer{l}"))
         }).collect();
-        // vram-heap migration: capture stagings are sub-allocations of
-        // the host-visible readback heap rather than fresh wgpu
-        // staging buffers. Safe because stagings are never bound as
-        // compute resources — only copy_buffer_to_buffer destinations
-        // and host map targets, neither of which triggers wgpu's
-        // per-dispatch buffer-usage tracker. After the overnight
-        // vram-heap rewrite, allocations free + coalesce via RAII
-        // Drop (no manual reset_transients); the explicit
-        // `drop(capture_stagings)` at function exit ensures Drop runs
-        // before the next forward call's allocator activity.
-        let capture_stagings: Vec<::vram_heap::VramAllocation> = capture_layers.iter()
-            .map(|&l| self.gpu.host_readback_heap.allocate(
-                scores_bytes,
-                ::vram_heap::COPY_BUFFER_ALIGNMENT,
-                &format!("forward_polar_traced.stg.layer{l}"),
-            ).expect("host_readback_heap capacity"))
-            .collect();
-        let capture_lookup: std::collections::HashMap<usize, &wgpu::Buffer> =
+        let region_sizes = vec![scores_bytes; capture_layers.len()];
+        let readback = ReadbackSpan::allocate(&self.gpu, &region_sizes, "forward_polar_traced.readback");
+        let capture_lookup: std::collections::HashMap<usize, BufRange<'_>> =
             capture_layers.iter().zip(capture_bufs.iter())
-                .map(|(&l, buf)| (l, buf))
+                .map(|(&l, buf)| (l, BufRange::of(buf)))
                 .collect();
 
         // ---- All blocks, split into chunks to avoid Windows TDR ----
@@ -252,68 +239,21 @@ impl GpuEngine {
         }
         // Skip final_norm + output projection — retrieval doesn't need logits.
         // Capture-to-staging copies go on the final encoder so they ride
-        // the last submit; staging readback below polls again before mapping.
-        for (cap_buf, stg) in capture_bufs.iter().zip(capture_stagings.iter()) {
-            // vram-heap: stg is a sub-range of the host_readback_heap's
-            // backing buffer. Copy to the right offset.
-            encoder.copy_buffer_to_buffer(
-                cap_buf, 0,
-                stg.buffer(), stg.offset(),
-                scores_bytes,
-            );
+        // the last submit; the span readback below polls before mapping.
+        for (i, cap_buf) in capture_bufs.iter().enumerate() {
+            let (dst, off) = readback.dst(i);
+            encoder.copy_buffer_to_buffer(cap_buf.buffer(), cap_buf.offset(), dst, off, scores_bytes);
         }
         self.gpu.queue.submit(Some(encoder.finish()));
 
-        // vram-heap migration: all capture_stagings share the same
-        // backing wgpu::Buffer (the host_readback_heap), so we can't
-        // map each sub-range separately (wgpu enforces one map state
-        // per buffer). Instead, map ONE range covering all the
-        // capture_staging sub-ranges, then slice into the mapped
-        // bytes by offset. Allocations are bump-allocated contiguously
-        // so the range is exactly [first.offset .. last.end].
-        use std::sync::mpsc;
-        let span_start = capture_stagings.first().map(|a| a.offset()).unwrap_or(0);
-        let span_end = capture_stagings.last()
-            .map(|a| a.offset() + a.size())
-            .unwrap_or(0);
-        let mapped_range = if span_end > span_start {
-            let slice = self.gpu.host_readback_heap.buffer().slice(span_start..span_end);
-            let (tx, rx) = mpsc::channel();
-            slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
-            self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
-            rx.recv().expect("readback channel closed").expect("buffer map failed");
-            Some(slice)
-        } else {
-            self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
-            None
-        };
+        // One map + one poll for every captured layer (wgpu enforces one
+        // map state per buffer, and the readback heap is one buffer).
+        let per_layer_scores: Vec<Vec<f32>> = readback.read(&self.gpu, |m| {
+            (0..capture_bufs.len()).map(|i| m.f32s(i)).collect()
+        });
 
-        let per_layer_scores: Vec<Vec<f32>> = if let Some(slice) = mapped_range.as_ref() {
-            let data = slice.get_mapped_range();
-            let out = capture_stagings.iter().map(|stg| {
-                let local_off = (stg.offset() - span_start) as usize;
-                let bytes = &data[local_off..local_off + scores_bytes as usize];
-                bytes.chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect()
-            }).collect();
-            drop(data);
-            out
-        } else {
-            Vec::new()
-        };
-
-        // Unmap the heap backing (covers the mapped span). Then drop
-        // the VramAllocations explicitly: vram-heap's free-list
-        // reclaims the ranges and coalesces with neighbors via RAII
-        // Drop (no manual reset needed after the overnight rewrite).
-        // Explicit drop forces this to happen before the function
-        // returns so the freelist state is clean for the next call.
-        if mapped_range.is_some() {
-            self.gpu.host_readback_heap.buffer().unmap();
-        }
-        drop(capture_stagings);
-
+        // RAII frees the Lane A/B ranges and the readback span at exit;
+        // the poll inside `read` already retired the GPU work on them.
         per_layer_scores
     }
 
@@ -469,12 +409,9 @@ impl GpuEngine {
             "forward_polar_argmax.hidden",
         ).expect("transient_heap_a capacity");
         hidden_buf.write(&self.gpu.queue, bytemuck::cast_slice(&hidden_packed));
-        let normed_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("forward_polar_argmax.normed"),
-            size: packed_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        // Review #23/#31: normed on Lane B, argmax scratch on Lane C,
+        // 4-byte readback on the heap — same layout as the f32 argmax path.
+        let normed_buf = lane_alloc(&self.gpu.transient_heap_b, packed_bytes, "forward_polar_argmax.normed");
 
         let intermediate = self.cpu.blocks()[0].ffn().as_any()
             .downcast_ref::<crate::layers::swiglu::SwiGLU>()
@@ -509,26 +446,11 @@ impl GpuEngine {
 
         // Last-token slice buffer (packed f16, [embed_dim/2] u32s).
         let last_token_bytes = (self.embed_dim * 2) as u64;
-        let last_token_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("forward_polar_argmax.last_token_packed"),
-            size: last_token_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let last_token_buf = lane_alloc(&self.gpu.transient_heap_c, last_token_bytes, "forward_polar_argmax.last_token_packed");
         let logits_bytes = (lm_head.vocab_size * std::mem::size_of::<f32>()) as u64;
-        let logits_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("forward_polar_argmax.logits"),
-            size: logits_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let token_id_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("forward_polar_argmax.token_id"),
-            size: 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let staging = self.gpu.create_staging_buffer(4);
+        let logits_buf = lane_alloc(&self.gpu.transient_heap_c, logits_bytes, "forward_polar_argmax.logits");
+        let token_id_buf = lane_alloc(&self.gpu.transient_heap_c, 4, "forward_polar_argmax.token_id");
+        let readback = ReadbackSpan::allocate(&self.gpu, &[4], "forward_polar_argmax.readback");
 
         let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("forward_polar_argmax.encoder"),
@@ -558,7 +480,7 @@ impl GpuEngine {
         // it goes (line 3126 in forward_block_gpu_polar_inner).
         for i in 0..n_layers {
             let inject = inject_deltas.get(i).and_then(|opt| opt.as_ref());
-            let capture = if debug_finite { Some(&debug_captures[i]) } else { None };
+            let capture = if debug_finite { Some(BufRange::whole(&debug_captures[i])) } else { None };
             self.forward_block_gpu_polar_inner(
                 &mut encoder, i, &hidden_buf, n_tokens, start_pos, &scratch,
                 &rotated_buf, &*polar_cache, qjl_c_buf.as_ref(), None, capture, inject,
@@ -574,15 +496,15 @@ impl GpuEngine {
         // _in_pass variant (still takes &wgpu::Buffer for non-polar
         // callers).
         self.dispatch_rmsnorm_packed_to_packed_into(
-            &mut encoder, hidden_buf.binding(), self.final_norm_weight_buf.binding(), normed_buf.as_entire_binding(),
+            &mut encoder, hidden_buf.binding(), self.final_norm_weight_buf.binding(), normed_buf.binding(),
             self.embed_dim, n_tokens, self.final_norm_eps,
         );
 
         // Slice the last token's packed row out of normed_buf.
         let last_token_offset = ((n_tokens - 1) * self.embed_dim * 2) as u64;
         encoder.copy_buffer_to_buffer(
-            &normed_buf, last_token_offset,
-            &last_token_buf, 0,
+            normed_buf.buffer(), normed_buf.offset() + last_token_offset,
+            last_token_buf.buffer(), last_token_buf.offset(),
             last_token_bytes,
         );
 
@@ -593,7 +515,7 @@ impl GpuEngine {
                 timestamp_writes: None,
             });
             self.dispatch_lm_head_matmul_pin_in_pass(
-                &mut pass, lm_head, &last_token_buf, &logits_buf,
+                &mut pass, lm_head, last_token_buf.binding(), logits_buf.binding(),
             );
         }
 
@@ -604,10 +526,13 @@ impl GpuEngine {
                 timestamp_writes: None,
             });
             self.dispatch_argmax_vocab_in_pass(
-                &mut pass, &logits_buf, &token_id_buf, lm_head.vocab_size,
+                &mut pass, logits_buf.binding(), token_id_buf.binding(), lm_head.vocab_size,
             );
         }
-        encoder.copy_buffer_to_buffer(&token_id_buf, 0, &staging, 0, 4);
+        {
+            let (dst, off) = readback.dst(0);
+            encoder.copy_buffer_to_buffer(token_id_buf.buffer(), token_id_buf.offset(), dst, off, 4);
+        }
 
         self.gpu.queue.submit(Some(encoder.finish()));
 
@@ -643,15 +568,10 @@ impl GpuEngine {
             }
         }
 
-        let slice = staging.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
-        self.gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
-        rx.recv().expect("token-id readback failed").expect("token-id map failed");
-        let data = slice.get_mapped_range();
-        let token_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-        drop(data);
-        staging.unmap();
+        let token_id = readback.read(&self.gpu, |m| {
+            let d = m.region(0);
+            u32::from_le_bytes([d[0], d[1], d[2], d[3]])
+        });
 
         polar_cache.set_len(start_pos + n_tokens);
         Some(token_id)
@@ -670,7 +590,7 @@ impl GpuEngine {
     /// - `rotated_buf`: scratch buffer of size `n_tokens * n_heads * head_dim`
     ///   f32, reused inside the block as both `rq` (post-rotate_q) and
     ///   `weighted_rotated_V` (pre-derotate). One allocation per trace call.
-    /// - `pre_softmax_capture`: optional buffer to copy scores into before
+    /// - `pre_softmax_capture`: optional range to copy scores into before
     ///   softmax overwrites them — for retrieval-mode tracing.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_block_gpu_polar_inner(
@@ -689,8 +609,8 @@ impl GpuEngine {
         // block fully rewrites it before reading — per-block
         // allocation would let RAII recycle the range mid-encoder).
         qjl_c_buf: Option<&::vram_heap::VramAllocation>,
-        pre_softmax_capture: Option<&wgpu::Buffer>,
-        post_block_hidden_capture: Option<&wgpu::Buffer>,
+        pre_softmax_capture: Option<BufRange<'_>>,
+        post_block_hidden_capture: Option<BufRange<'_>>,
         pre_block_hidden_inject: Option<&wgpu::Buffer>,
     ) {
         let block = &self.cpu.blocks()[block_idx];
@@ -833,11 +753,11 @@ impl GpuEngine {
         }
 
         // 6c. (optional) capture pre-softmax scores
-        if let Some(capture_buf) = pre_softmax_capture {
+        if let Some(capture) = pre_softmax_capture {
             let bytes = (n_tokens * n_heads * attn_max_seq * std::mem::size_of::<f32>()) as u64;
             encoder.copy_buffer_to_buffer(
                 scratch.scores.buffer(), scratch.scores.offset(),
-                capture_buf, 0, bytes,
+                capture.buffer, capture.offset, bytes,
             );
         }
 
@@ -940,11 +860,11 @@ impl GpuEngine {
 
         // (optional) post-block hidden state capture — shim hook point.
         // C3: hidden_buf is packed f16; capture is half size.
-        if let Some(capture_buf) = post_block_hidden_capture {
+        if let Some(capture) = post_block_hidden_capture {
             let bytes = (n_tokens * embed_dim * 2) as u64;
             encoder.copy_buffer_to_buffer(
                 hidden_buf.buffer(), hidden_buf.offset(),
-                capture_buf, 0, bytes,
+                capture.buffer, capture.offset, bytes,
             );
         }
     }

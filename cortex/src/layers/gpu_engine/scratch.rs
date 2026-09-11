@@ -32,6 +32,11 @@ pub struct ChunkLimits {
     /// how large Lane B is. (`max_buffer_size` is effectively unbounded
     /// on this hardware; the binding limit is the real ceiling.)
     pub binding_max: u64,
+    /// Bytes reserved on Lane C independent of `n` (review #23/#31): the
+    /// greedy-argmax forwards' decode scratch — last-token row
+    /// (`embed·2`), logits (`vocab·4`) and the token id (4). Budgeted on
+    /// every path so there is one formula.
+    pub fixed_c: u64,
 }
 
 /// wgpu's hard cap on any single `dispatch_workgroups` dimension
@@ -87,23 +92,62 @@ pub fn max_workgroups_per_token(n_heads: usize, head_dim: usize, embed: usize) -
 /// n · n_heads · (start + n) · 4 bytes). With `lin_coeff = 0` this
 /// degenerates to "scores alone ≤ budget" — used for the binding clamp.
 fn scores_quad_max_n(start_pos: usize, n_heads: usize, lin_coeff: usize, budget: u64) -> usize {
-    let a = (n_heads * 4) as f64;
+    scores_quad_max_n_k(start_pos, n_heads, 1, lin_coeff, budget)
+}
+
+/// [`scores_quad_max_n`] for `n_grids` score-sized grids at once
+/// (`n_grids·scores(n) + lin_coeff·n ≤ budget`): the scratch grid plus one
+/// capture per traced layer on Lane B, or the captures alone on the
+/// readback heap. `n_grids == 0` is the purely linear bound.
+fn scores_quad_max_n_k(
+    start_pos: usize,
+    n_heads: usize,
+    n_grids: usize,
+    lin_coeff: usize,
+    budget: u64,
+) -> usize {
+    if n_grids == 0 {
+        return if lin_coeff == 0 {
+            usize::MAX
+        } else {
+            (budget / lin_coeff as u64).min(usize::MAX as u64) as usize
+        }
+        .max(1);
+    }
+    let a = (n_heads * 4 * n_grids) as f64;
     let lin = a * start_pos as f64 + lin_coeff as f64;
     let n = ((-lin + (lin * lin + 4.0 * a * budget as f64).sqrt()) / (2.0 * a)).floor();
     (n as usize).max(1)
 }
 
+/// Per-token Lane B bytes that are linear in `n` on the f32 path: the
+/// scratch `normed` + `activated`, plus the forward's own post-norm
+/// hidden (review #23/#31: `normed_buf` lives on Lane B).
+fn lane_b_linear(lim: &ChunkLimits) -> usize {
+    (lim.embed + lim.intermediate) * 2 + lim.embed * 2
+}
+
+/// Per-token Lane A bytes on the f32 path: the scratch `attn_out`, `gate`,
+/// `up`, plus the forward's packed hidden (review #23/#31).
+fn lane_a_linear(lim: &ChunkLimits) -> usize {
+    lim.n_heads * lim.head_dim * 2 + lim.intermediate * 4 + lim.embed * 2
+}
+
 /// Pure prefill chunk-size math: the largest token count whose f32
-/// `BlockScratch` fits EVERY constraint at attention `start_pos`:
+/// `BlockScratch` — plus the forward's own per-call buffers, which since
+/// review #23/#31 live on the same lanes — fits EVERY constraint at
+/// attention `start_pos`:
 ///
 /// ```text
 ///   Lane B (quadratic): normed(n·embed·2) + activated(n·intermediate·2)
+///                       + post-norm hidden(n·embed·2)
 ///                       + scores(n·n_heads·(start+n)·4) ≤ lane_b
 ///   Binding (quadratic): scores ≤ binding_max          (single binding)
 ///   Lane A (linear): attn_out(n·n_heads·head_dim·2)
-///                    + gate(n·intermediate·2) + up(n·intermediate·2) ≤ lane_a
+///                    + gate(n·intermediate·2) + up(n·intermediate·2)
+///                    + packed hidden(n·embed·2) ≤ lane_a
 ///   Lane C (linear): q(n·n_heads·head_dim·2) + k + v (n·n_kv_heads·head_dim·2 each)
-///                    + projected(n·embed·2) ≤ lane_c
+///                    + projected(n·embed·2) ≤ lane_c − fixed_c
 /// ```
 ///
 /// Phase L checked Lane B only — safe while all three lanes shared the
@@ -111,20 +155,18 @@ fn scores_quad_max_n(start_pos: usize, n_heads: usize, lin_coeff: usize, budget:
 /// independently from the device budget, so each constraint must be
 /// checked; the chunk is the min. Always returns at least 1.
 fn prefill_chunk_size(start_pos: usize, lim: &ChunkLimits) -> usize {
-    // Lane B: scores + normed + activated (Phase L quadratic).
-    let n_b = scores_quad_max_n(
-        start_pos, lim.n_heads, (lim.embed + lim.intermediate) * 2, lim.lane_b,
-    );
+    // Lane B: scores + normed + activated (Phase L quadratic) + the
+    // forward's normed.
+    let n_b = scores_quad_max_n(start_pos, lim.n_heads, lane_b_linear(lim), lim.lane_b);
     // Binding cap: scores alone, no linear term.
     let n_bind = scores_quad_max_n(start_pos, lim.n_heads, 0, lim.binding_max);
-    // Lane A: attn_out + gate + up, all linear.
-    let ca = (lim.n_heads * lim.head_dim * 2 + lim.intermediate * 4) as u64;
-    let n_a = (lim.lane_a / ca).max(1) as usize;
-    // Lane C: q + k + v + projected, all linear.
+    // Lane A: attn_out + gate + up + the forward's packed hidden, all linear.
+    let n_a = (lim.lane_a / lane_a_linear(lim) as u64).max(1) as usize;
+    // Lane C: q + k + v + projected, all linear, after the fixed argmax scratch.
     let cc = (lim.n_heads * lim.head_dim * 2
         + lim.n_kv_heads * lim.head_dim * 4
         + lim.embed * 2) as u64;
-    let n_c = (lim.lane_c / cc).max(1) as usize;
+    let n_c = (lim.lane_c.saturating_sub(lim.fixed_c) / cc).max(1) as usize;
     // Dispatch limit (review #4): wgpu caps each dispatch_workgroups
     // dimension at 65535, and several batch shaders dispatch
     // (n_tokens × per-token groups) in ONE dimension. Bytes alone would
@@ -134,6 +176,59 @@ fn prefill_chunk_size(start_pos: usize, lim: &ChunkLimits) -> usize {
         / max_workgroups_per_token(lim.n_heads, lim.head_dim, lim.embed))
     .max(1);
     n_b.min(n_bind).min(n_a).min(n_c).min(n_dispatch).max(1)
+}
+
+/// Review #12 / #23: largest query `n` for ONE unchunked f32 traced
+/// forward (`forward_full_gpu_with_cache_traced`, `forward_full_gpu_traced`)
+/// against a `start_pos`-token shard capturing `n_capture_layers` layers.
+/// A prefill chunk's constraints ([`prefill_chunk_size`]) plus:
+/// - Lane A holds the `n_capture_layers` score captures next to its linear
+///   scratch (`attn_out`, `gate`, `up`, hidden): `L·scores + linear ≤ lane_a`
+///   — Lane A, not Lane B, because a capture is a copy out of
+///   `scratch.scores` on Lane B and wgpu rejects a copy within one buffer;
+/// - the readback span holds every capture plus the post-norm hidden:
+///   `L·scores + n·embed·2 ≤ readback`.
+pub fn f32_traced_query_max(
+    start_pos: usize,
+    lim: &ChunkLimits,
+    n_capture_layers: usize,
+    readback: u64,
+) -> usize {
+    let n_chunk = prefill_chunk_size(start_pos, lim);
+    let n_a = scores_quad_max_n_k(
+        start_pos, lim.n_heads, n_capture_layers, lane_a_linear(lim), lim.lane_a,
+    );
+    let n_rb = scores_quad_max_n_k(start_pos, lim.n_heads, n_capture_layers, lim.embed * 2, readback);
+    n_chunk.min(n_a).min(n_rb).max(1)
+}
+
+/// Review #23: largest `n` for ONE unchunked hidden-capture forward
+/// (`forward_full_gpu_with_hidden_capture`, `start_pos = 0`) capturing
+/// `n_capture_layers` post-block hidden states. A prefill chunk's
+/// constraints plus `L` packed-hidden captures (`n·embed·2` each) on Lane
+/// B and `(1 + L)` of them in the readback span.
+pub fn hidden_capture_max_n(lim: &ChunkLimits, n_capture_layers: usize, readback: u64) -> usize {
+    let n_chunk = prefill_chunk_size(0, lim);
+    let n_b = scores_quad_max_n(
+        0, lim.n_heads, lane_b_linear(lim) + n_capture_layers * lim.embed * 2, lim.lane_b,
+    );
+    let per_token_rb = ((1 + n_capture_layers) * lim.embed * 2) as u64;
+    let n_rb = (readback / per_token_rb).min(usize::MAX as u64) as usize;
+    n_chunk.min(n_b).min(n_rb).max(1)
+}
+
+/// Layout of a readback span: `sizes` tiled back to back, each region
+/// aligned to [`READBACK_ALIGNMENT`]. Returns `(offset, len)` per region
+/// and the span's total length. Pure so the tiling is unit-testable.
+pub(super) fn tile_regions(sizes: &[u64]) -> (Vec<(u64, u64)>, u64) {
+    let mut regions = Vec::with_capacity(sizes.len());
+    let mut total = 0u64;
+    for &size in sizes {
+        total = total.div_ceil(READBACK_ALIGNMENT) * READBACK_ALIGNMENT;
+        regions.push((total, size));
+        total += size;
+    }
+    (regions, total)
 }
 
 /// Per-block scratch buffers reused across all dispatches inside a single
@@ -322,8 +417,9 @@ impl BlockScratch {
 #[cfg(test)]
 mod chunk_size_tests {
     use super::{
-        max_workgroups_per_token, polar_traced_query_max, prefill_chunk_size, ChunkLimits,
-        PolarTraceLimits, WGPU_MAX_WORKGROUPS_PER_DIM,
+        f32_traced_query_max, hidden_capture_max_n, max_workgroups_per_token,
+        polar_traced_query_max, prefill_chunk_size, tile_regions, ChunkLimits,
+        PolarTraceLimits, READBACK_ALIGNMENT, WGPU_MAX_WORKGROUPS_PER_DIM,
     };
 
     /// Qwen 2.5 3B dims with all lanes at the Phase L 128 MB default and
@@ -339,7 +435,24 @@ mod chunk_size_tests {
             lane_b: 128 * 1024 * 1024 * 97 / 100,
             lane_c: 128 * 1024 * 1024 * 97 / 100,
             binding_max: 2 * 1024 * 1024 * 1024 - 4096, // ~2 GiB, typical NVIDIA
+            fixed_c: QWEN_FIXED_C,
         }
+    }
+
+    /// Qwen 2.5 3B argmax scratch: last-token row + 151936-entry logits + id.
+    const QWEN_FIXED_C: u64 = 2048 * 2 + 151_936 * 4 + 4;
+
+    /// The same dims on 12 GB-card lanes (A 512 MiB, B 1.2 GiB, C 256 MiB)
+    /// with the default 256 MiB readback heap, at the engine's 97 % slack.
+    fn qwen_limits_12gb() -> (ChunkLimits, u64) {
+        let lim = ChunkLimits {
+            lane_a: (512u64 << 20) * 97 / 100,
+            lane_b: (1200u64 << 20) * 97 / 100,
+            lane_c: (256u64 << 20) * 97 / 100,
+            binding_max: 2u64 << 30,
+            ..qwen_limits()
+        };
+        (lim, (256u64 << 20) * 97 / 100)
     }
 
     /// Exact per-lane footprints (bytes) of an f32 BlockScratch for `n`
@@ -347,18 +460,20 @@ mod chunk_size_tests {
     fn lane_a_bytes(n: usize, lim: &ChunkLimits) -> u64 {
         let attn_out = (n * lim.n_heads * lim.head_dim * 2) as u64;
         let gate_up = (n * lim.intermediate * 2 * 2) as u64;
-        attn_out + gate_up
+        let hidden = (n * lim.embed * 2) as u64; // review #23: packed hidden on Lane A
+        attn_out + gate_up + hidden
     }
     fn lane_b_bytes(n: usize, start: usize, lim: &ChunkLimits) -> u64 {
         let normed = (n * lim.embed * 2) as u64;
         let activated = (n * lim.intermediate * 2) as u64;
-        scores_bytes(n, start, lim) + normed + activated
+        let post_norm = (n * lim.embed * 2) as u64; // review #23: normed_buf on Lane B
+        scores_bytes(n, start, lim) + normed + activated + post_norm
     }
     fn lane_c_bytes(n: usize, lim: &ChunkLimits) -> u64 {
         let q = (n * lim.n_heads * lim.head_dim * 2) as u64;
         let kv = (n * lim.n_kv_heads * lim.head_dim * 2 * 2) as u64;
         let projected = (n * lim.embed * 2) as u64;
-        q + kv + projected
+        q + kv + projected + lim.fixed_c // review #23: argmax scratch on Lane C
     }
     fn scores_bytes(n: usize, start: usize, lim: &ChunkLimits) -> u64 {
         (n * lim.n_heads * (start + n) * 4) as u64
@@ -395,7 +510,9 @@ mod chunk_size_tests {
     fn polar_fits(n: usize, start: usize, lim: &PolarTraceLimits) -> bool {
         let hh = lim.n_heads * lim.head_dim;
         let scores = (n * lim.n_heads * (start + n) * 4) as u64;
-        let a = (n * (lim.intermediate * 4 + lim.embed * 2 + hh * 4)) as u64;
+        // Lane A: the linear scratch + one capture per traced layer (review #23).
+        let a = scores * lim.n_capture_layers as u64
+            + (n * (lim.intermediate * 4 + lim.embed * 2 + hh * 4)) as u64;
         let b = scores + (n * (lim.embed * 2 + lim.intermediate * 2 + hh * 2)) as u64;
         let c = (n * (hh * 2 + lim.n_kv_heads * lim.head_dim * 4 + lim.embed * 2)) as u64;
         let wg = max_workgroups_per_token(lim.n_heads, lim.head_dim, lim.embed);
@@ -445,6 +562,93 @@ mod chunk_size_tests {
             && lane_c_bytes(n, lim) <= lim.lane_c
             && scores_bytes(n, start, lim) <= lim.binding_max
             && n * wg_per_token(lim) <= WGPU_MAX_WORKGROUPS_PER_DIM
+    }
+
+    // --- Review #23/#31: the per-forward buffers moved onto the lanes ------
+
+    /// f32 traced forward: a chunk's constraints + L score captures on Lane
+    /// A + the readback span `[normed | scores × L]`.
+    fn f32_traced_fits(n: usize, start: usize, l: usize, lim: &ChunkLimits, readback: u64) -> bool {
+        let scores = scores_bytes(n, start, lim);
+        let hidden = (n * lim.embed * 2) as u64;
+        fits_all(n, start, lim)
+            && lane_a_bytes(n, lim) + scores * l as u64 <= lim.lane_a
+            && scores * l as u64 + hidden <= readback
+    }
+
+    #[test]
+    fn f32_traced_bound_is_maximal_against_every_constraint() {
+        let (lim, readback) = qwen_limits_12gb();
+        for &l in &[0usize, 1, 4, 36] {
+            let mut prev = usize::MAX;
+            for &start in &[0usize, 256, 1000, 4096, 16384] {
+                let n = f32_traced_query_max(start, &lim, l, readback);
+                assert!(n >= 1);
+                assert!(f32_traced_fits(n, start, l, &lim, readback), "L={l} start={start}: n={n} overflows");
+                if n > 1 {
+                    assert!(!f32_traced_fits(n + 1, start, l, &lim, readback), "L={l} start={start}: n={n} not maximal");
+                }
+                assert!(n <= prev, "L={l} start={start}: {n} > {prev}");
+                prev = n;
+            }
+        }
+        // With no captures the bound is exactly a prefill chunk's (the
+        // readback holds only the post-norm hidden, never the binding term
+        // at these sizes).
+        assert_eq!(f32_traced_query_max(4096, &lim, 0, readback), prefill_chunk_size(4096, &lim));
+        // Four captured layers against a 4096-token shard: the readback
+        // heap binds well below the chunk size, as review #12 found for
+        // the polar path.
+        let n4 = f32_traced_query_max(4096, &lim, 4, readback);
+        assert!(n4 < prefill_chunk_size(4096, &lim), "captures should bind: {n4}");
+        assert!(n4 >= 200, "4-layer retrieve query bound collapsed to {n4}");
+    }
+
+    /// Hidden-capture forward: a chunk's constraints at start 0 + L packed
+    /// hidden captures on Lane B + `(1 + L)` of them in the readback span.
+    fn hidden_capture_fits(n: usize, l: usize, lim: &ChunkLimits, readback: u64) -> bool {
+        let hidden = (n * lim.embed * 2) as u64;
+        fits_all(n, 0, lim)
+            && lane_b_bytes(n, 0, lim) + hidden * l as u64 <= lim.lane_b
+            && hidden * (1 + l as u64) <= readback
+    }
+
+    #[test]
+    fn hidden_capture_bound_is_maximal_against_every_constraint() {
+        let (lim, readback) = qwen_limits_12gb();
+        for &l in &[0usize, 1, 4, 36] {
+            let n = hidden_capture_max_n(&lim, l, readback);
+            assert!(n >= 1);
+            assert!(hidden_capture_fits(n, l, &lim, readback), "L={l}: n={n} overflows");
+            if n > 1 {
+                assert!(!hidden_capture_fits(n + 1, l, &lim, readback), "L={l}: n={n} not maximal");
+            }
+        }
+        // A gate/steer shim (no per-layer captures, just the post-norm
+        // hidden) keeps the full single-dispatch window on a 12 GB card.
+        assert_eq!(hidden_capture_max_n(&lim, 0, readback), 4095);
+        // Capturing every layer is readback-bound: 37 × 4 KiB per token
+        // into 248 MiB.
+        let all = hidden_capture_max_n(&lim, 36, readback);
+        assert!(all < 4095 && all > 1000, "{all}");
+    }
+
+    #[test]
+    fn readback_span_tiles_regions_aligned_and_disjoint() {
+        let sizes = [4096u64, 68, 100, 0, 8, 1_000_004];
+        let (regions, total) = tile_regions(&sizes);
+        assert_eq!(regions.len(), sizes.len());
+        let mut end = 0u64;
+        for (i, &(off, len)) in regions.iter().enumerate() {
+            assert_eq!(len, sizes[i]);
+            assert_eq!(off % READBACK_ALIGNMENT, 0, "region {i} offset {off} unaligned");
+            assert!(off >= end, "region {i} overlaps its predecessor");
+            end = off + len;
+        }
+        assert_eq!(total, end);
+        assert_eq!(total % 4, 0, "span length must be copy-aligned");
+        // An empty layout is legal (no captured layers).
+        assert_eq!(tile_regions(&[]), (Vec::new(), 0));
     }
 
     #[test]
@@ -582,6 +786,20 @@ impl GpuEngine {
     /// `scores` binding) are checked too. The chunker auto-adapts to
     /// whatever the heaps are sized to, on any GPU.
     pub fn safe_prefill_chunk_size(&self, start_pos: usize) -> usize {
+        prefill_chunk_size(start_pos, &self.chunk_limits(false))
+    }
+
+    /// The f32 lane geometry for this model. `from_capacity` sizes the
+    /// lanes from their nominal capacity (pure geometry — the number the
+    /// HTTP layer and an engine assert must agree on); otherwise from what
+    /// is free right now. ~3% slack against alignment padding /
+    /// fragmentation. With one forward at a time (cortex-cloud's gpu_gate,
+    /// review #7) the lanes are freshly empty at a forward's start (RAII
+    /// dropped the prior scratch) and the two agree; sizing chunks from
+    /// what is actually free means a caller that runs outside the gate at
+    /// least gets chunks that fit next to whatever is resident, instead of
+    /// a lane-capacity panic in BlockScratch.
+    fn chunk_limits(&self, from_capacity: bool) -> ChunkLimits {
         let attn0 = self.cpu.blocks()[0].attention();
         let embed = self.embed_dim();
         let intermediate = self.cpu.blocks()[0]
@@ -590,25 +808,38 @@ impl GpuEngine {
             .downcast_ref::<crate::layers::swiglu::SwiGLU>()
             .map(|f| f.intermediate_size())
             .unwrap_or(embed * 4);
-        // ~3% slack against alignment padding / fragmentation. With one
-        // forward at a time (cortex-cloud's gpu_gate, review #7) the lanes
-        // are freshly empty here (RAII dropped the prior scratch) and
-        // `available()` equals `capacity()`. Sizing from what is actually
-        // free rather than the nominal capacity means a caller that runs
-        // outside the gate at least gets chunks that fit next to whatever
-        // is resident, instead of an `.expect` panic in BlockScratch.
-        let lim = ChunkLimits {
+        let lane = |heap: &::vram_heap::VramHeap| {
+            if from_capacity { heap.capacity() } else { heap.available() }
+        };
+        ChunkLimits {
             n_heads: attn0.n_heads(),
             n_kv_heads: attn0.n_kv_heads(),
             head_dim: attn0.head_dim(),
             embed,
             intermediate,
-            lane_a: self.gpu.transient_heap_a.available() * 97 / 100,
-            lane_b: self.gpu.transient_heap_b.available() * 97 / 100,
-            lane_c: self.gpu.transient_heap_c.available() * 97 / 100,
+            lane_a: lane(&self.gpu.transient_heap_a) * 97 / 100,
+            lane_b: lane(&self.gpu.transient_heap_b) * 97 / 100,
+            lane_c: lane(&self.gpu.transient_heap_c) * 97 / 100,
             binding_max: self.gpu.device.limits().max_storage_buffer_binding_size as u64,
-        };
-        prefill_chunk_size(start_pos, &lim)
+            // Review #23: the greedy forwards' argmax scratch on Lane C.
+            fixed_c: (embed * 2 + self.cpu.vocab_size() * 4 + 4) as u64,
+        }
+    }
+
+    /// `host_readback_heap` bytes a forward may tile into its readback
+    /// span, at the same 97 % slack as the lanes.
+    fn readback_budget(&self) -> u64 {
+        self.gpu.host_readback_heap.capacity() * 97 / 100
+    }
+
+    /// Review #23: largest input (in tokens) ONE unchunked hidden-capture
+    /// forward (`forward_full_gpu_with_hidden_capture`) may carry while
+    /// capturing `n_capture_layers` post-block hidden states — the shim
+    /// embed / gate / steer prefill. Includes the single-dispatch cap
+    /// (review #4). The HTTP layer converts it to 400
+    /// `context_length_exceeded`; the forward asserts it as a backstop.
+    pub fn max_hidden_capture_tokens(&self, n_capture_layers: usize) -> usize {
+        hidden_capture_max_n(&self.chunk_limits(true), n_capture_layers, self.readback_budget())
     }
 
     /// Largest token count a SINGLE unchunked forward may carry before
@@ -629,9 +860,11 @@ impl GpuEngine {
     /// capturing `n_capture_layers` layers of pre-softmax scores.
     ///
     /// * `polar = false` (`forward_full_gpu_with_cache_traced`): the forward
-    ///   allocates one f32 `BlockScratch` at `start_pos = corpus_len` and
-    ///   raw staging buffers, so the bound is exactly a prefill chunk's —
-    ///   [`Self::safe_prefill_chunk_size`].
+    ///   allocates one f32 `BlockScratch` at `start_pos = corpus_len`, one
+    ///   score capture per traced layer on Lane A and a readback span for
+    ///   them — [`f32_traced_query_max`]. (Before review #23 the captures
+    ///   and stagings were raw, unbudgeted buffers and the bound was just
+    ///   a prefill chunk's.)
     /// * `polar = true` (`forward_full_gpu_polar_traced`): the polar
     ///   scratch layout plus one `host_readback_heap` staging of
     ///   `n·n_heads·(corpus+n)·4` bytes PER captured layer —
@@ -641,10 +874,10 @@ impl GpuEngine {
     ///   4096-token shard and panicked the worker.
     ///
     /// The HTTP layer converts this to `400 context_length_exceeded`; the
-    /// traced forwards assert against the same number as a backstop. The
-    /// polar bound is computed from lane *capacity* (pure geometry) because
-    /// the engine's assert runs after `hidden_buf` is already resident on
-    /// Lane A — both sides must agree on one number.
+    /// traced forwards assert against the same number as a backstop. Both
+    /// bounds are computed from lane *capacity* (pure geometry) because
+    /// the HTTP layer evaluates them outside the GPU region — both sides
+    /// must agree on one number.
     pub fn max_traced_query_tokens(
         &self,
         corpus_len: usize,
@@ -652,7 +885,9 @@ impl GpuEngine {
         polar: bool,
     ) -> usize {
         if !polar {
-            return self.safe_prefill_chunk_size(corpus_len);
+            return f32_traced_query_max(
+                corpus_len, &self.chunk_limits(true), n_capture_layers, self.readback_budget(),
+            );
         }
         let attn0 = self.cpu.blocks()[0].attention();
         let embed = self.embed_dim();
@@ -701,8 +936,9 @@ pub struct PolarTraceLimits {
 
 /// Largest query length `n` whose polar traced forward fits every
 /// constraint at corpus length `start_pos` (scores = `n·n_heads·(start+n)·4`):
-/// - Lane A, linear: gate + up (`inter·2` each), packed hidden (`embed·2`),
-///   rotated (`n_heads·head_dim·4`);
+/// - Lane A: gate + up (`inter·2` each), packed hidden (`embed·2`),
+///   rotated (`n_heads·head_dim·4`) linear, plus — review #23 — one
+///   score-sized capture per traced layer;
 /// - Lane B: normed (`embed·2`) + activated (`inter·2`) + attn_out
 ///   (`n_heads·head_dim·2`) linear, plus scores;
 /// - storage-binding cap: scores alone (bound as one buffer);
@@ -715,8 +951,13 @@ pub fn polar_traced_query_max(start_pos: usize, lim: &PolarTraceLimits) -> usize
         start_pos, lim.n_heads, lim.embed * 2 + lim.intermediate * 2 + hh * 2, lim.lane_b,
     );
     let n_bind = scores_quad_max_n(start_pos, lim.n_heads, 0, lim.binding_max);
-    let ca = (lim.intermediate * 4 + lim.embed * 2 + hh * 4) as u64;
-    let n_a = (lim.lane_a / ca).max(1) as usize;
+    // Lane A: the linear scratch plus one capture per traced layer (review
+    // #23 — a capture is a copy out of Lane B's `scratch.scores`, and wgpu
+    // rejects a copy within one buffer, so it cannot live on Lane B).
+    let n_a = scores_quad_max_n_k(
+        start_pos, lim.n_heads, lim.n_capture_layers,
+        lim.intermediate * 4 + lim.embed * 2 + hh * 4, lim.lane_a,
+    );
     let cc = (hh * 2 + lim.n_kv_heads * lim.head_dim * 4 + lim.embed * 2) as u64;
     let n_c = (lim.lane_c / cc).max(1) as usize;
     let n_dispatch = (WGPU_MAX_WORKGROUPS_PER_DIM

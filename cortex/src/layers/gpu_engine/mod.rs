@@ -238,10 +238,139 @@ pub(super) fn unpack_f16_bytes(data: &[u8]) -> Vec<f32> {
     out
 }
 
-/// Read back a packed-f16 buffer and unpack to `Vec<f32>`. `packed_bytes`
-/// is the byte count of the packed data in staging (each u32 holds 2
-/// f16). Output length is `packed_bytes / 2` f32s. Used by Phase B
-/// readback of `normed_buf` for CPU `finalize_logits`.
+/// A GPU buffer range: `(buffer, offset, size)`. Review #23/#31 moved every
+/// per-request buffer onto a budgeted heap, so the block forwards receive
+/// sub-ranges, not whole buffers — and a sub-range must serve both as a
+/// storage binding and as a `copy_buffer_to_buffer` endpoint, which a bare
+/// `BindingResource` cannot. Built with [`BufRange::of`] from a
+/// `VramAllocation` on the request path, or [`BufRange::whole`] from a raw
+/// buffer in the parity tests.
+#[derive(Clone, Copy)]
+pub struct BufRange<'a> {
+    pub buffer: &'a wgpu::Buffer,
+    pub offset: u64,
+    pub size: u64,
+}
+
+impl<'a> BufRange<'a> {
+    pub fn whole(buffer: &'a wgpu::Buffer) -> Self {
+        Self { buffer, offset: 0, size: buffer.size() }
+    }
+    pub fn of(alloc: &'a ::vram_heap::VramAllocation) -> Self {
+        Self { buffer: alloc.buffer(), offset: alloc.offset(), size: alloc.size() }
+    }
+    pub fn binding(&self) -> wgpu::BindingResource<'a> {
+        wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer: self.buffer,
+            offset: self.offset,
+            size: wgpu::BufferSize::new(self.size),
+        })
+    }
+}
+
+/// Alignment of `host_readback_heap` spans: wgpu maps at `MAP_ALIGNMENT`
+/// (8 bytes) and copies at `COPY_BUFFER_ALIGNMENT` (4); the larger wins.
+pub(super) const READBACK_ALIGNMENT: u64 = wgpu::MAP_ALIGNMENT;
+
+/// Storage-buffer sub-range alignment for the transient lanes.
+pub(super) const LANE_ALIGNMENT: u64 = ::vram_heap::STORAGE_BUFFER_OFFSET_ALIGNMENT_NVIDIA;
+
+/// Allocate `size` bytes on a transient lane for one forward (RAII-freed
+/// at function exit like the scratch). A lane that cannot fit the request
+/// is a bound violation upstream (`ChunkLimits`, `max_traced_query_tokens`
+/// and `max_hidden_capture_tokens` all include these buffers), so this
+/// panics with the heap's own error — before review #31 the same failure
+/// came back from the driver as `Buffer with '<label>' label is invalid`.
+pub(super) fn lane_alloc(
+    heap: &Arc<::vram_heap::VramHeap>,
+    size: u64,
+    label: &str,
+) -> ::vram_heap::VramAllocation {
+    heap.allocate(size.max(LANE_ALIGNMENT), LANE_ALIGNMENT, label)
+        .unwrap_or_else(|e| panic!("{} capacity for {label}: {e}", heap.label()))
+}
+
+/// The MAP_READ side of one forward: ONE `host_readback_heap` allocation
+/// tiling every staging region the forward reads back
+/// (`[normed | scores_0 | … | scores_L-1]`, or just `[token_id]`), mapped
+/// once. wgpu allows one live mapping per buffer and the readback heap is
+/// one buffer, so a forward maps a single span rather than L stagings —
+/// the pattern the polar traced forward established; review #23/#31 made
+/// it the only one (`GpuDevice::create_staging_buffer` has no caller on
+/// the request path any more).
+pub(super) struct ReadbackSpan {
+    alloc: ::vram_heap::VramAllocation,
+    /// `(offset within the span, byte length)` per region, in layout order.
+    regions: Vec<(u64, u64)>,
+}
+
+impl ReadbackSpan {
+    /// Lay `sizes` out back to back, each region `READBACK_ALIGNMENT`-aligned.
+    pub fn allocate(gpu: &GpuDevice, sizes: &[u64], label: &str) -> Self {
+        let (regions, total) = scratch::tile_regions(sizes);
+        let alloc = gpu
+            .host_readback_heap
+            .allocate(total.max(READBACK_ALIGNMENT), READBACK_ALIGNMENT, label)
+            .unwrap_or_else(|e| panic!("host_readback_heap capacity for {label}: {e}"));
+        Self { alloc, regions }
+    }
+
+    /// Copy destination of region `i`: the heap buffer and the absolute offset.
+    pub fn dst(&self, i: usize) -> (&wgpu::Buffer, u64) {
+        (self.alloc.buffer(), self.alloc.offset() + self.regions[i].0)
+    }
+
+    /// Map the whole span (one `map_async` + one poll), run `f` over the
+    /// mapped bytes, unmap. The poll also drains wgpu's deferred-destroy
+    /// queue, so this doubles as the per-forward flush.
+    pub fn read<R>(&self, gpu: &GpuDevice, f: impl FnOnce(&MappedSpan<'_>) -> R) -> R {
+        let buffer = self.alloc.buffer();
+        let start = self.alloc.offset();
+        let slice = buffer.slice(start..start + self.alloc.size());
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+        gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+        rx.recv().expect("readback channel closed").expect("buffer map failed");
+        let out = {
+            let view = slice.get_mapped_range();
+            f(&MappedSpan { bytes: &view, regions: &self.regions })
+        };
+        buffer.unmap();
+        out
+    }
+}
+
+/// The mapped bytes of a [`ReadbackSpan`], addressed by region.
+pub(super) struct MappedSpan<'a> {
+    bytes: &'a [u8],
+    regions: &'a [(u64, u64)],
+}
+
+impl MappedSpan<'_> {
+    pub fn region(&self, i: usize) -> &[u8] {
+        let (off, len) = self.regions[i];
+        &self.bytes[off as usize..(off + len) as usize]
+    }
+    /// Region `i` as packed f16, unpacked to f32.
+    pub fn f16_unpacked(&self, i: usize) -> Vec<f32> {
+        unpack_f16_bytes(self.region(i))
+    }
+    /// Region `i` as little-endian f32.
+    pub fn f32s(&self, i: usize) -> Vec<f32> {
+        self.region(i)
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+}
+
+/// Read back a packed-f16 raw staging buffer and unpack to `Vec<f32>`.
+/// `packed_bytes` is the byte count of the packed data in staging (each
+/// u32 holds 2 f16). Output length is `packed_bytes / 2` f32s. Since
+/// review #23/#31 only the env-gated per-layer debug scans
+/// (`CORTEX_DEBUG_HIDDEN_FINITE` / `CORTEX_DEBUG_POLAR_FINITE`) and the
+/// parity tests use raw stagings; the request path reads through
+/// [`ReadbackSpan`].
 fn read_back_buffer_f16_unpack(gpu: &GpuDevice, staging: &wgpu::Buffer, packed_bytes: usize) -> Vec<f32> {
     let slice = staging.slice(..);
     let (tx, rx) = std::sync::mpsc::channel();
@@ -563,12 +692,18 @@ impl GpuEngine {
     /// destroy queue for dropped buffers has been processed. wgpu uses a
     /// lazy destruction model — wgpu::Buffer's Drop only queues the
     /// underlying allocation for cleanup; the actual free happens at the
-    /// next poll/submit. Without an explicit poll, churn-heavy patterns
-    /// (e.g. cache_load creating + dropping a 300MB f32 cache per shard)
-    /// can grow the destroy queue until wgpu-29's stricter validation
-    /// rejects new allocations with a delayed "Buffer X is invalid"
-    /// error that surfaces at the next poll/get_mapped_range. Calling
-    /// this between cache loads lets the allocator drain.
+    /// next poll/submit. The `DeviceBudget` releases a dropped cache's
+    /// reservation synchronously, so between the drop and the next poll
+    /// the budget can admit a heap the driver cannot yet back; calling
+    /// this after dropping a shard (cache_delete, same-id reload,
+    /// polar_only) closes that window (review #30).
+    ///
+    /// The `Buffer with '<label>' label is invalid` panic this comment
+    /// used to attribute to the destroy queue was review #31: a raw,
+    /// unbudgeted `create_buffer_init` on the request path failing to
+    /// allocate under that same pressure, then being mapped. Every
+    /// per-request buffer is a budgeted heap sub-allocation now, so an
+    /// over-commit fails loudly at the heap, with the real label.
     pub fn poll_wait(&self) {
         self.gpu.device.poll(wgpu::PollType::Wait {
             submission_index: None,
@@ -694,6 +829,37 @@ impl GpuEngine {
             attn0.head_dim(),
             max_seq_len,
             rotation_seed_base,
+        )
+    }
+
+    /// Bytes the device VRAM budget can still reserve (review #30/#31
+    /// diagnostics for the same-id reload's transient two-shard window).
+    pub fn vram_budget_remaining(&self) -> u64 {
+        self.gpu.vram_budget.remaining()
+    }
+
+    /// Fallible `create_gpu_polar_kv_cache_with_qjl` (`n_qjl_proj == 0`
+    /// disables QJL): a refused VRAM budget is an `Err`, not a panic —
+    /// the polar half of review #6's `try_create_gpu_kv_cache`, so a
+    /// same-id reload at the budget edge (review #30/#31) fails as a 503
+    /// before any GPU work.
+    pub fn try_create_gpu_polar_kv_cache(
+        &self,
+        max_seq_len: usize,
+        rotation_seed_base: u64,
+        n_qjl_proj: usize,
+        qjl_seed_base: u64,
+    ) -> Result<crate::layers::gpu_polar_kv_cache::GpuPolarKvCache, ::vram_heap::Error> {
+        let attn0 = self.cpu.blocks()[0].attention();
+        crate::layers::gpu_polar_kv_cache::GpuPolarKvCache::try_new_with_qjl(
+            self.gpu.clone(),
+            self.cpu.n_layers(),
+            attn0.n_kv_heads(),
+            attn0.head_dim(),
+            max_seq_len,
+            rotation_seed_base,
+            n_qjl_proj,
+            qjl_seed_base,
         )
     }
 

@@ -806,6 +806,54 @@ impl GpuDevice {
             "cortex.host_readback",
         ).expect("vram-heap readback construction failed");
 
+        // Review #31 diagnostics: wgpu's default uncaptured-error handler
+        // panics with only the failing resource's label — which, for an
+        // allocation that failed under VRAM pressure, names the victim
+        // rather than the pressure (`Buffer with 'forward_advance_only.
+        // hidden' label is invalid`). Log every heap and the device
+        // budget first, then re-panic: validation errors leave the device
+        // in an unknown state and are not safely recoverable, so the
+        // worker still dies, but the next occurrence names the cause.
+        //
+        // The handler lives inside the device's error sink, and every heap
+        // holds the device alive through its backing buffer — so it must
+        // hold the heaps and the budget WEAKLY or the device, the heaps and
+        // their VRAM would form a cycle and never be freed (the parity
+        // suite builds one `GpuDevice` per test and found exactly that).
+        {
+            let heaps = [
+                Arc::downgrade(&transient_heap_a),
+                Arc::downgrade(&transient_heap_b),
+                Arc::downgrade(&transient_heap_c),
+                Arc::downgrade(&weights_heap),
+                Arc::downgrade(&host_readback_heap),
+            ];
+            let budget = Arc::downgrade(&vram_budget);
+            device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| {
+                for heap in heaps.iter().filter_map(|w| w.upgrade()) {
+                    let st = heap.stats();
+                    tracing::error!(
+                        heap = heap.label(),
+                        capacity_mb = heap.capacity() >> 20,
+                        used_mb = st.used_size >> 20,
+                        live_allocations = st.current_live_allocations,
+                        largest_free_mb = st.largest_free_block >> 20,
+                        "vram heap state at wgpu error",
+                    );
+                }
+                if let Some(budget) = budget.upgrade() {
+                    tracing::error!(
+                        total_mb = budget.total() >> 20,
+                        committed_mb = budget.committed() >> 20,
+                        remaining_mb = budget.remaining() >> 20,
+                        error = %e,
+                        "device VRAM budget at wgpu error (review #31)",
+                    );
+                }
+                panic!("wgpu error: {e}");
+            }));
+        }
+
         Some(Self {
             device, queue, pipelines, params_pool, vram_budget,
             transient_heap_a, transient_heap_b, transient_heap_c, weights_heap, host_readback_heap,
@@ -939,7 +987,11 @@ impl GpuDevice {
         })
     }
 
-    /// Create a staging buffer for GPU→CPU readback.
+    /// Create a raw (unbudgeted) staging buffer for GPU→CPU readback.
+    /// Tests, tools and the env-gated debug scans only: the request path
+    /// reads back through `host_readback_heap` spans (review #23/#31), so
+    /// a readback that does not fit is a bound violation upstream, not a
+    /// driver OOM at map time.
     pub fn create_staging_buffer(&self, size: u64) -> wgpu::Buffer {
         self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("staging"),

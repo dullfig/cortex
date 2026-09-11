@@ -1656,7 +1656,7 @@
         let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("test.encoder"),
         });
-        engine.forward_block_gpu(&mut encoder, 0, &hidden_buf, n_tokens, 0, &scratch);
+        engine.forward_block_gpu(&mut encoder, 0, BufRange::whole(&hidden_buf), n_tokens, 0, &scratch);
         encoder.copy_buffer_to_buffer(&hidden_buf, 0, &staging, 0, bytes);
         gpu.queue.submit(Some(encoder.finish()));
 

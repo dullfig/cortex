@@ -1029,8 +1029,8 @@ impl GpuEngine {
         &self,
         pass: &mut wgpu::ComputePass<'_>,
         lm_head: &LmHead,
-        in_packed_buf: &wgpu::Buffer,
-        out_buf: &wgpu::Buffer,
+        in_packed_buf: wgpu::BindingResource<'_>,
+        out_buf: wgpu::BindingResource<'_>,
     ) {
         #[repr(C)]
         #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -1047,8 +1047,8 @@ impl GpuEngine {
             pipeline,
             vec![
                 lm_head.weight_buf.binding(),
-                in_packed_buf.as_entire_binding(),
-                out_buf.as_entire_binding(),
+                in_packed_buf,
+                out_buf,
                 params_buf.as_entire_binding(),
             ],
         );
@@ -1067,15 +1067,15 @@ impl GpuEngine {
     pub(super) fn dispatch_argmax_vocab_in_pass(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
-        logits_buf: &wgpu::Buffer,
-        out_id_buf: &wgpu::Buffer,
+        logits_buf: wgpu::BindingResource<'_>,
+        out_id_buf: wgpu::BindingResource<'_>,
         vocab_size: usize,
     ) {
         let params = ArgmaxVocabParams { n: vocab_size as u32, _pad: 0 };
         let params_buf = self.gpu.create_params_buffer(&params);
         let pipeline = &self.gpu.pipelines.argmax_vocab;
-        let bind = self.gpu.make_bind_group(
-            pipeline, &[logits_buf, out_id_buf, &params_buf],
+        let bind = self.gpu.make_bind_group_with(
+            pipeline, vec![logits_buf, out_id_buf, params_buf.as_entire_binding()],
         );
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind, &[]);
@@ -1323,7 +1323,7 @@ impl GpuEngine {
         start_pos: usize,
         max_seq: usize,
         n_tokens: usize,
-        pre_softmax_capture: Option<&wgpu::Buffer>,
+        pre_softmax_capture: Option<BufRange<'_>>,
     ) {
         assert!(n_heads % n_kv_heads == 0, "n_heads must be divisible by n_kv_heads");
         let heads_per_kv = n_heads / n_kv_heads;
@@ -1430,11 +1430,11 @@ impl GpuEngine {
         }
 
         // ---- 1.5. (optional) capture pre-softmax scores ----
-        if let Some(capture_buf) = pre_softmax_capture {
+        if let Some(capture) = pre_softmax_capture {
             let bytes = (n_tokens * n_heads * max_seq * std::mem::size_of::<f32>()) as u64;
             encoder.copy_buffer_to_buffer(
                 scores_buf.buffer(), scores_buf.offset(),
-                capture_buf, 0, bytes,
+                capture.buffer, capture.offset, bytes,
             );
         }
 

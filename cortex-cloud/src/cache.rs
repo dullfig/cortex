@@ -167,6 +167,21 @@ pub(crate) async fn cache_load(
     // (gate -> pool lock order).
     let _gpu = state.gpu_gate.admit().await;
 
+    // Review #30/#31: a same-id reload builds the replacement BEFORE the
+    // old shard is dropped (a failed reload must not lose the old shard),
+    // so at the shard cap it transiently holds two shards' VRAM. The
+    // budget checks below see that 2x; a refusal is the 503 the caller
+    // gets instead of the driver OOM that used to surface as a mislabeled
+    // "buffer is invalid" panic in whatever forward allocated next.
+    let replacing = state.cache_pool.lock().await.contains_key(&req.cache_id);
+    if replacing {
+        tracing::info!(
+            cache_id = %req.cache_id,
+            budget_remaining_mb = state.engine.vram_budget_remaining() >> 20,
+            "cache_load replacing a resident shard: two shards resident until the swap",
+        );
+    }
+
     // Review #6: a refused VRAM budget is a 503, not a panic.
     let mut cache = state
         .engine
@@ -208,22 +223,17 @@ pub(crate) async fn cache_load(
     // populate path also writes K residual signs (handled inside
     // populate_from_f32_cache_gpu via qjl_encode_k_layer).
     let polar = if state.polar_cache_enabled {
-        tokio::task::block_in_place(|| {
-            let mut p = if req.qjl {
-                state.engine.create_gpu_polar_kv_cache_with_qjl(
-                    state.max_seq_len,
-                    state.polar_rotation_seed,
-                    state.qjl_projections,
-                    state.qjl_seed,
-                )
-            } else {
-                state.engine.create_gpu_polar_kv_cache(
-                    state.max_seq_len, state.polar_rotation_seed,
-                )
-            };
-            p.populate_from_f32_cache_gpu(&cache);
-            Some(p)
-        })
+        // Review #30/#31: the polar heaps reserve against the same budget;
+        // a refusal is a 503 here, not a panic mid-load.
+        let (n_qjl, qjl_seed) = if req.qjl { (state.qjl_projections, state.qjl_seed) } else { (0, 0) };
+        let mut p = state
+            .engine
+            .try_create_gpu_polar_kv_cache(
+                state.max_seq_len, state.polar_rotation_seed, n_qjl, qjl_seed,
+            )
+            .map_err(crate::chat::vram_exhausted_err)?;
+        tokio::task::block_in_place(|| p.populate_from_f32_cache_gpu(&cache));
+        Some(p)
     } else {
         None
     };

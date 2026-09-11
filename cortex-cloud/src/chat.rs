@@ -899,12 +899,13 @@ pub(crate) async fn chat_completions(
     // post-norm hidden. Skip the prefill entirely when neither set
     // has shims (preserves the existing fast path for plain chat).
     let need_hc = !resolved_gate_shims.is_empty() || !resolved_inject_shims.is_empty();
-    // Review #4: the hidden-capture prefill is a single unchunked forward,
-    // so it must respect wgpu's 65535 dispatch-dimension limit too.
+    // Review #4 / #23: the hidden-capture prefill is a single unchunked
+    // forward, so it must fit wgpu's 65535 dispatch-dimension limit and
+    // the lanes + readback span (no per-layer captures here).
     if need_hc {
         check_prompt_len(
             prompt_tokens.len(),
-            state.max_seq_len.min(state.engine.max_single_dispatch_tokens()),
+            state.max_seq_len.min(state.engine.max_hidden_capture_tokens(0)),
         )?;
     }
     // Review #7: one GPU region at a time. Everything below that touches the

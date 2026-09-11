@@ -182,6 +182,29 @@ impl GpuPolarKvCache {
         n_qjl_proj: usize,
         qjl_seed_base: u64,
     ) -> Self {
+        Self::try_new_with_qjl(
+            gpu, n_layers, n_kv_heads, head_dim, max_seq_len,
+            rotation_seed_base, n_qjl_proj, qjl_seed_base,
+        )
+        .expect("polar_kv heap construction failed")
+    }
+
+    /// Fallible `new_with_qjl`: the three lane heaps reserve against the
+    /// device VRAM budget, and a refused reservation is returned as
+    /// `Err(BudgetExceeded)` instead of panicking the worker (review
+    /// #30/#31: a same-id `cache/load` at the shard cap transiently holds
+    /// two shards, and the polar half of the replacement was the last
+    /// allocation on that path that could not say "no").
+    pub fn try_new_with_qjl(
+        gpu: Arc<GpuDevice>,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        rotation_seed_base: u64,
+        n_qjl_proj: usize,
+        qjl_seed_base: u64,
+    ) -> Result<Self, ::vram_heap::Error> {
         assert!(head_dim % 2 == 0, "head_dim must be even");
         assert!(n_layers > 0 && n_kv_heads > 0 && head_dim > 0 && max_seq_len > 0);
         assert!(
@@ -257,14 +280,14 @@ impl GpuPolarKvCache {
             ::vram_heap::MemoryTier::DeviceLocal,
             const_size,
             "polar_kv.const",
-        ).expect("polar_kv const_heap construction failed");
+        )?;
         let data_heap = ::vram_heap::VramHeap::new_in_budget(
             &gpu.device,
             &gpu.vram_budget,
             ::vram_heap::MemoryTier::DeviceLocal,
             data_size,
             "polar_kv.data",
-        ).expect("polar_kv data_heap construction failed");
+        )?;
         let signs_heap = if qjl_enabled {
             Some(::vram_heap::VramHeap::new_in_budget(
                 &gpu.device,
@@ -272,7 +295,7 @@ impl GpuPolarKvCache {
                 ::vram_heap::MemoryTier::DeviceLocal,
                 signs_size,
                 "polar_kv.signs",
-            ).expect("polar_kv signs_heap construction failed"))
+            )?)
         } else { None };
 
         let mut k_angles_buffers = Vec::with_capacity(n_layers);
@@ -371,7 +394,7 @@ impl GpuPolarKvCache {
             (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
         };
 
-        Self {
+        Ok(Self {
             gpu,
             const_heap,
             data_heap,
@@ -394,7 +417,7 @@ impl GpuPolarKvCache {
             n_qjl_proj,
             qjl_seed_base,
             len: 0,
-        }
+        })
     }
 
     /// Populate one layer's K and V buffers from a CPU `QuantizedKvCache`.
