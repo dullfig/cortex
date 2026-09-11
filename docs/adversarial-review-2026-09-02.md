@@ -15,9 +15,10 @@ exact root site, and matched the reported number precisely:
 chunk; 16 × 4178 = 66848** — the value memex logged. It then found the bug
 is a *class* (13 sites) and two things the report did not cover.
 
-**Fix status (2026-09-09).** 16 of 30 closed (four findings were added
-after the review, see below), all five P0s and the P1 concurrency/cache cluster among them. Rows
-below carry a `✅ CLOSED <commit>` marker.
+**Fix status (2026-09-10).** 24 of 31 closed (five findings were added
+after the review, see below): all five P0s, the P1 concurrency/cache cluster,
+and the whole GGUF / model-load trust boundary (#13–#19, #21). Rows below
+carry a `✅ CLOSED <commit>` marker.
 
 | Commit | Closes | What landed |
 |---|---|---|
@@ -29,9 +30,14 @@ below carry a `✅ CLOSED <commit>` marker.
 | `319ad42` | #8, #20 | `CacheEntry::check_lockstep` (tokens == f32 seq == polar seq) enforced → 409 `cache_desynced`; generation off-by-one fixed (trailing token forwarded or dropped); `sync_lagging_caches` after single- and multi-shard chat; append overflow pre-check uses the tighter window; single-shard retrieve gained the window bound (`check_retrieve_fits`). |
 | `1a594f2` | #7 | `ServerState::gpu_gate` (single-permit FIFO) around all 20 GPU regions, lock order gate → pool → composition; `cortex_gpu_gate_waiting` gauge; `safe_prefill_chunk_size` sizes from `available()`; params-pool comment corrected. Burst e2e: 4/8 dead + 7 panics → 8/8 clean. |
 | `f7e6d1e` | #12 | `GpuEngine::max_traced_query_tokens` (lane A/B/C, binding, dispatch, and `host_readback_heap` summed over captured layers) → 400 at the HTTP layer; the same formula backstops both traced forwards. |
+| `7382f6e` | #13, #14, #15, #16 | Parser knows the file length; `ensure_available` before every string/array/tensor allocation; counts bounded by the remaining bytes; `n_dims` 1..=4, no zero dims; checked element and byte counts (`tensor_byte_size -> Result`); every tensor extent validated at open and re-validated per read; alignment a non-zero power of two; arrays of arrays refused (no recursion); `FloatTensor::new` checked product. 10 hostile fixtures. |
+| `0dd39fa` | #17, #19 | `ModelConfig::validate()` before any tensor (divisors, caps, finite floats; `InvalidConfig` names the key); every tensor shape checked against the config (`DimensionMismatch`), norms and biases included; tokenizer/embedding vocab check before loading; `load_from_gguf` + `GgufFile::open_bytes` give the loader its first tests (a complete tiny model + one-field corruptions). |
+| `5a2dcb1` | #18 | `rope.scaling.type` read as the string it is and surfaced (warn: not implemented); RoPE layout from an architecture table transcribed from llama.cpp (unknown arch refused, `CORTEX_ROPE_LAYOUT` override); `hidden_act` must be SiLU. |
+| `f05aa09` | #21 | Tokenizer arrays validated against the vocabulary (present-but-short is an `Err`, any integer width accepted for types/ids), bos/eos range-checked, decode never indexes with a client id (U+FFFD), SentencePiece byte fallback decodes UTF-8, merges keep first rank. |
 
-Still open, in suggested order: #13–#17 (GGUF hardening), #18 (`rope.scaling.type`),
-#19, #21, #10 (O(n²) BPE), #23–#26.
+Still open, in suggested order: #31 (intermittent wgpu-29 delayed validation
+error, see below), #10 (O(n²) BPE), #23 (budget bypass on raw buffers),
+#24 (streaming swallows panics / no cancellation), #25, #26.
 
 ### Found after the review (2026-09-08/09)
 
@@ -39,8 +45,9 @@ The review's root cause #5 predicted #27–#29: their common cause is the C3
 packed residual stream (920e8be, 2026-05-29) — every entry point that
 hand-builds `hidden_buf` must pack it, and two never did. Two sibling
 instances had been found by hand in June (f5b55a2 polar traced, 7d63396
-`advance_only`); the pattern was never audited across the file. #30 is the
-budget-vs-deferred-destroy class (#6 / #23), surfaced by the #9 e2e.
+`advance_only`); the pattern was never audited across the file. #30 and #31
+are the budget-vs-deferred-destroy class (#6 / #23), surfaced by the e2e
+drivers.
 
 | # | Finding | Site | Label |
 |---|---|---|---|
@@ -48,6 +55,7 @@ budget-vs-deferred-destroy class (#6 / #23), surfaced by the #9 e2e.
 | 28 | ✅ CLOSED 221b9a1 — **f32 traced forward computed on garbage.** `forward_traced_inner` (`forward_full_gpu_traced` / `forward_traced_scores_only`) had the same raw-f32 upload + f32 final-norm/readback. Logit 0 on the toy: CPU −0.266, GPU −0.855; layer-0 scores off 2×. No production caller today (retrieve uses `_with_cache_traced`, packed since 00f3206 on 06-06 — so the Phase P f32-control result of 06-12 is **not** contaminated), but `state.rs:85` still documents it as the retrieve path. | `forward_f32.rs:80-91, 135-139, 170-177` | **VERIFIED** (tests `forward_full_gpu_traced_matches_cpu_traced`, `forward_traced_with_cache_matches_fresh_traced`) |
 | 29 | ✅ CLOSED 221b9a1 — **Every untied-output-head model panicked at engine init.** The Phase G LM-head materialisation `copy_buffer_to_buffer`s from the `GpuFloatLinear` weight allocation to a fresh `weights_heap` allocation — both are ranges of the **same** heap backing buffer, and wgpu rejects source == destination (`Validation Error: Source and destination cannot be the same buffer`). Qwen 0.5B–3B tie embeddings so were unaffected; 7B+ (`OutputProjection::Linear`) crash on load. Fix: `LmHeadWeights::Shared` binds the existing range (no copy, and ~1 GB less VRAM on 7B). | `gpu_engine/mod.rs:369-389` | **VERIFIED** (test `forward_full_gpu_qwen_shape_with_gpu_output_proj_no_crash`) |
 | 30 | ✅ CLOSED 602bcb8 — **Same-id `cache/load` under churn → `wgpu error: Out of Memory`, fatal.** Replacing an entry dropped the old caches without the deferred-destroy flush `cache_delete` and the polar-only path already do; the VRAM budget released its reservation at the drop while the driver still held the buffers (queued GPU work), so a burst of reloads admitted a cache the driver could not back. Found by `e2e_toctou.py` on 2026-09-09. Fix: drop the replaced entry after releasing the pool lock and `poll_wait()`. | `cache.rs` `cache_load` insert | **VERIFIED** (e2e) |
+| 31 | **OPEN — intermittent `wgpu error: Validation Error` at `get_mapped_range`: "Buffer with 'forward_advance_only.hidden' label is invalid".** wgpu-29's delayed validation error (the class the `poll_wait` flushes in `cache_load` / `cache_delete` exist for): a destroyed-but-not-yet-freed buffer is reported at the NEXT map/poll, with a misleading label. Seen 2 of ~8 `e2e_boundary.py` runs on 2026-09-10 (4096 window, cap 3: load 3 shards, replace one at cap, compose + chat), never in the other drivers; passed 5 of 5 on reruns. Kills the worker (connection dropped). Not reproduced deterministically yet; per-boot logs are now kept (`verify_*.sh`). Candidates: the raw `create_buffer_init` hidden buffer in `advance_only` (`forward_f32.rs:637`, not on a lane) dropped while its submission is in flight under churn, or the same-id replace path's drop-then-`poll_wait` ordering. | `forward_f32.rs:637`; `cache.rs` `cache_load` replace | HUNTER-CONFIRMED (e2e, 2/8) |
 
 ---
 
@@ -79,20 +87,20 @@ budget-vs-deferred-destroy class (#6 / #23), surfaced by the #9 e2e.
 
 | # | Finding | Site | Label |
 |---|---|---|---|
-| 13 | **Allocate-before-validate.** `vec![0u8; byte_size]` sized purely from declared dims, before any check against file length → 200-byte file declaring `[2^34, 4]` F32 → 256 GB zeroed alloc → `handle_alloc_error` **abort (not a panic)**. Same for raw string lengths, array counts, `HashMap::with_capacity(metadata_count)`, `n_dims` (spec caps at 4; code does not). | `gguf.rs:762-768, 352-353, 373-374, 541, 557, 560-563` | **VERIFIED** |
-| 14 | **`general.alignment = 0` → divide-by-zero panic** (present-but-zero passes `unwrap_or(DEFAULT)`). | `gguf.rs:550-554, 818-821` | **VERIFIED** |
-| 15 | **Unbounded nested-array recursion** → stack overflow abort (~1.2 MB file of `[9, count=1]`). | `gguf.rs:370-379` | **VERIFIED** |
-| 16 | **Size arithmetic wraps silently** — `shape.product()`, `n*4`, `div_ceil*BYTES`, `tensor_data_offset + info.offset`; **no `overflow-checks` set in any Cargo.toml** (release wraps, debug panics — verified with `rustc -O`). `FloatTensor::new` shares the wrap so a `[2^63, 2]` shape *passes* its length assert and panics on first forward. `TensorShapeMismatch` exists but is never constructed. | `gguf.rs:573, 764, 828-839`; `tensor.rs:16` | **VERIFIED** |
-| 17 | **Config divisors/sizes unchecked** — `head_count=0` → div-by-zero at `loader.rs:114`; `n_layers`/`n_experts = u32::MAX` → TB alloc abort; a dozen `assert!`s fire on first request instead of `Err` at load. | `loader.rs:114, 161, 189` + siblings | HUNTER-CONFIRMED |
+| 13 | ✅ CLOSED 7382f6e — **Allocate-before-validate.** `vec![0u8; byte_size]` sized purely from declared dims, before any check against file length → 200-byte file declaring `[2^34, 4]` F32 → 256 GB zeroed alloc → `handle_alloc_error` **abort (not a panic)**. Same for raw string lengths, array counts, `HashMap::with_capacity(metadata_count)`, `n_dims` (spec caps at 4; code does not). | `gguf.rs:762-768, 352-353, 373-374, 541, 557, 560-563` | **VERIFIED** |
+| 14 | ✅ CLOSED 7382f6e — **`general.alignment = 0` → divide-by-zero panic** (present-but-zero passes `unwrap_or(DEFAULT)`). | `gguf.rs:550-554, 818-821` | **VERIFIED** |
+| 15 | ✅ CLOSED 7382f6e — **Unbounded nested-array recursion** → stack overflow abort (~1.2 MB file of `[9, count=1]`). | `gguf.rs:370-379` | **VERIFIED** |
+| 16 | ✅ CLOSED 7382f6e — **Size arithmetic wraps silently** — `shape.product()`, `n*4`, `div_ceil*BYTES`, `tensor_data_offset + info.offset`; **no `overflow-checks` set in any Cargo.toml** (release wraps, debug panics — verified with `rustc -O`). `FloatTensor::new` shares the wrap so a `[2^63, 2]` shape *passes* its length assert and panics on first forward. `TensorShapeMismatch` exists but is never constructed. | `gguf.rs:573, 764, 828-839`; `tensor.rs:16` | **VERIFIED** |
+| 17 | ✅ CLOSED 0dd39fa — **Config divisors/sizes unchecked** — `head_count=0` → div-by-zero at `loader.rs:114`; `n_layers`/`n_experts = u32::MAX` → TB alloc abort; a dozen `assert!`s fire on first request instead of `Err` at load. | `loader.rs:114, 161, 189` + siblings | HUNTER-CONFIRMED |
 
 ### P2 — silently wrong output (worse than any panic)
 
 | # | Finding | Site | Label |
 |---|---|---|---|
-| 18 | **`rope.scaling.type` read as u32 but GGUF stores it as a *string*** → always 0; only the `arch.contains("qwen")` fallback saves Qwen. Any non-Qwen NeoX-style model gets interleaved RoPE → **fluent garbage, no error**. `hidden_act` is parsed and **never consumed** (always SiLU). | `gguf.rs:653-670`; `loader.rs:124-137, 195, 209` | **VERIFIED** |
-| 19 | **Norm weight lengths never validated at load.** CPU path panics on first use; GPU path hits WGSL robust-buffer clamping → dims past the short weight scaled by 0/garbage, **no error**. | `loader.rs:213-217, 237-238`; `rmsnorm_batch.wgsl:49` | VERIFIED (load) / PLAUSIBLE (GPU) |
+| 18 | ✅ CLOSED 5a2dcb1 — **`rope.scaling.type` read as u32 but GGUF stores it as a *string*** → always 0; only the `arch.contains("qwen")` fallback saves Qwen. Any non-Qwen NeoX-style model gets interleaved RoPE → **fluent garbage, no error**. `hidden_act` is parsed and **never consumed** (always SiLU). | `gguf.rs:653-670`; `loader.rs:124-137, 195, 209` | **VERIFIED** |
+| 19 | ✅ CLOSED 0dd39fa — **Norm weight lengths never validated at load.** CPU path panics on first use; GPU path hits WGSL robust-buffer clamping → dims past the short weight scaled by 0/garbage, **no error**. | `loader.rs:213-217, 237-238`; `rmsnorm_batch.wgsl:49` | VERIFIED (load) / PLAUSIBLE (GPU) |
 | 20 | ✅ CLOSED 319ad42 — `cache_append` runs f32 `advance_only` then polar; a polar-only failure leaves `f32.seq_len ≠ polar.seq_len ≠ tokens.len()` → silently misaligned positions thereafter. A polar-only failure exists under env-overridden lanes (chunker models the f32 layout; `PolarBlockScratch` needs +12 KB/token on Lane A). | `cache.rs:414-423`; `scratch.rs:158-205` | PLAUSIBLE |
-| 21 | Tokenizer metadata arrays of mismatched length: short `token_type` **silently drops `<\|im_start\|>` from special tokens** → chat markers get BPE-split → gibberish, no error. bos/eos ids unchecked against vocab → every request asserts. SentencePiece byte-fallback decode emits Latin-1 mojibake ("é" → "Ã©"; Qwen unaffected). | `tokenizer.rs:139-162, 305-311, 189-197, 470` | HUNTER-CONFIRMED |
+| 21 | ✅ CLOSED f05aa09 — Tokenizer metadata arrays of mismatched length: short `token_type` **silently drops `<\|im_start\|>` from special tokens** → chat markers get BPE-split → gibberish, no error. bos/eos ids unchecked against vocab → every request asserts. SentencePiece byte-fallback decode emits Latin-1 mojibake ("é" → "Ã©"; Qwen unaffected). | `tokenizer.rs:139-162, 305-311, 189-197, 470` | HUNTER-CONFIRMED |
 
 ### P3 — observability / hygiene
 

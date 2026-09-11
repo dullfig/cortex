@@ -10,3 +10,10 @@ members = [
 # affecting the main crates or CI. Each pinky experiment is its own
 # standalone Cargo project that path-deps on cortex.
 exclude = ["pinky"]
+
+# Review #16: size arithmetic on file-declared values must never wrap
+# silently in production. The engine is GPU-bound; the cost is noise
+# (measured 2026-09-10, Qwen2.5-3B, 756-token prefill: 2213 -> 2204 ms;
+# decode: 37.1 -> 37.7 tok/s).
+[profile.release]
+overflow-checks = true

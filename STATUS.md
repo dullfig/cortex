@@ -23,7 +23,15 @@
 > lock re-acquisition witnesses, #8/#20 `tokens`-vs-KV lockstep invariant,
 > #7 `gpu_gate` one-GPU-region-at-a-time admission (+ `cortex_gpu_gate_waiting`
 > gauge, the Stage-2 trigger), #12 traced-query bound, #30 reload flush.
-> 16 of 30 closed; open: GGUF hardening #13–#17, #18, #19, #21, #10, #23–#26.)
+> 2026-09-10: the GGUF / model-load trust boundary closed — a hostile or
+> corrupt model file is always a clean `Err` from `load_model` naming the
+> field (never an abort, panic, silent wrap or first-request assert): #13–#16
+> parser bounds + checked arithmetic, #17/#19 `ModelConfig::validate` + every
+> tensor shape and norm length checked, #18 RoPE layout per architecture
+> (`rope.scaling.type` was read as the wrong type), #21 tokenizer arrays
+> validated + UTF-8 byte fallback; release profile now has
+> `overflow-checks`. 24 of 31 closed; open: #31 (intermittent wgpu-29
+> delayed validation error, filed), #10, #23–#26.)
 > cortex is currently **PARKED as a stable inference substrate** — per the
 > integration pin `state_of_project_2026-07-24`, "cortex is the next *code*
 > phase, not the next *project* phase"; the project foreground is the

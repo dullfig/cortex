@@ -87,6 +87,7 @@ Ternary/BitNet inference: see `ternary-rs` (un-merged 2026-05-29).
 - GGUF: Q4_K/Q5_K/Q6_K/F16/BF16/F32 → FloatLinear (dequantized at load)
 - All f32 at layer boundaries (activations may be packed-f16 internally for bandwidth)
 - Zero unsafe
+- **A model file is untrusted input.** `load_model` returns `Err` naming the field on any malformed GGUF (sizes checked against the file before allocation, checked size arithmetic, config validated before any tensor, every tensor shape checked against the config); it never aborts or panics on file contents. Review batch 4 (2026-09-10).
 
 ## Public API
 
