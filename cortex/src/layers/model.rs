@@ -140,6 +140,10 @@ impl TransformerModel {
             }
             OutputProjection::TiedEmbedding => {}
         }
+        // Review #19: a final norm of the wrong length used to be accepted
+        // here and panic on the first forward. The loader rejects it with
+        // an Err first; this is the constructor invariant.
+        assert_eq!(final_norm.dim(), embed_dim, "final_norm length must match embed_dim");
 
         Self {
             embedding,
@@ -636,6 +640,15 @@ mod tests {
     }
 
     // -- Construction --
+
+    #[test]
+    #[should_panic(expected = "final_norm length must match embed_dim")]
+    fn short_final_norm_is_rejected_at_construction() {
+        let embedding = FloatTensor::new(vec![0.0; 64], vec![8, 8]);
+        let blocks = vec![make_test_block(8, 2, 2, 16)];
+        let final_norm = RmsNorm::new(vec![1.0; 7], 1e-5);
+        let _ = TransformerModel::new(embedding, blocks, final_norm, OutputProjection::TiedEmbedding);
+    }
 
     #[test]
     fn construction() {

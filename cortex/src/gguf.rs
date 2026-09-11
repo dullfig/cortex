@@ -63,6 +63,15 @@ pub enum GgufError {
     #[error("metadata key '{0}' is an array of arrays, which is not supported")]
     NestedArrayUnsupported(String),
 
+    // Review #17/#19: the loader rejects a config or tensor shape it would
+    // otherwise divide by, allocate from, or assert on — at load, naming
+    // the field, never on the first request.
+    #[error("invalid model config: {key} = {value}: {reason}")]
+    InvalidConfig { key: String, value: String, reason: &'static str },
+
+    #[error("tensor '{tensor}' has shape {actual:?}, expected {expected:?}")]
+    DimensionMismatch { tensor: String, expected: Vec<usize>, actual: Vec<usize> },
+
     #[error("unsupported GGUF version: {0} (expected {GGUF_VERSION})")]
     UnsupportedVersion(u32),
 
@@ -293,6 +302,87 @@ pub struct ModelConfig {
     pub expert_count: Option<u32>,
     /// Number of experts activated per token (top-k routing, default 2).
     pub expert_used_count: Option<u32>,
+}
+
+/// Upper bound on `block_count` / `expert_count` accepted at load. Real
+/// models are well under 200 layers; the cap exists so a hostile value
+/// cannot size a `Vec::with_capacity` into an allocation abort.
+pub const MAX_LAYERS: u32 = 1024;
+
+impl ModelConfig {
+    /// `embedding_length / head_count`. Only meaningful after `validate()`.
+    pub fn head_dim(&self) -> u32 {
+        self.embedding_dim / self.n_heads.max(1)
+    }
+
+    /// Review #17: everything the loader or the forward pass would divide
+    /// by, allocate from, or assert on is checked here first, and a bad
+    /// value is an `Err` naming the key. Called by `load_model` before any
+    /// tensor is read.
+    pub fn validate(&self) -> Result<()> {
+        fn bad<T: std::fmt::Display>(key: &str, value: T, reason: &'static str) -> Result<()> {
+            Err(GgufError::InvalidConfig { key: key.to_string(), value: value.to_string(), reason })
+        }
+        if self.n_heads == 0 {
+            return bad("attention.head_count", self.n_heads, "must be >= 1");
+        }
+        if self.n_kv_heads == 0 {
+            return bad("attention.head_count_kv", self.n_kv_heads, "must be >= 1");
+        }
+        if self.n_heads % self.n_kv_heads != 0 {
+            return bad(
+                "attention.head_count_kv",
+                format!("{} (head_count {})", self.n_kv_heads, self.n_heads),
+                "head_count must be a multiple of head_count_kv",
+            );
+        }
+        if self.embedding_dim == 0 {
+            return bad("embedding_length", self.embedding_dim, "must be >= 1");
+        }
+        if self.embedding_dim % self.n_heads != 0 {
+            return bad(
+                "embedding_length",
+                format!("{} (head_count {})", self.embedding_dim, self.n_heads),
+                "must be a multiple of head_count",
+            );
+        }
+        let head_dim = self.embedding_dim / self.n_heads;
+        if head_dim % 4 != 0 {
+            return bad(
+                "embedding_length",
+                format!("{} (head_dim {head_dim})", self.embedding_dim),
+                "head_dim must be a multiple of 4 (packed-f16 RoPE)",
+            );
+        }
+        if self.n_layers == 0 || self.n_layers > MAX_LAYERS {
+            return bad("block_count", self.n_layers, "must be in 1..=1024");
+        }
+        if self.intermediate_size == 0 {
+            return bad("feed_forward_length", self.intermediate_size, "must be >= 1");
+        }
+        if self.vocab_size == 0 {
+            return bad("vocab_size", self.vocab_size, "must be >= 1");
+        }
+        if self.context_length == 0 {
+            return bad("context_length", self.context_length, "must be >= 1");
+        }
+        if let Some(n) = self.expert_count {
+            if n == 0 || n > MAX_LAYERS {
+                return bad("expert_count", n, "must be in 1..=1024");
+            }
+            let k = self.expert_used_count.unwrap_or(2);
+            if k == 0 || k > n {
+                return bad("expert_used_count", format!("{k} (expert_count {n})"), "must be in 1..=expert_count");
+            }
+        }
+        if !(self.rope_theta.is_finite() && self.rope_theta > 0.0) {
+            return bad("rope.freq_base", self.rope_theta, "must be finite and > 0");
+        }
+        if !(self.rms_norm_eps.is_finite() && self.rms_norm_eps > 0.0) {
+            return bad("attention.layer_norm_rms_epsilon", self.rms_norm_eps, "must be finite and > 0");
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -605,6 +695,9 @@ pub struct GgufFile {
     /// checked against it (review #13).
     file_len: u64,
     path: PathBuf,
+    /// In-memory source (`open_bytes`), used by tests that load a whole
+    /// synthetic model without touching the filesystem.
+    data: Option<Vec<u8>>,
 }
 
 impl GgufFile {
@@ -618,6 +711,14 @@ impl GgufFile {
         let reader = std::io::BufReader::new(file);
         let mut gguf = Self::open_reader(reader)?;
         gguf.path = path;
+        Ok(gguf)
+    }
+
+    /// Parse a GGUF held entirely in memory; tensor loads read from the
+    /// same bytes. For synthetic models in tests.
+    pub fn open_bytes(data: Vec<u8>) -> Result<Self> {
+        let mut gguf = Self::open_reader(std::io::Cursor::new(&data))?;
+        gguf.data = Some(data);
         Ok(gguf)
     }
 
@@ -756,6 +857,7 @@ impl GgufFile {
             alignment,
             file_len,
             path: PathBuf::new(),
+            data: None,
         })
     }
 
@@ -899,6 +1001,12 @@ impl GgufFile {
             .get(name)
             .ok_or_else(|| GgufError::MissingMetadata(name.to_string()))?;
 
+        if let Some(mem) = &self.data {
+            let (abs_offset, byte_size) = self.checked_extent(info, mem.len() as u64)?;
+            let read_len = (n as u64).min(byte_size) as usize;
+            let start = abs_offset as usize;
+            return Ok(mem[start..start + read_len].to_vec());
+        }
         let mut file = std::fs::File::open(&self.path)?;
         let (abs_offset, byte_size) = self.checked_extent(info, file.metadata()?.len())?;
         let read_len = (n as u64).min(byte_size) as usize;
@@ -917,8 +1025,13 @@ impl GgufFile {
         tensor_extent(info, self.tensor_data_offset, source_len)
     }
 
-    /// Read raw tensor bytes from the file.
+    /// Read raw tensor bytes from the file (or the in-memory source).
     fn read_tensor_data(&self, info: &TensorInfo) -> Result<Vec<u8>> {
+        if let Some(mem) = &self.data {
+            let (abs_offset, byte_size) = self.checked_extent(info, mem.len() as u64)?;
+            let start = abs_offset as usize;
+            return Ok(mem[start..start + byte_size as usize].to_vec());
+        }
         let mut file = std::fs::File::open(&self.path)?;
         let (abs_offset, byte_size) = self.checked_extent(info, file.metadata()?.len())?;
         file.seek(SeekFrom::Start(abs_offset))?;
@@ -1042,28 +1155,28 @@ fn tensor_byte_size(info: &TensorInfo) -> Result<u64> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::Cursor;
 
     // -- Helper: build a synthetic GGUF file in memory --
 
-    struct GgufBuilder {
+    pub(crate) struct GgufBuilder {
         metadata: Vec<(String, u32, Vec<u8>)>, // key, type_id, encoded value
         tensor_infos: Vec<(String, Vec<u64>, u32, Vec<u8>)>, // name, shape, type, data
         offset_overrides: Vec<Option<u64>>, // parallel to tensor_infos
     }
 
     /// Byte offsets of the header counts, for post-build patching.
-    const TENSOR_COUNT_AT: usize = 8;
-    const METADATA_COUNT_AT: usize = 16;
+    pub(crate) const TENSOR_COUNT_AT: usize = 8;
+    pub(crate) const METADATA_COUNT_AT: usize = 16;
 
-    fn patch(bytes: &mut [u8], at: usize, value: &[u8]) {
+    pub(crate) fn patch(bytes: &mut [u8], at: usize, value: &[u8]) {
         bytes[at..at + value.len()].copy_from_slice(value);
     }
 
     impl GgufBuilder {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 metadata: Vec::new(),
                 tensor_infos: Vec::new(),
@@ -1071,29 +1184,29 @@ mod tests {
             }
         }
 
-        fn add_metadata_u32(&mut self, key: &str, val: u32) {
+        pub(crate) fn add_metadata_u32(&mut self, key: &str, val: u32) {
             self.metadata
                 .push((key.to_string(), 4, val.to_le_bytes().to_vec()));
         }
 
-        fn add_metadata_f32(&mut self, key: &str, val: f32) {
+        pub(crate) fn add_metadata_f32(&mut self, key: &str, val: f32) {
             self.metadata
                 .push((key.to_string(), 6, val.to_le_bytes().to_vec()));
         }
 
-        fn add_metadata_string(&mut self, key: &str, val: &str) {
+        pub(crate) fn add_metadata_string(&mut self, key: &str, val: &str) {
             let mut encoded = Vec::new();
             encoded.extend_from_slice(&(val.len() as u64).to_le_bytes());
             encoded.extend_from_slice(val.as_bytes());
             self.metadata.push((key.to_string(), 8, encoded));
         }
 
-        fn add_metadata_bool(&mut self, key: &str, val: bool) {
+        pub(crate) fn add_metadata_bool(&mut self, key: &str, val: bool) {
             self.metadata
                 .push((key.to_string(), 7, vec![val as u8]));
         }
 
-        fn add_metadata_array_u32(&mut self, key: &str, vals: &[u32]) {
+        pub(crate) fn add_metadata_array_u32(&mut self, key: &str, vals: &[u32]) {
             let mut encoded = Vec::new();
             encoded.extend_from_slice(&4u32.to_le_bytes()); // elem type = u32
             encoded.extend_from_slice(&(vals.len() as u64).to_le_bytes());
@@ -1103,7 +1216,38 @@ mod tests {
             self.metadata.push((key.to_string(), 9, encoded));
         }
 
-        fn add_tensor(&mut self, name: &str, shape: &[u64], type_code: u32, data: Vec<u8>) {
+        pub(crate) fn add_metadata_array_i32(&mut self, key: &str, vals: &[i32]) {
+            let mut encoded = Vec::new();
+            encoded.extend_from_slice(&5u32.to_le_bytes()); // elem type = i32
+            encoded.extend_from_slice(&(vals.len() as u64).to_le_bytes());
+            for &v in vals {
+                encoded.extend_from_slice(&v.to_le_bytes());
+            }
+            self.metadata.push((key.to_string(), 9, encoded));
+        }
+
+        pub(crate) fn add_metadata_array_f32(&mut self, key: &str, vals: &[f32]) {
+            let mut encoded = Vec::new();
+            encoded.extend_from_slice(&6u32.to_le_bytes()); // elem type = f32
+            encoded.extend_from_slice(&(vals.len() as u64).to_le_bytes());
+            for &v in vals {
+                encoded.extend_from_slice(&v.to_le_bytes());
+            }
+            self.metadata.push((key.to_string(), 9, encoded));
+        }
+
+        pub(crate) fn add_metadata_array_string(&mut self, key: &str, vals: &[&str]) {
+            let mut encoded = Vec::new();
+            encoded.extend_from_slice(&8u32.to_le_bytes()); // elem type = string
+            encoded.extend_from_slice(&(vals.len() as u64).to_le_bytes());
+            for v in vals {
+                encoded.extend_from_slice(&(v.len() as u64).to_le_bytes());
+                encoded.extend_from_slice(v.as_bytes());
+            }
+            self.metadata.push((key.to_string(), 9, encoded));
+        }
+
+        pub(crate) fn add_tensor(&mut self, name: &str, shape: &[u64], type_code: u32, data: Vec<u8>) {
             // Shape stored innermost-first in GGUF, so reverse our outermost-first
             let mut gguf_shape = shape.to_vec();
             gguf_shape.reverse();
@@ -1117,19 +1261,19 @@ mod tests {
         // cannot lie; these can. --
 
         /// A metadata entry with arbitrary value bytes for `type_id`.
-        fn add_raw_metadata(&mut self, key: &str, type_id: u32, encoded: Vec<u8>) {
+        pub(crate) fn add_raw_metadata(&mut self, key: &str, type_id: u32, encoded: Vec<u8>) {
             self.metadata.push((key.to_string(), type_id, encoded));
         }
 
         /// Like `add_tensor`, but the info's offset field is `offset`
         /// instead of the computed one (the data is still written where the
         /// builder would have put it).
-        fn add_tensor_at_offset(&mut self, name: &str, shape: &[u64], type_code: u32, data: Vec<u8>, offset: u64) {
+        pub(crate) fn add_tensor_at_offset(&mut self, name: &str, shape: &[u64], type_code: u32, data: Vec<u8>, offset: u64) {
             self.add_tensor(name, shape, type_code, data);
             *self.offset_overrides.last_mut().unwrap() = Some(offset);
         }
 
-        fn build(self) -> Vec<u8> {
+        pub(crate) fn build(self) -> Vec<u8> {
             let mut out = Vec::new();
             let alignment = DEFAULT_ALIGNMENT;
 
@@ -1357,6 +1501,71 @@ mod tests {
         b.add_tensor_at_offset("t", &[4], F32_TYPE, vec![0u8; 16], 1 << 20);
         let err = GgufFile::open_reader(Cursor::new(b.build())).err().expect("must fail");
         assert!(matches!(err, GgufError::Truncated { .. }), "{err}");
+    }
+
+    // -- ModelConfig::validate (review #17) --
+
+    fn qwen_like_config() -> ModelConfig {
+        ModelConfig {
+            vocab_size: 151936,
+            embedding_dim: 2048,
+            n_layers: 36,
+            n_heads: 16,
+            n_kv_heads: 2,
+            context_length: 32768,
+            intermediate_size: 11008,
+            rope_theta: 1_000_000.0,
+            rms_norm_eps: 1e-6,
+            rope_type: 0,
+            hidden_act: "silu".into(),
+            model_name: None,
+            expert_count: None,
+            expert_used_count: None,
+        }
+    }
+
+    fn invalid_key(r: Result<()>) -> String {
+        match r {
+            Err(GgufError::InvalidConfig { key, .. }) => key,
+            other => panic!("expected InvalidConfig, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn model_config_validate_accepts_qwen_and_names_the_bad_key() {
+        assert!(qwen_like_config().validate().is_ok());
+        assert_eq!(qwen_like_config().head_dim(), 128);
+
+        let cases: Vec<(&str, Box<dyn Fn(&mut ModelConfig)>)> = vec![
+            ("attention.head_count", Box::new(|c| c.n_heads = 0)),
+            ("attention.head_count_kv", Box::new(|c| c.n_kv_heads = 0)),
+            ("attention.head_count_kv", Box::new(|c| c.n_kv_heads = 3)),
+            ("embedding_length", Box::new(|c| c.embedding_dim = 0)),
+            ("embedding_length", Box::new(|c| c.embedding_dim = 2049)),
+            ("embedding_length", Box::new(|c| { c.n_heads = 2; c.n_kv_heads = 2; c.embedding_dim = 20 })), // head_dim 10
+            ("block_count", Box::new(|c| c.n_layers = 0)),
+            ("block_count", Box::new(|c| c.n_layers = u32::MAX)),
+            ("feed_forward_length", Box::new(|c| c.intermediate_size = 0)),
+            ("vocab_size", Box::new(|c| c.vocab_size = 0)),
+            ("context_length", Box::new(|c| c.context_length = 0)),
+            ("expert_count", Box::new(|c| c.expert_count = Some(0))),
+            ("expert_count", Box::new(|c| c.expert_count = Some(u32::MAX))),
+            ("expert_used_count", Box::new(|c| { c.expert_count = Some(8); c.expert_used_count = Some(9) })),
+            ("rope.freq_base", Box::new(|c| c.rope_theta = 0.0)),
+            ("rope.freq_base", Box::new(|c| c.rope_theta = f32::NAN)),
+            ("attention.layer_norm_rms_epsilon", Box::new(|c| c.rms_norm_eps = -1.0)),
+            ("attention.layer_norm_rms_epsilon", Box::new(|c| c.rms_norm_eps = f32::INFINITY)),
+        ];
+        for (expected_key, mutate) in cases {
+            let mut c = qwen_like_config();
+            mutate(&mut c);
+            assert_eq!(invalid_key(c.validate()), expected_key);
+        }
+        // A valid MoE config passes.
+        let mut c = qwen_like_config();
+        c.expert_count = Some(8);
+        c.expert_used_count = Some(2);
+        assert!(c.validate().is_ok());
     }
 
     #[test]

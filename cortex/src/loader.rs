@@ -43,14 +43,46 @@ struct LoadCtx<'a> {
     _marker: std::marker::PhantomData<&'a ()>,
 }
 
+/// Review #17/#19: a tensor whose shape disagrees with the model config is
+/// an `Err` naming the tensor, checked BEFORE any layer is built from it —
+/// the layer constructors' `assert!`s then only guard programming errors.
+fn expect_shape(t: &crate::tensor::FloatTensor, name: &str, expected: &[usize]) -> Result<(), GgufError> {
+    if t.shape() != expected {
+        return Err(GgufError::DimensionMismatch {
+            tensor: name.to_string(),
+            expected: expected.to_vec(),
+            actual: t.shape().to_vec(),
+        });
+    }
+    Ok(())
+}
+
+/// A 1-D float vector of exactly `len` elements (norm weights, biases).
+fn load_vector(gguf: &GgufFile, name: &str, len: usize) -> Result<Vec<f32>, GgufError> {
+    let t = gguf.load_float(name)?;
+    expect_shape(&t, name, &[len])?;
+    Ok(t.data().to_vec())
+}
+
+/// Review #19: an RMSNorm whose weight length is checked against the
+/// model dimension at load. A short weight used to be accepted, panic on
+/// the CPU path's first forward, and on the GPU be read past its end under
+/// robust-buffer clamping — silently wrong output.
+fn load_norm(gguf: &GgufFile, name: &str, dim: usize, eps: f32) -> Result<RmsNorm, GgufError> {
+    Ok(RmsNorm::new(load_vector(gguf, name, dim)?, eps))
+}
+
 /// Load a weight tensor as a LinearLayer. Float-only after the
 /// 2026-05-29 BitNet un-merge: all weights are dequantized to f32 at
 /// load time (Q4_K / Q5_K / Q6_K / F16 / BF16 / F32). The GPU-resident
 /// path keeps weights on the device for the model's lifetime.
+/// `expected` is `[out_features, in_features]` — GGUF stores dims
+/// innermost-first, so the parsed shape is already `[out, in]`.
 fn load_linear_layer(
     gguf: &GgufFile,
     name: &str,
     ctx: &LoadCtx,
+    expected: [usize; 2],
 ) -> Result<Box<dyn LinearLayer>, GgufError> {
     let _info = gguf
         .tensor_info(name)
@@ -58,6 +90,7 @@ fn load_linear_layer(
 
     // Quantized or float → dequantize to f32
     let tensor = gguf.load_float(name)?;
+    expect_shape(&tensor, name, &expected)?;
     #[cfg(feature = "gpu")]
     if let Some(gpu) = ctx.gpu {
         // f16 packing requires even in_features; fall back to CPU if odd.
@@ -88,13 +121,45 @@ pub struct LoadedModel {
 }
 
 /// Load a transformer model and tokenizer from a GGUF file.
+///
+/// The model file is **untrusted input**: any malformed field is an
+/// `Err` naming it (review #13–#19); this never aborts or panics on file
+/// contents.
 pub fn load_model(path: &str) -> Result<LoadedModel, GgufError> {
     // Hardware detection and boot banner
     let hw = crate::compute::device::HardwareInfo::detect();
     hw.print_boot_banner();
 
     let gguf = GgufFile::open(path)?;
+
+    // If a discrete GPU is present, stand up a shared GpuDevice so
+    // float weights can be uploaded once and stay resident.
+    #[cfg(feature = "gpu")]
+    let gpu = compute::detect_gpu_device();
+    #[cfg(feature = "gpu")]
+    if gpu.is_some() {
+        eprintln!("  [boot] Resident-weights runtime: enabled (GpuFloatLinear)");
+        info!("GPU device available; float layers will be GPU-resident");
+    }
+
+    load_from_gguf(
+        gguf,
+        #[cfg(feature = "gpu")]
+        gpu,
+    )
+}
+
+/// Build the model and tokenizer from an already-parsed GGUF (any source —
+/// file or `GgufFile::open_bytes`). `gpu = None` keeps every layer on the
+/// CPU, which is how the loader's own tests run.
+pub fn load_from_gguf(
+    gguf: GgufFile,
+    #[cfg(feature = "gpu")] gpu: Option<Arc<crate::compute::wgpu_backend::GpuDevice>>,
+) -> Result<LoadedModel, GgufError> {
     let config = gguf.model_config()?;
+    // Review #17: reject at load, before any allocation, anything the
+    // loader or the forward pass would divide by or assert on.
+    config.validate()?;
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
 
     info!(
@@ -105,14 +170,29 @@ pub fn load_model(path: &str) -> Result<LoadedModel, GgufError> {
         n_kv_heads = config.n_kv_heads,
         intermediate = config.intermediate_size,
         rope_theta = config.rope_theta,
-        "loading model"
+        context_length = config.context_length,
+        "loading model (context_length is the trained window; the KV window is --max-seq-len)"
     );
 
+    let vocab = config.vocab_size as usize;
     let embed_dim = config.embedding_dim as usize;
     let n_heads = config.n_heads as usize;
     let n_kv_heads = config.n_kv_heads as usize;
-    let head_dim = embed_dim / n_heads;
+    let head_dim = config.head_dim() as usize;
     let intermediate = config.intermediate_size as usize;
+    let q_dim = n_heads * head_dim;
+    let kv_dim = n_kv_heads * head_dim;
+
+    // The tokenizer must describe exactly the rows the embedding has.
+    // Checked here, before any tensor is loaded (it used to be an
+    // `assert_eq!` after the whole model was resident).
+    if tokenizer.vocab_size() != vocab {
+        return Err(GgufError::DimensionMismatch {
+            tensor: "tokenizer.ggml.tokens".to_string(),
+            expected: vec![vocab],
+            actual: vec![tokenizer.vocab_size()],
+        });
+    }
 
     let arch = gguf
         .get_metadata("general.architecture")
@@ -136,16 +216,6 @@ pub fn load_model(path: &str) -> Result<LoadedModel, GgufError> {
         }
     };
 
-    // If a discrete GPU is present, stand up a shared GpuDevice so
-    // float weights can be uploaded once and stay resident.
-    #[cfg(feature = "gpu")]
-    let gpu = compute::detect_gpu_device();
-    #[cfg(feature = "gpu")]
-    if gpu.is_some() {
-        eprintln!("  [boot] Resident-weights runtime: enabled (GpuFloatLinear)");
-        info!("GPU device available; float layers will be GPU-resident");
-    }
-
     let ctx = LoadCtx {
         #[cfg(feature = "gpu")]
         gpu: gpu.as_ref(),
@@ -153,18 +223,19 @@ pub fn load_model(path: &str) -> Result<LoadedModel, GgufError> {
         _marker: std::marker::PhantomData,
     };
 
-    // Embedding table
+    // Embedding table: exactly [vocab, embed].
     let embedding = gguf.load_float("token_embd.weight")?;
+    expect_shape(&embedding, "token_embd.weight", &[vocab, embed_dim])?;
     info!("loaded embedding: {:?}", embedding.shape());
 
-    // Transformer blocks
+    // Transformer blocks (n_layers validated <= MAX_LAYERS)
     let mut blocks = Vec::with_capacity(config.n_layers as usize);
 
     for i in 0..config.n_layers as usize {
-        let q_proj = load_linear_layer(&gguf, &format!("blk.{i}.attn_q.weight"), &ctx)?;
-        let k_proj = load_linear_layer(&gguf, &format!("blk.{i}.attn_k.weight"), &ctx)?;
-        let v_proj = load_linear_layer(&gguf, &format!("blk.{i}.attn_v.weight"), &ctx)?;
-        let o_proj = load_linear_layer(&gguf, &format!("blk.{i}.attn_output.weight"), &ctx)?;
+        let q_proj = load_linear_layer(&gguf, &format!("blk.{i}.attn_q.weight"), &ctx, [q_dim, embed_dim])?;
+        let k_proj = load_linear_layer(&gguf, &format!("blk.{i}.attn_k.weight"), &ctx, [kv_dim, embed_dim])?;
+        let v_proj = load_linear_layer(&gguf, &format!("blk.{i}.attn_v.weight"), &ctx, [kv_dim, embed_dim])?;
+        let o_proj = load_linear_layer(&gguf, &format!("blk.{i}.attn_output.weight"), &ctx, [embed_dim, q_dim])?;
 
         let mut attention = MultiHeadAttention::with_rope_layout(
             q_proj, k_proj, v_proj, o_proj,
@@ -173,9 +244,9 @@ pub fn load_model(path: &str) -> Result<LoadedModel, GgufError> {
 
         // Optional attention biases (Qwen2 has Q/K/V biases)
         if gguf.tensor_info(&format!("blk.{i}.attn_q.bias")).is_some() {
-            let q_bias = gguf.load_float(&format!("blk.{i}.attn_q.bias"))?.data().to_vec();
-            let k_bias = gguf.load_float(&format!("blk.{i}.attn_k.bias"))?.data().to_vec();
-            let v_bias = gguf.load_float(&format!("blk.{i}.attn_v.bias"))?.data().to_vec();
+            let q_bias = load_vector(&gguf, &format!("blk.{i}.attn_q.bias"), q_dim)?;
+            let k_bias = load_vector(&gguf, &format!("blk.{i}.attn_k.bias"), kv_dim)?;
+            let v_bias = load_vector(&gguf, &format!("blk.{i}.attn_v.bias"), kv_dim)?;
             if i == 0 {
                 info!("loading attention biases (Q/K/V)");
             }
@@ -189,13 +260,13 @@ pub fn load_model(path: &str) -> Result<LoadedModel, GgufError> {
             let mut experts = Vec::with_capacity(n_experts);
 
             for e in 0..n_experts {
-                let e_gate = load_linear_layer(&gguf, &format!("blk.{i}.ffn_gate.{e}.weight"), &ctx)?;
-                let e_up = load_linear_layer(&gguf, &format!("blk.{i}.ffn_up.{e}.weight"), &ctx)?;
-                let e_down = load_linear_layer(&gguf, &format!("blk.{i}.ffn_down.{e}.weight"), &ctx)?;
+                let e_gate = load_linear_layer(&gguf, &format!("blk.{i}.ffn_gate.{e}.weight"), &ctx, [intermediate, embed_dim])?;
+                let e_up = load_linear_layer(&gguf, &format!("blk.{i}.ffn_up.{e}.weight"), &ctx, [intermediate, embed_dim])?;
+                let e_down = load_linear_layer(&gguf, &format!("blk.{i}.ffn_down.{e}.weight"), &ctx, [embed_dim, intermediate])?;
                 experts.push(SwiGLU::new(e_gate, e_up, e_down));
             }
 
-            let router = load_linear_layer(&gguf, &format!("blk.{i}.ffn_gate_inp.weight"), &ctx)?;
+            let router = load_linear_layer(&gguf, &format!("blk.{i}.ffn_gate_inp.weight"), &ctx, [n_experts, embed_dim])?;
 
             if i == 0 {
                 info!(n_experts, top_k, "loading MoE experts");
@@ -203,18 +274,15 @@ pub fn load_model(path: &str) -> Result<LoadedModel, GgufError> {
 
             Box::new(crate::layers::moe::MoELayer::new(experts, router, top_k))
         } else {
-            let gate_proj = load_linear_layer(&gguf, &format!("blk.{i}.ffn_gate.weight"), &ctx)?;
-            let up_proj = load_linear_layer(&gguf, &format!("blk.{i}.ffn_up.weight"), &ctx)?;
-            let down_proj = load_linear_layer(&gguf, &format!("blk.{i}.ffn_down.weight"), &ctx)?;
+            let gate_proj = load_linear_layer(&gguf, &format!("blk.{i}.ffn_gate.weight"), &ctx, [intermediate, embed_dim])?;
+            let up_proj = load_linear_layer(&gguf, &format!("blk.{i}.ffn_up.weight"), &ctx, [intermediate, embed_dim])?;
+            let down_proj = load_linear_layer(&gguf, &format!("blk.{i}.ffn_down.weight"), &ctx, [embed_dim, intermediate])?;
             Box::new(SwiGLU::new(gate_proj, up_proj, down_proj))
         };
 
-        // Norms (float)
-        let attn_norm_w = gguf.load_float(&format!("blk.{i}.attn_norm.weight"))?;
-        let ffn_norm_w = gguf.load_float(&format!("blk.{i}.ffn_norm.weight"))?;
-
-        let attn_norm = RmsNorm::new(attn_norm_w.data().to_vec(), config.rms_norm_eps);
-        let ffn_norm = RmsNorm::new(ffn_norm_w.data().to_vec(), config.rms_norm_eps);
+        // Norms (float), length-checked against the model dimension (#19)
+        let attn_norm = load_norm(&gguf, &format!("blk.{i}.attn_norm.weight"), embed_dim, config.rms_norm_eps)?;
+        let ffn_norm = load_norm(&gguf, &format!("blk.{i}.ffn_norm.weight"), embed_dim, config.rms_norm_eps)?;
 
         let block = TransformerBlock::new(attn_norm, attention, ffn_norm, ffn);
         blocks.push(block);
@@ -233,13 +301,13 @@ pub fn load_model(path: &str) -> Result<LoadedModel, GgufError> {
         info!(layer = i, "loaded transformer block {}/{}", i + 1, config.n_layers);
     }
 
-    // Final norm
-    let final_norm_w = gguf.load_float("output_norm.weight")?;
-    let final_norm = RmsNorm::new(final_norm_w.data().to_vec(), config.rms_norm_eps);
+    // Final norm (#19: length-checked; it was compared to nothing at all)
+    let final_norm = load_norm(&gguf, "output_norm.weight", embed_dim, config.rms_norm_eps)?;
 
     // Output projection
     let output_proj = if let Some(_out_info) = gguf.tensor_info("output.weight") {
         let out_tensor = gguf.load_float("output.weight")?;
+        expect_shape(&out_tensor, "output.weight", &[vocab, embed_dim])?;
         info!(shape = ?out_tensor.shape(), "loaded output projection (float)");
         #[cfg(feature = "gpu")]
         if let Some(gpu) = ctx.gpu {
@@ -269,15 +337,7 @@ pub fn load_model(path: &str) -> Result<LoadedModel, GgufError> {
         "model loaded successfully"
     );
 
-    assert_eq!(
-        model.vocab_size(),
-        tokenizer.vocab_size(),
-        "model vocab size ({}) != tokenizer vocab size ({})",
-        model.vocab_size(),
-        tokenizer.vocab_size()
-    );
-
-    let _ = intermediate;
+    debug_assert_eq!(model.vocab_size(), tokenizer.vocab_size(), "checked before loading");
 
     Ok(LoadedModel {
         model,
@@ -286,4 +346,140 @@ pub fn load_model(path: &str) -> Result<LoadedModel, GgufError> {
         #[cfg(feature = "gpu")]
         gpu,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gguf::tests::GgufBuilder;
+
+    const F32: u32 = 0;
+
+    /// Knobs for corrupting one field of the tiny model.
+    #[derive(Default)]
+    struct Corrupt {
+        attn_norm_len: Option<usize>,
+        final_norm_len: Option<usize>,
+        q_shape: Option<[u64; 2]>,
+        n_tokens: Option<usize>,
+        head_count: Option<u32>,
+        q_bias_len: Option<usize>,
+    }
+
+    /// A complete, loadable toy model: vocab 8, embed 8, 2 layers, 2 heads,
+    /// 1 kv head (head_dim 4), intermediate 16, tied output, SentencePiece
+    /// tokenizer with default ids. Every tensor is F32 zeros.
+    fn tiny_model(c: &Corrupt) -> Vec<u8> {
+        let (vocab, embed, inter, n_layers) = (8usize, 8usize, 16usize, 2u32);
+        let zeros = |n: usize| vec![0u8; n * 4];
+        let mut b = GgufBuilder::new();
+        b.add_metadata_string("general.architecture", "llama");
+        b.add_metadata_u32("llama.embedding_length", embed as u32);
+        b.add_metadata_u32("llama.block_count", n_layers);
+        b.add_metadata_u32("llama.attention.head_count", c.head_count.unwrap_or(2));
+        b.add_metadata_u32("llama.attention.head_count_kv", 1);
+        b.add_metadata_u32("llama.context_length", 16);
+        b.add_metadata_u32("llama.feed_forward_length", inter as u32);
+        b.add_metadata_f32("llama.rope.freq_base", 10000.0);
+        b.add_metadata_f32("llama.attention.layer_norm_rms_epsilon", 1e-5);
+        let names: Vec<String> = (0..c.n_tokens.unwrap_or(vocab)).map(|i| format!("t{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        b.add_metadata_array_string("tokenizer.ggml.tokens", &refs);
+        b.add_metadata_string("tokenizer.ggml.model", "llama");
+
+        b.add_tensor("token_embd.weight", &[vocab as u64, embed as u64], F32, zeros(vocab * embed));
+        for i in 0..n_layers {
+            let q = c.q_shape.unwrap_or([embed as u64, embed as u64]);
+            b.add_tensor(&format!("blk.{i}.attn_q.weight"), &q, F32, zeros((q[0] * q[1]) as usize));
+            b.add_tensor(&format!("blk.{i}.attn_k.weight"), &[4, embed as u64], F32, zeros(4 * embed));
+            b.add_tensor(&format!("blk.{i}.attn_v.weight"), &[4, embed as u64], F32, zeros(4 * embed));
+            b.add_tensor(&format!("blk.{i}.attn_output.weight"), &[embed as u64, embed as u64], F32, zeros(embed * embed));
+            if let Some(n) = c.q_bias_len {
+                b.add_tensor(&format!("blk.{i}.attn_q.bias"), &[n as u64], F32, zeros(n));
+                b.add_tensor(&format!("blk.{i}.attn_k.bias"), &[4], F32, zeros(4));
+                b.add_tensor(&format!("blk.{i}.attn_v.bias"), &[4], F32, zeros(4));
+            }
+            b.add_tensor(&format!("blk.{i}.ffn_gate.weight"), &[inter as u64, embed as u64], F32, zeros(inter * embed));
+            b.add_tensor(&format!("blk.{i}.ffn_up.weight"), &[inter as u64, embed as u64], F32, zeros(inter * embed));
+            b.add_tensor(&format!("blk.{i}.ffn_down.weight"), &[embed as u64, inter as u64], F32, zeros(embed * inter));
+            let an = if i == 0 { c.attn_norm_len.unwrap_or(embed) } else { embed };
+            b.add_tensor(&format!("blk.{i}.attn_norm.weight"), &[an as u64], F32, zeros(an));
+            b.add_tensor(&format!("blk.{i}.ffn_norm.weight"), &[embed as u64], F32, zeros(embed));
+        }
+        let fnl = c.final_norm_len.unwrap_or(embed);
+        b.add_tensor("output_norm.weight", &[fnl as u64], F32, zeros(fnl));
+        b.build()
+    }
+
+    fn load(bytes: Vec<u8>) -> Result<LoadedModel, GgufError> {
+        let gguf = GgufFile::open_bytes(bytes)?;
+        load_from_gguf(
+            gguf,
+            #[cfg(feature = "gpu")]
+            None,
+        )
+    }
+
+    #[test]
+    fn tiny_model_loads_on_the_cpu_path() {
+        let m = load(tiny_model(&Corrupt::default())).expect("tiny model must load");
+        assert_eq!(m.model.n_layers(), 2);
+        assert_eq!(m.model.vocab_size(), 8);
+        assert_eq!(m.model.embed_dim(), 8);
+        assert_eq!(m.tokenizer.vocab_size(), 8);
+        // With biases too.
+        let m = load(tiny_model(&Corrupt { q_bias_len: Some(8), ..Default::default() })).unwrap();
+        assert_eq!(m.model.n_layers(), 2);
+    }
+
+    fn mismatch_tensor(r: Result<LoadedModel, GgufError>) -> String {
+        match r {
+            Err(GgufError::DimensionMismatch { tensor, .. }) => tensor,
+            Err(other) => panic!("expected DimensionMismatch, got {other}"),
+            Ok(_) => panic!("expected DimensionMismatch, got Ok"),
+        }
+    }
+
+    #[test]
+    fn short_attn_norm_is_rejected_at_load() {
+        // Review #19: this used to load and panic on the first forward.
+        let t = mismatch_tensor(load(tiny_model(&Corrupt { attn_norm_len: Some(7), ..Default::default() })));
+        assert_eq!(t, "blk.0.attn_norm.weight");
+    }
+
+    #[test]
+    fn short_final_norm_is_rejected_at_load() {
+        // Review #19: final_norm was compared to nothing at all.
+        let t = mismatch_tensor(load(tiny_model(&Corrupt { final_norm_len: Some(7), ..Default::default() })));
+        assert_eq!(t, "output_norm.weight");
+    }
+
+    #[test]
+    fn wrong_projection_shape_is_rejected_at_load() {
+        let t = mismatch_tensor(load(tiny_model(&Corrupt { q_shape: Some([8, 7]), ..Default::default() })));
+        assert_eq!(t, "blk.0.attn_q.weight");
+    }
+
+    #[test]
+    fn wrong_bias_length_is_rejected_at_load() {
+        let t = mismatch_tensor(load(tiny_model(&Corrupt { q_bias_len: Some(6), ..Default::default() })));
+        assert_eq!(t, "blk.0.attn_q.bias");
+    }
+
+    #[test]
+    fn tokenizer_vocab_mismatch_is_rejected_before_any_tensor() {
+        // vocab_size derives from the token list (9) but the embedding has
+        // 8 rows: used to be an assert_eq! after the whole model was built.
+        let t = mismatch_tensor(load(tiny_model(&Corrupt { n_tokens: Some(9), ..Default::default() })));
+        assert_eq!(t, "token_embd.weight");
+    }
+
+    #[test]
+    fn invalid_config_is_rejected_before_any_tensor() {
+        // Review #17: head_count = 0 used to divide by zero at loader.rs:114.
+        match load(tiny_model(&Corrupt { head_count: Some(0), ..Default::default() })) {
+            Err(GgufError::InvalidConfig { key, .. }) => assert_eq!(key, "attention.head_count"),
+            other => panic!("expected InvalidConfig, got {:?}", other.map(|_| ())),
+        }
+    }
 }

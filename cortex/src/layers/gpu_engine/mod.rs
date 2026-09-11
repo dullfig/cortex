@@ -298,20 +298,27 @@ impl GpuEngine {
             alloc
         };
 
-        // Final norm
+        let embed_dim = cpu.embed_dim();
+
+        // Final norm. Review #19: the shader loops `i < embed_dim` over the
+        // weight buffer; a short weight was read past its end under WGSL
+        // robust-buffer clamping — wrong output, no error. The loader
+        // rejects that file; this guards the constructor.
         let final_norm = cpu.final_norm();
+        assert_eq!(final_norm.dim(), embed_dim, "final_norm length must match embed_dim");
         let final_norm_weight_buf = upload_static(
             bytemuck::cast_slice(final_norm.weight()),
             "gpu_engine.final_norm.weight",
         );
         let final_norm_eps = final_norm.eps();
-        let embed_dim = cpu.embed_dim();
 
         // Per-block norms + optional Q/K/V biases (Qwen2)
         let blocks_gpu: Vec<GpuBlock> = cpu.blocks().iter().enumerate().map(|(i, blk)| {
             let an = blk.attn_norm();
             let fn_ = blk.ffn_norm();
             let attn = blk.attention();
+            assert_eq!(an.dim(), embed_dim, "block {i} attn_norm length must match embed_dim");
+            assert_eq!(fn_.dim(), embed_dim, "block {i} ffn_norm length must match embed_dim");
             GpuBlock {
                 attn_norm_weight_buf: upload_static(
                     bytemuck::cast_slice(an.weight()),
