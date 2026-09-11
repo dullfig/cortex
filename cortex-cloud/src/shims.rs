@@ -1034,12 +1034,19 @@ pub(crate) async fn shim_infer(
         ));
     }
 
-    // Review #7: one GPU region at a time.
-    let _gpu = state.gpu_gate.admit().await;
+    // Review #7: one GPU region at a time. Review #24: the prefill runs in
+    // a task that owns the permit, so this future is droppable and a panic
+    // is a 500 rather than a dropped connection.
+    let gpu = state.gpu_gate.admit().await;
     let infer_start = Instant::now();
-    let hc = tokio::task::block_in_place(|| {
-        state.engine.forward_full_gpu_with_hidden_capture(&tokens, &[])
-    });
+    let hc = {
+        let (st, toks) = (state.clone(), tokens.clone());
+        crate::chat::run_generation(move || {
+            let _gpu = gpu;
+            st.engine.forward_full_gpu_with_hidden_capture(&toks, &[])
+        })
+        .await?
+    };
     let cortex_ms = infer_start.elapsed().as_millis() as u64;
 
     let result = run_shim_against_hidden(&shim, &hc).await?;
@@ -1175,12 +1182,17 @@ pub(crate) async fn shim_embed(
         ));
     }
 
-    // Review #7: one GPU region at a time.
-    let _gpu = state.gpu_gate.admit().await;
+    // Review #7: one GPU region at a time. Review #24: see shim_infer.
+    let gpu = state.gpu_gate.admit().await;
     let infer_start = Instant::now();
-    let hc = tokio::task::block_in_place(|| {
-        state.engine.forward_full_gpu_with_hidden_capture(&tokens, &capture_layers)
-    });
+    let hc = {
+        let (st, toks, layers) = (state.clone(), tokens.clone(), capture_layers.clone());
+        crate::chat::run_generation(move || {
+            let _gpu = gpu;
+            st.engine.forward_full_gpu_with_hidden_capture(&toks, &layers)
+        })
+        .await?
+    };
     let cortex_ms = infer_start.elapsed().as_millis() as u64;
 
     let embedding = match layer {

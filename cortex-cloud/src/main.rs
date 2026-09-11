@@ -112,6 +112,13 @@ struct Cli {
     /// not mounted (404).
     #[arg(long)]
     enable_shims: bool,
+
+    /// Arm the review #24 e2e hooks: with `CORTEX_TEST_PANIC_AFTER_TOKENS=N`
+    /// in the environment every generation panics on purpose once N tokens
+    /// exist. Off by default; nothing a client sends can arm it. Never for
+    /// a production deployment.
+    #[arg(long)]
+    enable_test_hooks: bool,
 }
 
 
@@ -317,7 +324,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    // Review #24: every panic — worker, blocking or generation thread — is
+    // logged through tracing with its location before it unwinds, so a
+    // generation that dies is in the server log even when the HTTP layer
+    // turns it into a structured error. `RUST_BACKTRACE=1` adds the trace.
+    std::panic::set_hook(Box::new(|info| {
+        let thread = std::thread::current();
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_default();
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string panic payload".to_string());
+        tracing::error!(
+            thread = thread.name().unwrap_or("?"),
+            location = %location,
+            backtrace = %std::backtrace::Backtrace::capture(),
+            "panicked: {payload}",
+        );
+    }));
+
     let cli = Cli::parse();
+
+    if cli.enable_test_hooks {
+        if let Some(n) = std::env::var("CORTEX_TEST_PANIC_AFTER_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            tracing::warn!(
+                panic_after_tokens = n,
+                "TEST HOOK ARMED: generations panic on purpose (review #24 e2e); never in production",
+            );
+            crate::chat::install_test_hooks(n);
+        }
+    }
 
     info!(model = %cli.model, "loading model");
     let loaded = cortex::load_model(&cli.model)?;

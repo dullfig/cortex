@@ -481,6 +481,8 @@ pub(crate) fn generate_with_cache(
     seed: u64,
     eos: u32,
     max_tokens: usize,
+    // Review #24: polled once per decode step; true = the client is gone.
+    should_stop: &dyn Fn() -> bool,
 ) -> Vec<u32> {
     let mut sampler = Sampler::new(sampler_config.clone(), seed);
     let greedy_gpu = lm_head_greedy_eligible(&sampler_config);
@@ -525,7 +527,15 @@ pub(crate) fn generate_with_cache(
     out.push(next_token);
 
     let mut ended_by_eos = false;
+    let mut cancelled = false;
     for _ in 1..max_tokens {
+        // Review #24: the client is gone — stop at the step boundary. The
+        // trailing-token rule below keeps the lockstep post-condition.
+        if should_stop() {
+            cancelled = true;
+            break;
+        }
+        test_hook_panic_after(out.len());
         // Review #1: never let decode reach the engine's cache-overflow
         // assert. When the cache is full, stop with finish="length"
         // instead of panicking mid-loop (which left `entry.tokens`
@@ -551,6 +561,9 @@ pub(crate) fn generate_with_cache(
             break;
         }
         out.push(next_token);
+    }
+    if cancelled {
+        tracing::info!(generated = out.len(), "generation cancelled: client disconnected");
     }
     // Review #8: a token is pushed when sampled but only enters the cache
     // on the NEXT iteration's forward, so on a max_tokens / full-cache exit
@@ -582,6 +595,8 @@ pub(crate) fn generate_with_polar_cache(
     _seed: u64,
     eos: u32,
     max_tokens: usize,
+    // Review #24: polled once per decode step; true = the client is gone.
+    should_stop: &dyn Fn() -> bool,
 ) -> Option<Vec<u32>> {
     if !lm_head_greedy_eligible(&sampler_config) {
         return None;
@@ -604,7 +619,14 @@ pub(crate) fn generate_with_polar_cache(
     out.push(next_token);
 
     let mut ended_by_eos = false;
+    let mut cancelled = false;
     for _ in 1..max_tokens {
+        // Review #24: same step-boundary cancellation as the f32 loop.
+        if should_stop() {
+            cancelled = true;
+            break;
+        }
+        test_hook_panic_after(out.len());
         // Review #1: same graceful length-stop as the f32 loop.
         if polar_cache.seq_len() >= polar_cache.max_seq_len() {
             break;
@@ -617,6 +639,9 @@ pub(crate) fn generate_with_polar_cache(
             break;
         }
         out.push(next_token);
+    }
+    if cancelled {
+        tracing::info!(generated = out.len(), "generation cancelled: client disconnected");
     }
     // Review #8: same trailing-token rule as generate_with_cache — see there.
     if !ended_by_eos && !out.is_empty() {
@@ -663,6 +688,8 @@ pub(crate) fn generate_stateless_gpu(
     max_seq_len: usize,
     steers: &[Arc<RegisteredShim>],
     inject_deltas: &[Option<wgpu::Buffer>],
+    // Review #24: polled once per decode step; true = the client is gone.
+    should_stop: &dyn Fn() -> bool,
 ) -> Result<Vec<u32>, ::cortex::vram_heap::Error> {
     // Review #6: a refused VRAM budget is returned, not panicked, so the
     // handler can answer 503.
@@ -746,6 +773,12 @@ pub(crate) fn generate_stateless_gpu(
     out.push(next_token);
 
     for _ in 1..max_tokens {
+        // Review #24: stop at the step boundary once the client is gone.
+        if should_stop() {
+            tracing::info!(generated = out.len(), "generation cancelled: client disconnected");
+            break;
+        }
+        test_hook_panic_after(out.len());
         next_token = if has_steers {
             let mut hidden = engine.forward_full_gpu_with_cache_inject_returning_hidden(
                 &[next_token], &mut cache, inject_deltas,
@@ -790,6 +823,10 @@ pub(crate) async fn chat_completions(
     // responses record duration up to handoff (the SSE stream itself
     // is recorded by TTFT inside chat_completions_stream).
     let mut _telemetry = metrics::RequestTimer::new(state.metrics.clone(), metrics::Endpoint::ChatCompletions);
+    // Review #24: trips when this future is dropped (client disconnect);
+    // the generation loops poll it once per decode step.
+    let cancel = CancelOnDrop::new();
+    let should_stop = stop_when(cancel.flag());
 
     let prompt_tokens = apply_chat_template(
         &req.messages,
@@ -916,9 +953,9 @@ pub(crate) async fn chat_completions(
     let gpu_permit = state.gpu_gate.admit().await;
     let (hc, gate_prefill_ms) = if need_hc {
         let prefill_start = Instant::now();
-        let hc = tokio::task::block_in_place(|| {
+        let hc = guarded_block(|| {
             state.engine.forward_full_gpu_with_hidden_capture(&prompt_tokens, &[])
-        });
+        })?;
         (Some(hc), prefill_start.elapsed().as_millis() as u64)
     } else {
         (None, 0)
@@ -1062,8 +1099,11 @@ pub(crate) async fn chat_completions(
                 })),
             ));
         }
-        _telemetry.mark_success();
-        return chat_completions_stream(state, req, prompt_tokens, gate_metadata, active_steers, inject_deltas, gpu_permit).await;
+        // Review #24: the request timer travels with the stream; success is
+        // marked when the stream finishes, not at handoff.
+        return chat_completions_stream(
+            state, req, prompt_tokens, gate_metadata, active_steers, inject_deltas, gpu_permit, _telemetry,
+        ).await;
     }
 
     let prompt_len = prompt_tokens.len() as u32;
@@ -1234,7 +1274,7 @@ pub(crate) async fn chat_completions(
                     state.engine.log_allocator_report("before_polar_retrieve");
                     state.engine.log_vram_heap_stats("before_polar_retrieve");
                 }
-                let (q, b) = tokio::task::block_in_place(|| {
+                let (q, b) = guarded_block(|| {
                     let q = state.engine.forward_full_gpu_polar_traced(
                         &prompt_tokens, polar_ref, &capture_layers,
                     );
@@ -1242,7 +1282,7 @@ pub(crate) async fn chat_completions(
                         &baseline_tokens, polar_ref, &capture_layers,
                     );
                     (q, b)
-                });
+                })?;
                 if diag {
                     state.engine.log_allocator_report("after_polar_retrieve");
                     state.engine.log_vram_heap_stats("after_polar_retrieve");
@@ -1267,7 +1307,7 @@ pub(crate) async fn chat_completions(
                     backend = "f32",
                     "retrieval mode: single-shard cached forward",
                 );
-                let (q, b) = tokio::task::block_in_place(|| {
+                let (q, b) = guarded_block(|| {
                     let q = state.engine.forward_full_gpu_with_cache_traced(
                         &prompt_tokens, cache_ref, &capture_layers,
                     );
@@ -1275,7 +1315,7 @@ pub(crate) async fn chat_completions(
                         &baseline_tokens, cache_ref, &capture_layers,
                     );
                     (q, b)
-                });
+                })?;
                 (q, b, cache_seq)
             }
         } else {
@@ -1327,12 +1367,12 @@ pub(crate) async fn chat_completions(
                 let all_tokens: Vec<u32> = snapshot.iter()
                     .flat_map(|(_, _, t)| t.iter().copied())
                     .collect();
-                tokio::task::block_in_place(|| {
+                guarded_block(|| {
                     // Review #5: chunked prefill (the logits were discarded
                     // anyway) — bounded by the lane/dispatch limits, and no
                     // wasted finalize_logits over every shard token.
                     forward_chunked_into_cache(&state.engine, &all_tokens, &mut cache_buf, |_, _, _, _| {});
-                });
+                })?;
                 *composition = Some(ComposedEntry {
                     key,
                     cache: cache_buf,
@@ -1355,7 +1395,7 @@ pub(crate) async fn chat_completions(
                 composition = if reused { "reused" } else { "rebuilt" },
                 "retrieval mode: multi-shard composed cached forward",
             );
-            let (q, b) = tokio::task::block_in_place(|| {
+            let (q, b) = guarded_block(|| {
                 let q = state.engine.forward_full_gpu_with_cache_traced(
                     &prompt_tokens, cache_ref, &capture_layers,
                 );
@@ -1363,7 +1403,7 @@ pub(crate) async fn chat_completions(
                     &baseline_tokens, cache_ref, &capture_layers,
                 );
                 (q, b)
-            });
+            })?;
             (q, b, cache_seq)
         };
 
@@ -1616,6 +1656,14 @@ pub(crate) async fn chat_completions(
         // Only reject when neither polar_chat nor cache is available.
         for shard_name in &shards {
             if let Some(e) = pool.get(shard_name) {
+                // Review #24: a shard that a panicked generation left
+                // half-updated (cache advanced, `tokens` not) is refused
+                // here with the lockstep 409, as retrieve and append already
+                // do — before, the next chat used it silently and the drift
+                // persisted into every later composition.
+                if let Err(l) = e.check_lockstep() {
+                    return Err(cache_desynced_err(shard_name, l));
+                }
                 if e.cache.is_none() && !e.polar_chat {
                     return Err((
                         StatusCode::CONFLICT,
@@ -1679,8 +1727,8 @@ pub(crate) async fn chat_completions(
             // polar cache; f32 cache stays unchanged (Phase 2 keeps
             // it for non-greedy fallback only).
             let polar_generated: Option<Vec<u32>> = if entry.polar_chat {
-                entry.polar.as_mut().and_then(|polar| {
-                    tokio::task::block_in_place(|| {
+                match entry.polar.as_mut() {
+                    Some(polar) => guarded_block(|| {
                         generate_with_polar_cache(
                             &state.engine,
                             &prompt_tokens,
@@ -1689,9 +1737,11 @@ pub(crate) async fn chat_completions(
                             seed,
                             eos,
                             max_tokens,
+                            &should_stop,
                         )
-                    })
-                })
+                    })?,
+                    None => None,
+                }
             } else {
                 None
             };
@@ -1702,7 +1752,7 @@ pub(crate) async fn chat_completions(
                 // available: use the f32 path. (For polar_chat + non-greedy
                 // this diverges semantics across turns — see plan Phase 2
                 // notes.)
-                tokio::task::block_in_place(|| {
+                guarded_block(|| {
                     generate_with_cache(
                         &state.engine,
                         &prompt_tokens,
@@ -1711,8 +1761,9 @@ pub(crate) async fn chat_completions(
                         seed,
                         eos,
                         max_tokens,
+                        &should_stop,
                     )
-                })
+                })?
             } else {
                 // polar_chat + polar_only + non-greedy: no path exists.
                 // Polar orchestrator only supports greedy today; f32
@@ -1746,7 +1797,7 @@ pub(crate) async fn chat_completions(
             // shard still holds (f32 after a polar turn, polar after the
             // non-greedy f32 fallback) up to `tokens`, so the next turn,
             // append or retrieve sees one consistent shard.
-            tokio::task::block_in_place(|| sync_lagging_caches(&state.engine, entry));
+            guarded_block(|| sync_lagging_caches(&state.engine, entry))?;
             debug_assert!(entry.check_lockstep().is_ok(), "single-shard chat left {:?}", entry.check_lockstep());
             entry.last_used = Instant::now();
             let len = generated.len() as u32;
@@ -1785,12 +1836,12 @@ pub(crate) async fn chat_completions(
                 .engine
                 .try_create_gpu_kv_cache(state.max_seq_len)
                 .map_err(vram_exhausted_err)?;
-            tokio::task::block_in_place(|| {
+            guarded_block(|| {
                 forward_chunked_into_cache(&state.engine, &all_tokens, &mut composed_cache, |_, _, _, _| {});
-            });
+            })?;
 
             // Now generate with the composed cache
-            let generated = tokio::task::block_in_place(|| {
+            let generated = guarded_block(|| {
                 generate_with_cache(
                     &state.engine,
                     &prompt_tokens,
@@ -1799,8 +1850,9 @@ pub(crate) async fn chat_completions(
                     seed,
                     eos,
                     max_tokens,
+                    &should_stop,
                 )
-            });
+            })?;
 
             // Update the LAST shard with the new tokens (the user's shard
             // is conventionally the last in the list). The shared shards
@@ -1823,7 +1875,7 @@ pub(crate) async fn chat_completions(
                         // The polar snapshot of this shard is stale after the
                         // chat append (multi-shard path).
                         entry.polar = None;
-                        tokio::task::block_in_place(|| sync_lagging_caches(&state.engine, entry));
+                        guarded_block(|| sync_lagging_caches(&state.engine, entry))?;
                         debug_assert!(entry.check_lockstep().is_ok(), "multi-shard chat left {:?}", entry.check_lockstep());
                         entry.last_used = Instant::now();
                     } else {
@@ -1843,12 +1895,22 @@ pub(crate) async fn chat_completions(
         // Stateless with active steers and/or inject: GPU generation
         // path that threads inject deltas through every forward and
         // applies steer deltas to last-token hidden each step.
-        let generated = tokio::task::block_in_place(|| {
+        // Review #24: off the reactor, in a task that owns its inputs and
+        // the GPU permit, so this future is droppable — a disconnect trips
+        // `cancel` and the loop stops at its next step, releasing the
+        // permit only then.
+        let (st, prompt, steers, injects, permit, stop) = (
+            state.clone(), prompt_tokens.clone(), active_steers, inject_deltas,
+            gpu_permit, stop_when(cancel.flag()),
+        );
+        let generated = run_generation(move || {
+            let _permit = permit;
             generate_stateless_gpu(
-                &state.engine, &prompt_tokens, sampler_config, seed, eos,
-                max_tokens, state.max_seq_len, &active_steers, &inject_deltas,
+                &st.engine, &prompt, sampler_config, seed, eos,
+                max_tokens, st.max_seq_len, &steers, &injects, &stop,
             )
         })
+        .await?
         .map_err(vram_exhausted_err)?;
         let len = generated.len() as u32;
         (generated, len)
@@ -1861,12 +1923,18 @@ pub(crate) async fn chat_completions(
         // batch shaders. generate_stateless_gpu with empty steers/inject
         // is equivalent semantically to the prior CPU path (greedy/temp=0
         // matches; sampling differs only in float-order accumulation).
-        let generated = tokio::task::block_in_place(|| {
+        // Review #24: same droppable-task shape as the shim path above.
+        let (st, prompt, permit, stop) = (
+            state.clone(), prompt_tokens.clone(), gpu_permit, stop_when(cancel.flag()),
+        );
+        let generated = run_generation(move || {
+            let _permit = permit;
             generate_stateless_gpu(
-                &state.engine, &prompt_tokens, sampler_config, seed, eos,
-                max_tokens, state.max_seq_len, &[], &[],
+                &st.engine, &prompt, sampler_config, seed, eos,
+                max_tokens, st.max_seq_len, &[], &[], &stop,
             )
         })
+        .await?
         .map_err(vram_exhausted_err)?;
         let len = generated.len() as u32;
         (generated, len)
@@ -1954,6 +2022,10 @@ pub(crate) async fn chat_completions_stream(
     // below and released when the stream ends (a stream holds the GPU for
     // its lifetime — per-step fairness is Stage-2 batching work).
     gpu_permit: tokio::sync::OwnedSemaphorePermit,
+    // Review #24: the request timer; moved into the generation task so the
+    // request is a success only when the stream finishes and its duration
+    // covers the stream, not the handoff.
+    telemetry: metrics::RequestTimer,
 ) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
     // Review #3: reject NaN/inf/negative (400) and floor tiny values so
     // `logit / temperature` can never overflow into a NaN sampler panic.
@@ -1974,12 +2046,13 @@ pub(crate) async fn chat_completions_stream(
     // an Option<String>: Some(delta) for content, None for "we're done,
     // emit the final finish_reason chunk".
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamMessage>(8);
+    // Review #24: the supervisor's sender — the channel (and so the SSE
+    // stream) closes only after the generation task's outcome is known.
+    let tx_supervisor = tx.clone();
 
     // Telemetry: stamp start so the streaming TTFT histogram records
-    // request-arrival to first content delta. (record_request for the
-    // streaming response itself fires in the parent chat_completions
-    // handler on handoff — see _telemetry.mark_success before this is
-    // called.)
+    // request-arrival to first content delta. The request timer itself
+    // moves into the generation task below (review #24).
     let ttft_start = Instant::now();
 
     // Spawn the generation. block_in_place isn't an option from inside a
@@ -1995,8 +2068,9 @@ pub(crate) async fn chat_completions_stream(
         .engine
         .try_create_gpu_kv_cache(state.max_seq_len)
         .map_err(vram_exhausted_err)?;
-    tokio::task::spawn_blocking(move || {
+    let gen_handle = tokio::task::spawn_blocking(move || {
         let _gpu_permit = gpu_permit; // held until this task returns or unwinds
+        let mut telemetry = telemetry; // dropped here: records the stream's outcome
         let mut sampler = Sampler::new(sampler_config.clone(), seed);
         let embed_dim = state_for_gen.engine.embed_dim();
         let has_steers = !steers_for_gen.is_empty();
@@ -2013,6 +2087,11 @@ pub(crate) async fn chat_completions_stream(
         if n > 1 {
             let mut rest = &prompt_tokens[..n - 1];
             while !rest.is_empty() {
+                // Review #24: a gone client stops the prefill at the next chunk.
+                if tx.is_closed() {
+                    tracing::info!("stream cancelled during prefill: client disconnected");
+                    return;
+                }
                 let chunk = state_for_gen
                     .engine
                     .safe_prefill_chunk_size(cache.seq_len())
@@ -2086,9 +2165,11 @@ pub(crate) async fn chat_completions_stream(
             } else {
                 // Decode shrank or diverged (rare; happens with some BPE
                 // edge cases when a new token reshapes earlier output).
-                // Reset baseline; don't emit a delta this round.
+                // Reset baseline; don't emit a delta this round — but
+                // (review #24) still notice a gone client, so a run of
+                // non-emitting steps cannot hide a disconnect.
                 *emitted_text = full;
-                true
+                !tx.is_closed()
             }
         };
 
@@ -2099,10 +2180,15 @@ pub(crate) async fn chat_completions_stream(
             // this is the GPU-side definition of "first token ready".
             state_for_gen.metrics.record_ttft(ttft_start.elapsed().as_secs_f64());
             if !push_delta(&generated, &mut emitted_text, &tx) {
-                return; // client gone
+                {
+                    tracing::info!(generated = generated.len(), "stream cancelled: client disconnected");
+                    state_for_gen.metrics.record_tokens(0, generated.len() as u64);
+                    return;
+                }
             }
 
             for _ in 1..max_tokens {
+                test_hook_panic_after(generated.len());
                 next_token = if has_steers {
                     let mut hidden = state_for_gen.engine.forward_full_gpu_with_cache_inject_returning_hidden(
                         &[next_token], &mut cache, &inject_for_gen,
@@ -2132,19 +2218,37 @@ pub(crate) async fn chat_completions_stream(
                 }
                 generated.push(next_token);
                 if !push_delta(&generated, &mut emitted_text, &tx) {
-                    return; // client gone
+                    {
+                    tracing::info!(generated = generated.len(), "stream cancelled: client disconnected");
+                    state_for_gen.metrics.record_tokens(0, generated.len() as u64);
+                    return;
+                }
                 }
             }
         }
 
         let finish = if generated.len() >= max_tokens { "length" } else { "stop" };
         state_for_gen.metrics.record_tokens(0, generated.len() as u64);
+        telemetry.mark_success();
         let _ = tx.blocking_send(StreamMessage::Finish(finish.to_string()));
         // Cache dropped on scope exit.
     });
+    // Review #24: a panic in the generation task used to end the stream
+    // with a bare `[DONE]`, indistinguishable from an empty completion.
+    // The supervisor turns it into an `Error` event; the channel closes
+    // only after both senders are gone, so the event is the stream's last.
+    tokio::spawn(async move {
+        if let Err(e) = gen_handle.await {
+            if e.is_panic() {
+                let msg = panic_message(e.into_panic());
+                tracing::error!(error = %msg, "streaming generation panicked");
+                let _ = tx_supervisor.send(StreamMessage::Error(msg)).await;
+            }
+        }
+    });
 
+    use futures::StreamExt;
     use tokio_stream::wrappers::ReceiverStream;
-    use tokio_stream::StreamExt;
 
     let chunk_id_for_stream = chunk_id.clone();
     let model_for_stream = model_name.clone();
@@ -2159,30 +2263,23 @@ pub(crate) async fn chat_completions_stream(
     // Subsequent chunks come from the generation task. The Finish chunk
     // carries the gate metadata (if any) at the chunk root so callers
     // see `gate_decisions` / `signals` alongside the OpenAI fields.
-    let body_stream = ReceiverStream::new(rx).map(move |msg| {
-        Ok::<_, std::convert::Infallible>(match msg {
-            StreamMessage::Delta(text) => stream_chunk_event(
-                &chunk_id_for_stream, created, &model_for_stream,
-                Some(serde_json::json!({"content": text})),
-                None,
-            ),
-            StreamMessage::Finish(reason) => stream_finish_event(
-                &chunk_id_for_stream, created, &model_for_stream,
-                reason, gate_metadata.clone(),
-            ),
-        })
-    });
-
-    // Final [DONE] sentinel per OpenAI SSE spec.
-    let done_event = futures::stream::once(async {
-        Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]"))
+    // Review #24: `[DONE]` follows a `Finish` only; an `Error` event is the
+    // stream's last event, so a client can tell a failure from an empty
+    // completion (`stream_message_payloads` is the tested contract).
+    let body_stream = ReceiverStream::new(rx).flat_map(move |msg| {
+        let payloads = stream_message_payloads(
+            msg, &chunk_id_for_stream, created, &model_for_stream, gate_metadata.clone(),
+        );
+        futures::stream::iter(
+            payloads.into_iter().map(|p| Ok::<_, std::convert::Infallible>(Event::default().data(p))),
+        )
     });
 
     let initial = futures::stream::once(async move {
         Ok::<_, std::convert::Infallible>(role_event)
     });
 
-    let combined = initial.chain(body_stream).chain(done_event);
+    let combined = initial.chain(body_stream);
 
     Ok(Sse::new(combined)
         .keep_alive(KeepAlive::default())
@@ -2194,8 +2291,42 @@ pub(crate) enum StreamMessage {
     /// Newly-detokenized text since the last chunk.
     Delta(String),
     /// Generation finished; emit the final chunk with this finish_reason
-    /// ("stop" or "length"). Always the last message before the channel closes.
+    /// ("stop" or "length") and then `[DONE]`. The last message on a
+    /// successful stream.
     Finish(String),
+    /// Review #24: the generation task panicked. Rendered as an OpenAI-style
+    /// error event; the last message of the stream, with no `[DONE]` after
+    /// it.
+    Error(String),
+}
+
+/// Review #24: the wire payloads one [`StreamMessage`] becomes. Pure so the
+/// termination contract is unit-tested: `[DONE]` follows only a `Finish`;
+/// an `Error` is the stream's last event and no `[DONE]` follows it.
+pub(crate) fn stream_message_payloads(
+    msg: StreamMessage,
+    id: &str,
+    created: u64,
+    model: &str,
+    gate_metadata: Option<serde_json::Value>,
+) -> Vec<String> {
+    match msg {
+        StreamMessage::Delta(text) => vec![
+            stream_chunk_payload(id, created, model, Some(serde_json::json!({"content": text})), None)
+                .to_string(),
+        ],
+        StreamMessage::Finish(reason) => vec![
+            stream_finish_payload(id, created, model, reason, gate_metadata).to_string(),
+            "[DONE]".to_string(),
+        ],
+        StreamMessage::Error(message) => vec![serde_json::json!({
+            "error": {
+                "type": "internal_generation_error",
+                "message": format!("generation failed: {message}"),
+            }
+        })
+        .to_string()],
+    }
 }
 
 /// Build one `chat.completion.chunk` SSE event with the given delta and
@@ -2207,7 +2338,18 @@ pub(crate) fn stream_chunk_event(
     delta: Option<serde_json::Value>,
     finish_reason: Option<String>,
 ) -> Event {
-    let payload = serde_json::json!({
+    Event::default().data(stream_chunk_payload(id, created, model, delta, finish_reason).to_string())
+}
+
+/// The JSON of one `chat.completion.chunk` (see [`stream_chunk_event`]).
+pub(crate) fn stream_chunk_payload(
+    id: &str,
+    created: u64,
+    model: &str,
+    delta: Option<serde_json::Value>,
+    finish_reason: Option<String>,
+) -> serde_json::Value {
+    serde_json::json!({
         "id": id,
         "object": "chat.completion.chunk",
         "created": created,
@@ -2217,8 +2359,7 @@ pub(crate) fn stream_chunk_event(
             "delta": delta.unwrap_or(serde_json::json!({})),
             "finish_reason": finish_reason,
         }],
-    });
-    Event::default().data(payload.to_string())
+    })
 }
 
 /// Build the terminal `chat.completion.chunk` SSE event with an optional
@@ -2233,6 +2374,17 @@ pub(crate) fn stream_finish_event(
     finish_reason: String,
     metadata: Option<serde_json::Value>,
 ) -> Event {
+    Event::default().data(stream_finish_payload(id, created, model, finish_reason, metadata).to_string())
+}
+
+/// The JSON of the terminal chunk (see [`stream_finish_event`]).
+pub(crate) fn stream_finish_payload(
+    id: &str,
+    created: u64,
+    model: &str,
+    finish_reason: String,
+    metadata: Option<serde_json::Value>,
+) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "id": id,
         "object": "chat.completion.chunk",
@@ -2249,7 +2401,7 @@ pub(crate) fn stream_finish_event(
             obj.insert("metadata".to_string(), meta);
         }
     }
-    Event::default().data(payload.to_string())
+    payload
 }
 
 /// Silent-gate short-circuit SSE response. Emits the role chunk for
@@ -2293,12 +2445,177 @@ pub(crate) fn silent_stream_response(
 // Qwen tokenizer does.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Review #24: generation panics are structured errors; a client disconnect
+// cancels what can be cancelled.
+// ---------------------------------------------------------------------------
+
+/// A generation panic as a 500 `internal_generation_error` — instead of an
+/// aborted connection (non-streaming) or a bare `[DONE]` (streaming).
+pub(crate) fn internal_generation_err(
+    msg: impl std::fmt::Display,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": {
+                "type": "internal_generation_error",
+                "message": format!("generation failed: {msg}"),
+            }
+        })),
+    )
+}
+
+/// The message inside a panic payload (`&str` / `String`), or a placeholder.
+pub(crate) fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+/// Run a generation on the blocking pool; a panic comes back as a 500. The
+/// closure owns everything it needs (an `Arc` of the state, its own copy of
+/// the tokens, the GPU permit), so the calling handler future stays
+/// droppable: a client disconnect drops it, the [`CancelOnDrop`] flag trips,
+/// the loop stops at its next decode step, and the permit is released only
+/// then — never while GPU work is still running.
+pub(crate) async fn run_generation<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, (StatusCode, Json<serde_json::Value>)> {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(v) => Ok(v),
+        Err(e) if e.is_panic() => Err(internal_generation_err(panic_message(e.into_panic()))),
+        Err(e) => Err(internal_generation_err(format!("generation task cancelled: {e}"))),
+    }
+}
+
+/// `block_in_place` with the panic caught and returned as a 500. For the
+/// cached paths, which borrow into the pool lock and so cannot move to a
+/// task (that refactor is review #32). A half-updated entry is caught by
+/// the next request's lockstep check (409 `cache_desynced`, review #8).
+pub(crate) fn guarded_block<T>(
+    f: impl FnOnce() -> T,
+) -> Result<T, (StatusCode, Json<serde_json::Value>)> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tokio::task::block_in_place(f)))
+        .map_err(|p| internal_generation_err(panic_message(p)))
+}
+
+/// Set when the owning handler future is dropped — the client disconnected
+/// before the response — and polled by the generation loops once per
+/// decode step (`should_stop`). Dropping at a normal return sets it too,
+/// harmlessly: nothing polls it after the generation has returned.
+pub(crate) struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+impl CancelOnDrop {
+    pub fn new() -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+    }
+    pub fn flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.0.clone()
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A `should_stop` closure over a cancellation flag.
+pub(crate) fn stop_when(
+    flag: Arc<std::sync::atomic::AtomicBool>,
+) -> impl Fn() -> bool + Send + Sync + 'static {
+    move || flag.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Review #24 e2e hook: armed only by `--enable-test-hooks` plus
+/// `CORTEX_TEST_PANIC_AFTER_TOKENS=N` at startup; no client input can set
+/// it. Every generation loop panics once `N` tokens exist.
+static TEST_PANIC_AFTER_TOKENS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+pub(crate) fn install_test_hooks(panic_after_tokens: usize) {
+    let _ = TEST_PANIC_AFTER_TOKENS.set(panic_after_tokens);
+}
+
+fn test_hook_panic_after(generated: usize) {
+    if let Some(&n) = TEST_PANIC_AFTER_TOKENS.get() {
+        if generated >= n {
+            panic!("test hook: CORTEX_TEST_PANIC_AFTER_TOKENS={n} reached after {generated} tokens");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::api::ChatMessage;
     use cortex::tokenizer::TokenType;
     use cortex::Tokenizer;
+
+    // --- Review #24 ---------------------------------------------------------
+
+    #[test]
+    fn stream_payloads_end_with_done_only_after_finish() {
+        let done = |msg| stream_message_payloads(msg, "id", 0, "m", None);
+        let d = done(StreamMessage::Delta("hi".into()));
+        assert_eq!(d.len(), 1);
+        assert!(d[0].contains("\"content\":\"hi\""));
+        let f = done(StreamMessage::Finish("stop".into()));
+        assert_eq!(f.len(), 2);
+        assert!(f[0].contains("\"finish_reason\":\"stop\""));
+        assert_eq!(f[1], "[DONE]");
+        let e = done(StreamMessage::Error("boom".into()));
+        assert_eq!(e.len(), 1, "an error is the last event: no [DONE]");
+        assert!(e[0].contains("\"internal_generation_error\""));
+        assert!(e[0].contains("boom"));
+        assert!(!e.iter().any(|p| p == "[DONE]"));
+    }
+
+    #[test]
+    fn cancel_on_drop_trips_the_flag() {
+        let cancel = CancelOnDrop::new();
+        let stop = stop_when(cancel.flag());
+        assert!(!stop());
+        drop(cancel);
+        assert!(stop(), "dropping the handler-side guard must trip should_stop");
+    }
+
+    #[test]
+    fn panic_message_extracts_str_and_string() {
+        let p: Box<dyn std::any::Any + Send> = Box::new("static");
+        assert_eq!(panic_message(p), "static");
+        let p: Box<dyn std::any::Any + Send> = Box::new(String::from("owned"));
+        assert_eq!(panic_message(p), "owned");
+        let p: Box<dyn std::any::Any + Send> = Box::new(7u8);
+        assert_eq!(panic_message(p), "non-string panic payload");
+    }
+
+    #[test]
+    fn guarded_block_turns_a_panic_into_a_500() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        rt.block_on(async {
+            let ok = guarded_block(|| 41 + 1);
+            assert_eq!(ok.unwrap(), 42);
+            let err = guarded_block(|| -> u32 { panic!("kaboom") }).unwrap_err();
+            assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+            let body = err.1 .0;
+            assert_eq!(body["error"]["type"], "internal_generation_error");
+            assert!(body["error"]["message"].as_str().unwrap().contains("kaboom"));
+        });
+    }
+
+    #[tokio::test]
+    async fn run_generation_turns_a_panic_into_a_500() {
+        let ok = run_generation(|| 1u8).await.unwrap();
+        assert_eq!(ok, 1);
+        let err = run_generation(|| -> u8 { panic!("kaboom") }).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.1 .0["error"]["type"], "internal_generation_error");
+    }
 
     /// SentencePiece-mode fixture: `<|im_start|>` / `<|im_end|>` are Control
     /// tokens; everything else falls back to byte tokens, so any text encodes
