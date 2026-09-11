@@ -139,9 +139,9 @@ Run all: `cargo test --workspace`
       + per-block scratch packed f16
 - [x] BitNet un-merge: ternary path moved to ternary-rs (2026-05-29).
       Tag: bitnet-archive-2026-05-29 (commit e1e2dc1).
-- [ ] Restore C3 packed perf for Qwen now that BitNet's gone (currently
-      hidden_buf + scratch.projected reverted to f32 for the Option E
-      BitNet fix; ~9% Qwen prefill regression vs C3 baseline)
+- [x] C3 packed perf for Qwen (hidden_buf + scratch.projected packed f16
+      again since 920e8be, 2026-05-29; the stale "reverted to f32" note
+      was removed 2026-09-11)
 - [ ] Polar variant `forward_block_gpu_polar_inner` C3 port (rotate_q /
       derotate need packed variants; currently panic-guarded)
 - [ ] QJL correction on V dequant (currently K-only) to close the cosine-

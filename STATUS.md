@@ -30,8 +30,15 @@
 > tensor shape and norm length checked, #18 RoPE layout per architecture
 > (`rope.scaling.type` was read as the wrong type), #21 tokenizer arrays
 > validated + UTF-8 byte fallback; release profile now has
-> `overflow-checks`. 24 of 31 closed; open: #31 (intermittent wgpu-29
-> delayed validation error, filed), #10, #23–#26.)
+> `overflow-checks`. 2026-09-11: **the review is closed, 31 of 31** — #23/#31
+> every per-request GPU buffer on a budgeted lane / readback span (the
+> intermittent "buffer is invalid" panic was a raw `create_buffer_init`
+> mapping the buffer it failed to allocate), #24 panics are structured
+> errors + disconnect cancels stateless/streaming/shim generation, #10
+> bigram-heap BPE + input caps, #25/#26 shim ONNX validated at PUT,
+> `max_tokens: 0` → 400, `PollFlush` guard, `kv_write` y-stride
+> (a9d39fc, a9f91f1, ac748ac, a6a25c5). Filed: #32 (cached-path cancellation is a
+> design question — see the review doc).)
 > cortex is currently **PARKED as a stable inference substrate** — per the
 > integration pin `state_of_project_2026-07-24`, "cortex is the next *code*
 > phase, not the next *project* phase"; the project foreground is the
@@ -193,12 +200,11 @@ not what design docs claim. The `[?]` rows are the antidote rows.
   control-token forgery blocked in the chat template, temperature floor +
   NaN-safe sampler, fallible cache alloc (`503 vram_exhausted`), pool cap
   (`--max-cache-shards`, `507 cache_pool_full`), token-id validation.
-- [ ] **Open from the review** (`docs/adversarial-review-2026-09-02.md`):
-  #22 dead parity test suite (`gpu_engine/tests.rs` under `#[cfg(any())]`),
-  #7 lane race / false "serialized by the pool mutex" invariant, #8
-  `entry.tokens` vs resident-cache drift, #9 TOCTOU unwraps, #12 readback
-  heap on long polar queries, #13–#17 GGUF hardening, #18 `rope.scaling.type`
-  read as u32, #10 O(n²) BPE.
+- [x] **Adversarial review closed 31/31 (2026-09-11)** — see
+  `docs/adversarial-review-2026-09-02.md` (fix-status table). One design
+  question filed as #32: cancelling cached-path generation on client
+  disconnect needs the pool entry checked out for the duration of
+  generation (wait vs. 409 `shard_busy` for concurrent callers).
 - [ ] `cortex_local::CortexLocal::complete()` over `GpuEngine` — still uses
   the slow CPU `model.generate()` path; needs the GPU-engine wrapping.
 - [?] Per-request sampling override beyond temperature (top-k/top-p/rep) —

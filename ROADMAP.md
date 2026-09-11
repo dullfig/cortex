@@ -66,9 +66,9 @@ stable, deployable state on 2026-06-13 (device-probe consumption followed
 - **Tensor-core / cooperative-matrix matmul** — the old M6 CUDA target
   (~40–60 t/s decode). Matmul remains the bottleneck; device-probe now
   *measures* f16 speedup so the future precision-kernel switch has its input.
-- **C3 packed-perf restoration** — `hidden_buf`/`projected` still f32 from
-  the old BitNet "Option E" revert (no longer load-bearing); restoring
-  packed-f16 recovers ~9% Qwen prefill.
+- ~~**C3 packed-perf restoration**~~ — done in 920e8be (2026-05-29, with the
+  BitNet un-merge): `hidden_buf` / `projected` are packed f16 again; the
+  review #27–#29 investigation confirmed every forward reads them packed.
 
 **Exit (met for stability; perf partial):** engine is stable, deployable, no
 TTFT cliff, no panics under normal load. The tensor-core decode win is the
@@ -94,7 +94,7 @@ dead end for recall.
   (dispatch-dimension constraint in the prefill chunker; unchunked forwards
   bounded → 400; heap-free-on-failure verified). See STATUS §4 and
   `docs/adversarial-review-2026-09-02.md` (#4, plus #1/#2/#3/#5/#6/#11
-  closed in the same pass; #22 parity suite and #7/#8 concurrency next).
+  closed in the same pass; the whole review closed 31/31 on 2026-09-11).
 - Move retrieval (bidirectional attention) + HierarchicalCache +
   consolidation from engram; `project_qk()` on TransformerModel.
 

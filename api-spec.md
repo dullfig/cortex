@@ -144,6 +144,28 @@ were generated (e.g., very short response).
 - `finish_reason`: `"stop"` for normal completion, `"tool_calls"` when the model invokes tools, `"length"` if max_tokens hit
 - `id` can be any unique string, `"cortex-"` + uuid is fine
 
+**Error contract (adversarial-review hardening, 2026-09):** every error is
+`{"error": {"type": ..., "message": ...}}`; no request input reaches a
+panic. The types a client should handle:
+- `400 invalid_request` (`max_tokens` must be ≥ 1; malformed fields),
+  `400 context_length_exceeded` (prompt / query / composition does not fit
+  the window or the traced-forward bound; carries `prompt_tokens`,
+  `max_seq_len`), `400 input_too_long` (request text over
+  `max(64 KiB, 16 × max_seq_len)` bytes — checked before tokenization),
+  `400 invalid_token_id`, `400 shape_mismatch` (a shim's ONNX graph or
+  manifest does not fit the model — refused at `PUT /v1/shims/{id}`),
+  `413` (JSON body over 2 MiB).
+- `404 cache_not_found`, `409 cache_changed` / `cache_desynced` (the shard
+  changed under the request; reload it), `503 vram_exhausted` (free a
+  shard), `507 cache_pool_full` (`--max-cache-shards`).
+- `500 internal_generation_error`: the generation panicked; the server is
+  still up and the GPU is released. On a **stream** the same failure is an
+  SSE event whose data is `{"error": {"type": "internal_generation_error",
+  ...}}` and it is the LAST event — `data: [DONE]` follows a
+  `finish_reason` chunk only, never an error. A client that disconnects
+  mid-generation stops a stateless / streaming / shim request at its next
+  decode step; a cached (`cache_shards`) request runs to `max_tokens`.
+
 ### `GET /v1/models`
 
 Optional but nice — lets the pipeline discover what's loaded.
