@@ -72,6 +72,11 @@ pub enum GgufError {
     #[error("tensor '{tensor}' has shape {actual:?}, expected {expected:?}")]
     DimensionMismatch { tensor: String, expected: Vec<usize>, actual: Vec<usize> },
 
+    // Review #21: tokenizer metadata that does not describe the vocabulary
+    // (mismatched array lengths, out-of-range ids, wrong element types).
+    #[error("invalid tokenizer metadata: {field}: {message}")]
+    InvalidTokenizer { field: &'static str, message: String },
+
     #[error("unsupported GGUF version: {0} (expected {GGUF_VERSION})")]
     UnsupportedVersion(u32),
 
@@ -250,6 +255,23 @@ impl MetadataValue {
     pub fn as_array(&self) -> Option<&[MetadataValue]> {
         match self {
             MetadataValue::Array(v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Any integer variant as `i64` (review #21: ids and token types are
+    /// written with whatever width the converter chose; the strict
+    /// `as_u32`/`as_i32` silently fell back to defaults on a mismatch).
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            MetadataValue::U8(v) => Some(*v as i64),
+            MetadataValue::I8(v) => Some(*v as i64),
+            MetadataValue::U16(v) => Some(*v as i64),
+            MetadataValue::I16(v) => Some(*v as i64),
+            MetadataValue::U32(v) => Some(*v as i64),
+            MetadataValue::I32(v) => Some(*v as i64),
+            MetadataValue::U64(v) => i64::try_from(*v).ok(),
+            MetadataValue::I64(v) => Some(*v),
             _ => None,
         }
     }

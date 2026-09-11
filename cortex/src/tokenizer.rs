@@ -129,50 +129,77 @@ impl Tokenizer {
                 expected: "array",
             })?;
 
-        let vocab: Vec<String> = tokens_arr
-            .iter()
-            .map(|v| v.as_str().unwrap_or("").to_string())
-            .collect();
+        // Review #21: every array must describe the vocabulary exactly, and
+        // an element of the wrong type is an error, not a silent default
+        // (a U32-typed token_type array used to become all-Normal and drop
+        // every special token, including the ChatML markers).
+        let bad = |field: &'static str, message: String| GgufError::InvalidTokenizer { field, message };
+        let mut vocab: Vec<String> = Vec::with_capacity(tokens_arr.len());
+        for (i, v) in tokens_arr.iter().enumerate() {
+            let s = v
+                .as_str()
+                .ok_or_else(|| bad("tokenizer.ggml.tokens", format!("element {i} is not a string")))?;
+            vocab.push(s.to_string());
+        }
         let vocab_size = vocab.len();
 
-        // Extract scores (may be absent for GPT-2)
-        let scores: Vec<f32> =
-            if let Some(scores_meta) = gguf.get_metadata("tokenizer.ggml.scores") {
-                if let Some(arr) = scores_meta.as_array() {
-                    arr.iter().map(|v| v.as_f32().unwrap_or(0.0)).collect()
-                } else {
-                    vec![0.0; vocab_size]
+        // Scores: absent is a valid file shape (all zero); present must be
+        // a float array of exactly vocab_size.
+        let scores: Vec<f32> = match gguf.get_metadata("tokenizer.ggml.scores") {
+            None => vec![0.0; vocab_size],
+            Some(meta) => {
+                let arr = meta
+                    .as_array()
+                    .ok_or_else(|| bad("tokenizer.ggml.scores", "not an array".to_string()))?;
+                let mut out = Vec::with_capacity(arr.len());
+                for (i, v) in arr.iter().enumerate() {
+                    out.push(v.as_f32().ok_or_else(|| {
+                        bad("tokenizer.ggml.scores", format!("element {i} is not f32"))
+                    })?);
                 }
-            } else {
-                vec![0.0; vocab_size]
-            };
+                out
+            }
+        };
 
-        // Extract token types (optional)
-        let token_types: Vec<TokenType> =
-            if let Some(types_meta) = gguf.get_metadata("tokenizer.ggml.token_type") {
-                if let Some(arr) = types_meta.as_array() {
-                    arr.iter()
-                        .map(|v| TokenType::from_i32(v.as_i32().unwrap_or(1)))
-                        .collect()
-                } else {
-                    vec![TokenType::Normal; vocab_size]
-                }
-            } else {
+        // Token types: absent is a valid (if unusual) shape — all Normal,
+        // no special tokens; say so. Present must be an integer array of
+        // exactly vocab_size; any integer width is accepted.
+        let token_types: Vec<TokenType> = match gguf.get_metadata("tokenizer.ggml.token_type") {
+            None => {
+                tracing::warn!("tokenizer.ggml.token_type is absent: no special tokens (chat markers will be split by BPE)");
                 vec![TokenType::Normal; vocab_size]
-            };
+            }
+            Some(meta) => {
+                let arr = meta
+                    .as_array()
+                    .ok_or_else(|| bad("tokenizer.ggml.token_type", "not an array".to_string()))?;
+                let mut out = Vec::with_capacity(arr.len());
+                for (i, v) in arr.iter().enumerate() {
+                    let t = v.as_int().ok_or_else(|| {
+                        bad("tokenizer.ggml.token_type", format!("element {i} is not an integer"))
+                    })?;
+                    out.push(TokenType::from_i32(i32::try_from(t).unwrap_or(1)));
+                }
+                out
+            }
+        };
 
         // Extract merge list for GPT-2
         let merges: Vec<String> = if mode == BpeMode::Gpt2 {
-            if let Some(merges_meta) = gguf.get_metadata("tokenizer.ggml.merges") {
-                if let Some(arr) = merges_meta.as_array() {
-                    arr.iter()
-                        .map(|v| v.as_str().unwrap_or("").to_string())
-                        .collect()
-                } else {
-                    Vec::new()
+            match gguf.get_metadata("tokenizer.ggml.merges") {
+                None => Vec::new(),
+                Some(meta) => {
+                    let arr = meta
+                        .as_array()
+                        .ok_or_else(|| bad("tokenizer.ggml.merges", "not an array".to_string()))?;
+                    let mut out = Vec::with_capacity(arr.len());
+                    for (i, v) in arr.iter().enumerate() {
+                        out.push(v.as_str().ok_or_else(|| {
+                            bad("tokenizer.ggml.merges", format!("element {i} is not a string"))
+                        })?.to_string());
+                    }
+                    out
                 }
-            } else {
-                Vec::new()
             }
         } else {
             Vec::new()
@@ -186,15 +213,21 @@ impl Tokenizer {
         // repeated SINK_TOKENS times at cache start and broke chat by
         // making the model parse 4 quote characters before the real
         // chat-template markers.
-        let eos_token_id = gguf
-            .get_metadata("tokenizer.ggml.eos_token_id")
-            .and_then(|v| v.as_u32())
-            .unwrap_or(2);
-
-        let bos_token_id = gguf
-            .get_metadata("tokenizer.ggml.bos_token_id")
-            .and_then(|v| v.as_u32())
-            .unwrap_or(eos_token_id);
+        // Ids may be written with any integer width; a present key of a
+        // non-integer type is an error rather than a silent fallback.
+        let read_id = |key: &'static str| -> Result<Option<u32>, GgufError> {
+            match gguf.get_metadata(key) {
+                None => Ok(None),
+                Some(v) => {
+                    let n = v.as_int().ok_or_else(|| bad(key, "not an integer".to_string()))?;
+                    u32::try_from(n)
+                        .map(Some)
+                        .map_err(|_| bad(key, format!("{n} is not a valid token id")))
+                }
+            }
+        };
+        let eos_token_id = read_id("tokenizer.ggml.eos_token_id")?.unwrap_or(2);
+        let bos_token_id = read_id("tokenizer.ggml.bos_token_id")?.unwrap_or(eos_token_id);
 
         // Check if model explicitly disables BOS token
         let add_bos_default = gguf
@@ -261,6 +294,35 @@ impl Tokenizer {
         pre_type: PreTokenizerType,
         merges: &[String],
     ) -> Result<Self, GgufError> {
+        // Review #21: the three vectors must describe the same vocabulary
+        // and the ids must be in it. A short token_type array used to drop
+        // the trailing specials silently (for Qwen 2.5 that is exactly
+        // <|im_start|> / <|im_end|>, the last ids) and make `decode`
+        // index-panic on any high id; a short scores array panicked inside
+        // the merge loop; an out-of-vocab BOS asserted in the engine on
+        // the first request, since every prompt starts with it.
+        let bad = |field: &'static str, message: String| GgufError::InvalidTokenizer { field, message };
+        if vocab.is_empty() {
+            return Err(bad("tokenizer.ggml.tokens", "vocabulary is empty".to_string()));
+        }
+        if scores.len() != vocab.len() {
+            return Err(bad(
+                "tokenizer.ggml.scores",
+                format!("{} entries for a {}-token vocabulary", scores.len(), vocab.len()),
+            ));
+        }
+        if token_types.len() != vocab.len() {
+            return Err(bad(
+                "tokenizer.ggml.token_type",
+                format!("{} entries for a {}-token vocabulary", token_types.len(), vocab.len()),
+            ));
+        }
+        for (field, id) in [("tokenizer.ggml.bos_token_id", bos_token_id), ("tokenizer.ggml.eos_token_id", eos_token_id)] {
+            if id as usize >= vocab.len() {
+                return Err(bad(field, format!("{id} is outside the {}-token vocabulary", vocab.len())));
+            }
+        }
+
         // Build reverse lookup
         let mut token_to_id = HashMap::with_capacity(vocab.len());
         for (id, token) in vocab.iter().enumerate() {
@@ -291,11 +353,18 @@ impl Tokenizer {
             }
         }
 
-        // Build merge rank table for GPT-2
+        // Build merge rank table for GPT-2. A merge is exactly two
+        // non-empty pieces; a duplicate pair keeps its FIRST (best) rank —
+        // `insert` used to let a later duplicate overwrite it.
         let mut merge_ranks = HashMap::new();
         for (rank, merge_str) in merges.iter().enumerate() {
-            if let Some((left, right)) = merge_str.split_once(' ') {
-                merge_ranks.insert((left.to_string(), right.to_string()), rank as u32);
+            let mut parts = merge_str.split(' ');
+            if let (Some(left), Some(right), None) = (parts.next(), parts.next(), parts.next()) {
+                if !left.is_empty() && !right.is_empty() {
+                    merge_ranks
+                        .entry((left.to_string(), right.to_string()))
+                        .or_insert(rank as u32);
+                }
             }
         }
 
@@ -339,17 +408,19 @@ impl Tokenizer {
     /// End-of-sequence token ID.
     pub fn eos_token_id(&self) -> u32 { self.eos_token_id }
 
-    /// Get token string by ID.
-    pub fn token(&self, id: u32) -> &str { &self.vocab[id as usize] }
+    /// Get token string by ID (empty for an id outside the vocabulary).
+    pub fn token(&self, id: u32) -> &str {
+        self.vocab.get(id as usize).map(String::as_str).unwrap_or("")
+    }
 
     /// Get token ID by string.
     pub fn token_id(&self, token: &str) -> Option<u32> {
         self.token_to_id.get(token).copied()
     }
 
-    /// Get token type.
+    /// Get token type (`Unknown` for an id outside the vocabulary).
     pub fn token_type(&self, id: u32) -> TokenType {
-        self.token_types[id as usize]
+        self.token_types.get(id as usize).copied().unwrap_or(TokenType::Unknown)
     }
 
     /// Encode text to token IDs.
@@ -470,26 +541,49 @@ impl Tokenizer {
 
     fn decode_sentencepiece(&self, tokens: &[u32]) -> String {
         let mut text = String::new();
+        // Review #21: byte-fallback tokens are the UTF-8 bytes of a
+        // character the vocabulary lacks; they must be accumulated and
+        // decoded as UTF-8 (the GPT-2 path already does), not pushed as
+        // `u8 as char`, which is Latin-1 and turned "é" into "Ã©".
+        let mut pending: Vec<u8> = Vec::new();
+        let flush = |pending: &mut Vec<u8>, text: &mut String| {
+            if !pending.is_empty() {
+                text.push_str(&String::from_utf8_lossy(pending));
+                pending.clear();
+            }
+        };
 
         for &id in tokens {
             if id == self.bos_token_id || id == self.eos_token_id {
                 continue;
             }
-            let token_str = &self.vocab[id as usize];
-            let token_type = self.token_types[id as usize];
+            // An id outside the vocabulary (a corrupt client id, or a
+            // metadata array that lied) renders as U+FFFD — never an
+            // index panic on the decode path.
+            let (Some(token_str), Some(&token_type)) =
+                (self.vocab.get(id as usize), self.token_types.get(id as usize))
+            else {
+                flush(&mut pending, &mut text);
+                text.push('\u{FFFD}');
+                continue;
+            };
 
             match token_type {
                 TokenType::Byte => {
                     if let Some(byte_val) = parse_byte_token(token_str) {
-                        text.push(byte_val as char);
+                        pending.push(byte_val);
                     }
                 }
-                TokenType::Control => {}
+                TokenType::Control => {
+                    flush(&mut pending, &mut text);
+                }
                 _ => {
+                    flush(&mut pending, &mut text);
                     text.push_str(token_str);
                 }
             }
         }
+        flush(&mut pending, &mut text);
 
         text = text.replace('\u{2581}', " ");
         if text.starts_with(' ') {
@@ -598,12 +692,17 @@ impl Tokenizer {
             if id == self.bos_token_id || id == self.eos_token_id {
                 continue;
             }
-            let token_type = self.token_types[id as usize];
+            // Review #21: never index the decode path with a client id.
+            let (Some(token_str), Some(&token_type)) =
+                (self.vocab.get(id as usize), self.token_types.get(id as usize))
+            else {
+                bytes.extend_from_slice("\u{FFFD}".as_bytes());
+                continue;
+            };
             if token_type == TokenType::Control {
                 continue;
             }
 
-            let token_str = &self.vocab[id as usize];
             // Map GPT-2 Unicode characters back to bytes
             for ch in token_str.chars() {
                 bytes.push(gpt2_char_to_byte(ch));
@@ -1014,6 +1113,127 @@ fn try_contraction_ci(chars: &[char], i: usize) -> Option<(String, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =======================================================================
+    // Review #21: metadata validation, UTF-8 byte fallback, merges, decode
+    // =======================================================================
+
+    fn tiny_parts() -> (Vec<String>, Vec<f32>, Vec<TokenType>) {
+        let vocab: Vec<String> = ["<unk>", "<s>", "</s>", "a", "<|im_start|>"]
+            .iter().map(|s| s.to_string()).collect();
+        let scores = vec![0.0; vocab.len()];
+        let types = vec![
+            TokenType::Unknown, TokenType::Control, TokenType::Control,
+            TokenType::Normal, TokenType::Control,
+        ];
+        (vocab, scores, types)
+    }
+
+    fn field_of(r: Result<Tokenizer, GgufError>) -> &'static str {
+        match r {
+            Err(GgufError::InvalidTokenizer { field, .. }) => field,
+            Err(other) => panic!("expected InvalidTokenizer, got {other}"),
+            Ok(_) => panic!("expected InvalidTokenizer, got Ok"),
+        }
+    }
+
+    #[test]
+    fn short_token_type_array_is_rejected() {
+        // A short array used to silently drop the trailing specials — for
+        // Qwen 2.5 exactly <|im_start|> / <|im_end|> — and index-panic in
+        // decode.
+        let (vocab, scores, mut types) = tiny_parts();
+        types.pop();
+        assert_eq!(field_of(Tokenizer::from_parts(vocab, scores, types, 1, 2)), "tokenizer.ggml.token_type");
+    }
+
+    #[test]
+    fn short_scores_array_is_rejected() {
+        let (vocab, mut scores, types) = tiny_parts();
+        scores.pop();
+        assert_eq!(field_of(Tokenizer::from_parts(vocab, scores, types, 1, 2)), "tokenizer.ggml.scores");
+    }
+
+    #[test]
+    fn out_of_vocab_bos_or_eos_is_rejected() {
+        let (vocab, scores, types) = tiny_parts();
+        assert_eq!(field_of(Tokenizer::from_parts(vocab.clone(), scores.clone(), types.clone(), 9999, 2)), "tokenizer.ggml.bos_token_id");
+        assert_eq!(field_of(Tokenizer::from_parts(vocab, scores, types, 1, 5)), "tokenizer.ggml.eos_token_id");
+    }
+
+    #[test]
+    fn empty_vocab_is_rejected() {
+        assert_eq!(field_of(Tokenizer::from_parts(vec![], vec![], vec![], 0, 0)), "tokenizer.ggml.tokens");
+    }
+
+    #[test]
+    fn from_gguf_accepts_any_integer_width_for_token_types_and_ids() {
+        use crate::gguf::tests::GgufBuilder;
+        use crate::gguf::GgufFile;
+        // token_type as a U32 array and ids as U64 used to fall back
+        // silently (all Normal, eos = 2): the chat markers stopped being
+        // special and got BPE-split.
+        let mut b = GgufBuilder::new();
+        b.add_metadata_string("tokenizer.ggml.model", "llama");
+        b.add_metadata_array_string("tokenizer.ggml.tokens", &["<unk>", "<s>", "</s>", "a", "<|im_start|>"]);
+        b.add_metadata_array_u32("tokenizer.ggml.token_type", &[2, 3, 3, 1, 3]);
+        b.add_raw_metadata("tokenizer.ggml.eos_token_id", 10, 4u64.to_le_bytes().to_vec());
+        let gguf = GgufFile::open_reader(std::io::Cursor::new(b.build())).unwrap();
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        assert_eq!(tok.eos_token_id(), 4);
+        assert_eq!(tok.token_type(4), TokenType::Control);
+        assert_eq!(tok.encode("<|im_start|>", false), vec![4]);
+
+        // A present-but-short token_type array is an error, not a default.
+        let mut b = GgufBuilder::new();
+        b.add_metadata_string("tokenizer.ggml.model", "llama");
+        b.add_metadata_array_string("tokenizer.ggml.tokens", &["<unk>", "<s>", "</s>", "a", "<|im_start|>"]);
+        b.add_metadata_array_i32("tokenizer.ggml.token_type", &[2, 3, 3, 1]);
+        let gguf = GgufFile::open_reader(std::io::Cursor::new(b.build())).unwrap();
+        assert_eq!(field_of(Tokenizer::from_gguf(&gguf)), "tokenizer.ggml.token_type");
+    }
+
+    #[test]
+    fn sentencepiece_byte_fallback_decodes_utf8_not_latin1() {
+        // make_test_tokenizer: byte tokens <0xNN> live at id 3 + NN.
+        let tok = make_test_tokenizer();
+        let id = |b: u8| 3 + b as u32;
+        // "é" = C3 A9; "日本" = E6 97 A5 E6 9C AC. The old `u8 as char`
+        // path produced "Ã©".
+        assert_eq!(tok.decode(&[id(0xC3), id(0xA9)]), "é");
+        assert_eq!(tok.decode(&[id(0xE6), id(0x97), id(0xA5), id(0xE6), id(0x9C), id(0xAC)]), "日本");
+        // Bytes flush at a normal token boundary, and a lone lead byte is
+        // replaced rather than corrupting the following text.
+        let a = tok.token_id("h").unwrap();
+        assert_eq!(tok.decode(&[id(0xC3), id(0xA9), a]), "éh");
+        assert_eq!(tok.decode(&[id(0xC3), a]), "\u{FFFD}h");
+    }
+
+    #[test]
+    fn decode_of_an_out_of_vocab_id_is_a_replacement_char_not_a_panic() {
+        let tok = make_test_tokenizer();
+        let a = tok.token_id("h").unwrap();
+        assert_eq!(tok.decode(&[a, 999_999, a]), "h\u{FFFD}h");
+        assert_eq!(tok.token(999_999), "");
+        assert_eq!(tok.token_type(999_999), TokenType::Unknown);
+        let g = make_gpt2_tokenizer();
+        assert!(g.decode(&[999_999]).contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn duplicate_merge_keeps_its_first_rank_and_malformed_lines_are_skipped() {
+        let vocab: Vec<String> = ["<|endoftext|>", "h", "e", "he"].iter().map(|s| s.to_string()).collect();
+        let types = vec![TokenType::Control, TokenType::Normal, TokenType::Normal, TokenType::Normal];
+        let merges = vec![
+            "h e".to_string(),      // rank 0
+            "no-space".to_string(), // skipped
+            "a b c".to_string(),    // skipped (three pieces)
+            "h e".to_string(),      // duplicate: must not overwrite rank 0
+        ];
+        let tok = Tokenizer::from_parts_gpt2(vocab, types, 0, 0, &merges).unwrap();
+        assert_eq!(tok.merge_ranks.get(&("h".to_string(), "e".to_string())), Some(&0));
+        assert_eq!(tok.merge_ranks.len(), 1);
+    }
 
     // =======================================================================
     // SentencePiece tests (existing)
