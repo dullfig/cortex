@@ -18,7 +18,11 @@ fn main() {
         let val = &gguf.metadata()[key];
         let display = match val {
             cortex::MetadataValue::String(s) => {
-                if s.len() > 80 { format!("\"{}...\"", &s[..80]) } else { format!("\"{s}\"") }
+                if s.chars().count() > 80 {
+                    format!("\"{}...\"", s.chars().take(80).collect::<String>())
+                } else {
+                    format!("\"{s}\"")
+                }
             }
             cortex::MetadataValue::U32(v) => format!("{v}"),
             cortex::MetadataValue::I32(v) => format!("{v}"),
