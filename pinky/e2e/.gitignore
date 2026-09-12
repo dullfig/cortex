@@ -1,0 +1,7 @@
+# run artifacts the bars write next to the scripts
+*.log
+*_out.txt
+*.txt
+dumps_new/
+dumps_polar/
+__pycache__/
