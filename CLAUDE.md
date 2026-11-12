@@ -3,6 +3,8 @@
 > **If something has happened to Daniel:** read `C:\src\CARETAKER.md` — the project's caretaker-handoff document.
 >
 > **2026-05-29: BitNet un-merge.** The ternary/BitNet inference path moved out of cortex into the sibling `ternary-rs` crate. Cortex is now a float-only Qwen-class GPU transformer (Q4_K_M, F16, BF16, F32). Architectural rationale: `project_training_time_representation.md` (pinned in integration repo) — representation choices belong at training time, not runtime polymorphism. Pre-excision cortex is preserved at git tag `bitnet-archive-2026-05-29` (commit e1e2dc1); GPU port artifacts went to `ternary-rs/incoming-cortex-gpu/` for ternary-rs's Stage 1.
+>
+> **2026-11-11: parked sub-project of RingHub.** cortex is a parked sub-project of RingHub (moving to `C:\src\RingHub\cortex\cortex`, with its cluster beside it). It is not in Bob's loop today and will very likely run Bob one day. AgentOS is a separate project.
 
 # cortex
 
@@ -37,7 +39,7 @@ let provider = cortex_local::CortexLocal::load("model.gguf", 4096)?;
 let response = provider.complete(&request)?;
 ```
 
-AgentOS integration: add as `LlmClient::Local(CortexLocal)` variant in `agentos-llm`.
+(AgentOS is a separate project; that hookup is its business.)
 
 ## Lineage
 
@@ -151,4 +153,4 @@ Run all: `cargo test --workspace`
 - [ ] Move retrieval (bidirectional attention) from engram into cortex
 - [ ] Move HierarchicalCache + consolidation from engram
 - [ ] project_qk() method on TransformerModel for memory integration
-- [ ] Wire into AgentOS as `handler: cortex` organism listener
+- ~~Wire into AgentOS as `handler: cortex` organism listener~~ dropped 2026-11-11: AgentOS is not Bob's platform

@@ -7,13 +7,9 @@ taken**; the engine substrate was rebuilt with `vram-heap` + `device-probe`
 instead (see Stage E). BitNet references are gone (un-merged 2026-05-29 to
 `ternary-rs`).
 
-> **⚠️ PARKED posture (read first).** Per the integration pin
-> `state_of_project_2026-07-24`, **cortex is the next *code* phase, not the
-> next *project* phase.** The engine substrate is done and stable; the
-> project foreground is the mission/corpus track (which needs zero cortex).
-> So **no stage below is actively SHIPPING right now** — this doc is the plan
-> for when cortex resumes as the code critical path, plus the near-term code
-> items that are worth doing whenever a session picks cortex up.
+> **⚠️ PARKED posture (read first).** Parked sub-project of RingHub
+> (2026-11-11): the site comes first and Bob runs on Haiku. cortex will
+> very likely run Bob one day.
 
 ## How to use this doc
 
@@ -117,19 +113,19 @@ before.
 **Exit:** 1000 concurrent sustained across 2–4 instances, p99 TTFT <10s, p95
 decode >30 t/s.
 
-## Stage 3 — Cortex + AgentOS cache coordination (RESEARCHING)
+## Stage 3 — Cortex + Bob's host cache coordination (RESEARCHING)
 
-Cortex stays hot-VRAM-only with a sane default LRU; AgentOS owns warm/cold
+Cortex stays hot-VRAM-only with a sane default LRU; Bob's host (not AgentOS; to be decided) owns warm/cold
 tiers + prefetch policy (it has the semantic knowledge cortex doesn't).
-Cortex = *mechanism*; AgentOS = *policy*. Makes cortex *smaller*, not bigger.
+Cortex = *mechanism*; Bob's host = *policy*. Makes cortex *smaller*, not bigger.
 
 **Cortex-side (small):**
 - Configurable per-instance cache budget; default LRU eviction on overflow.
-- **Eviction notification hook** so AgentOS's shadow doesn't drift.
+- **Eviction notification hook** so Bob's host's shadow doesn't drift.
 - Bulk inspect endpoint with access/timing metadata; eviction-under-pressure
   tests.
 
-**Exit:** ~5000 concurrent across the fleet; AgentOS reawaken (`cache_load`
+**Exit:** ~5000 concurrent across the fleet; Bob's host reawaken (`cache_load`
 → prefill) <5s p95; cortex never OOMs (eviction before VRAM exhaustion).
 
 ## Stage 4 — Production fleet (PARKED until Stage 3)

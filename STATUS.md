@@ -75,8 +75,7 @@ over-mark than leave assumptions invisible to other Claude sessions.
 | `[ ]` | Next (specced, hasn't started) |
 | `[?]` | Discussed only (no spec, possibly phantom) |
 
-This board exists so integration-claude, AgentOS-claude, memex-claude and
-other cross-repo sessions can see what cortex actually provides today —
+This board exists so integration, Bob and other RingHub agents can see what cortex actually provides today —
 not what design docs claim. The `[?]` rows are the antidote rows.
 
 ---
@@ -256,8 +255,8 @@ not what design docs claim. The `[?]` rows are the antidote rows.
 - [~] memex retrieval coupling — memex hits `/v1/cache/append` + `/v1/retrieve`
   over HTTP (live; see the §4 defect it surfaced). Deeper zero-copy coupling
   discussed only.
-- [?] AgentOS kernel `LlmClient::Local(CortexLocal)` variant — not landed in
-  AgentOS.
+- [?] AgentOS kernel `LlmClient::Local(CortexLocal)` variant — AgentOS's business
+  (separate project), not RingHub's.
 - [?] **RetrievalAttention / ANN-over-KV** (arXiv 2409.10516) — evaluate on
   integration's stack first; 4-phase roadmap to a swappable
   `AttentionBackend` (CPU index + GPU compute). Pin:

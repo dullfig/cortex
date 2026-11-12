@@ -1,8 +1,7 @@
 # Cortex Inference Server — API Specification
 
 **Date:** 2026-04-05
-**Consumer:** AgentOS `agentos-llm` crate (OpenAI wire format client)
-**First deployment:** RunPod A100 via `agentos-cloud` provisioning
+**Consumer:** any OpenAI-compatible client (AgentOS was the first; it is a separate project)
 
 ## Overview
 

@@ -1,3 +1,5 @@
+> **SUPERSEDED:** written 2026-04-19 for an AgentOS-hosted Bob. AgentOS is not Bob's platform (2026-10-28); cortex is parked (2026-11-11).
+
 > **Cross-session coordination:** This doc assumes you have read `C:\Users\danu\.claude\projects\C--src-ringhub-integration\memory\MEMORY.md` and its referenced files. Several architectural decisions from 2026-04-19's sessions change what cortex needs to be — read memory first, then this. If you haven't, start there.
 
 # Cortex v1 Next Steps

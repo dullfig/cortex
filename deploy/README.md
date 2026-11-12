@@ -3,15 +3,15 @@
 Box-local packaging to run a **secure** cortex-server on a remote GPU
 box. cortex stays inference-only; this directory is everything needed to
 run it behind TLS + auth. It does **not** provision boxes — your
-orchestrator (AgentOS via the rental provider's API) pulls the published
+orchestrator (whatever hosts Bob then) pulls the published
 image and launches the stack; clients then talk HTTPS.
 
 ```
 registry(cortex img) --pull--> GPU box:  Caddy :443  (TLS + API key)
                                             └─► cortex-server :8100 (private)
                                                 model: volume or fetch-at-boot
-AgentOS --HTTPS + Bearer key--> Caddy
-AgentOS --provider API--------> launch / stop the box
+Client  --HTTPS + Bearer key--> Caddy
+Orchestr --provider API-------> launch / stop the box
 ```
 
 ## What's here
@@ -71,7 +71,7 @@ docker compose -f deploy/docker-compose.yml --env-file deploy/.env up -d --build
   pointed at the box).
 - **Bare IP** (`CORTEX_DOMAIN` blank → address `:443`): **uncomment the
   `tls internal` line in the `Caddyfile`** so Caddy serves its own CA
-  cert (it can't get a public cert without a hostname). AgentOS must then
+  cert (it can't get a public cert without a hostname). The client must then
   trust/pin that cert, or run inside a private network/VPN. Do *not*
   enable `tls internal` with a real domain — it disables Let's Encrypt.
 
@@ -90,10 +90,10 @@ curl -H "Authorization: Bearer $CORTEX_API_KEY" \
      https://HOST/v1/chat/completions
 ```
 
-## AgentOS integration
+## Client integration
 
-Point AgentOS's `OpenAiClient` at `https://HOST/v1` with the Bearer key.
-For elastic spin-up, AgentOS calls the **provider's** API to launch a box
+Point any OpenAI-compatible client at `https://HOST/v1` with the Bearer key.
+For elastic spin-up, the orchestrator calls the **provider's** API to launch a box
 that pulls `cortex-server:latest` and runs this compose stack — no cortex
 control-plane endpoint involved. Keep session affinity to one instance
 while a retrieval cache is loaded (the cache is server-side state).
