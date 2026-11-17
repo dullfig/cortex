@@ -1,10 +1,8 @@
-> **Cross-session coordination:** Before making any design/scope decision, read `C:\Users\danu\.claude\projects\C--src-ringhub-integration\memory\MEMORY.md` first — that folder is the shared brain across all Claude sessions on this project. Decisions pinned there supersede anything in this repo's older docs.
->
 > **If something has happened to Daniel:** read `C:\src\CARETAKER.md` — the project's caretaker-handoff document.
 >
 > **2026-05-29: BitNet un-merge.** The ternary/BitNet inference path moved out of cortex into the sibling `ternary-rs` crate. Cortex is now a float-only Qwen-class GPU transformer (Q4_K_M, F16, BF16, F32). Architectural rationale: `project_training_time_representation.md` (pinned in integration repo) — representation choices belong at training time, not runtime polymorphism. Pre-excision cortex is preserved at git tag `bitnet-archive-2026-05-29` (commit e1e2dc1); GPU port artifacts went to `ternary-rs/incoming-cortex-gpu/` for ternary-rs's Stage 1.
 >
-> **2026-11-11: parked sub-project of RingHub.** cortex is a parked sub-project of RingHub (moving to `C:\src\RingHub\cortex\cortex`, with its cluster beside it). It is not in Bob's loop today and will very likely run Bob one day. AgentOS is a separate project.
+> **2026-11-16: standalone project.** cortex is a top-level, general-purpose inference engine with its own API (OpenAI wire via `cortex-server`, in-process via `cortex-local`). It lives at `C:\src\cortex` with its sibling crates `vram-heap` and `device-probe` beside it (the Cargo paths depend on that layout). It is not part of RingHub: RingHub/Bob (and memex) are possible future *clients*, should they run on a local model. AgentOS is a separate project. RingHub's pin bank is RingHub's record; cite it only where a specific RingHub decision bears on cortex.
 
 # cortex
 

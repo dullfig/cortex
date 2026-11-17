@@ -7,9 +7,10 @@ taken**; the engine substrate was rebuilt with `vram-heap` + `device-probe`
 instead (see Stage E). BitNet references are gone (un-merged 2026-05-29 to
 `ternary-rs`).
 
-> **⚠️ PARKED posture (read first).** Parked sub-project of RingHub
-> (2026-11-11): the site comes first and Bob runs on Haiku. cortex will
-> very likely run Bob one day.
+> **Standalone project (2026-11-16).** cortex is a top-level,
+> general-purpose inference engine with its own API, not a sub-project of
+> RingHub. RingHub/Bob (and memex) are possible future clients if they run
+> on a local model; today Bob runs on Haiku and nothing here is on its path.
 
 ## How to use this doc
 
